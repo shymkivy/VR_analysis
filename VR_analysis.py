@@ -8,13 +8,14 @@ Created on Sat Feb 15 13:51:24 2025
 import sys
 import os
 
-path2 = ['C:/Users/ys2605/Desktop/stuff/VR/VR_analysis']
+path2 = ['C:/Users/ys2605',
+         'C:/Users/shymk']
 
 for path3 in path2:
     if os.path.isdir(path3):
-        path1 = path3;
+        path1 = path3 + '/Desktop/stuff/VR';
 
-sys.path.append(path1);
+sys.path.append(path1 + '/VR_analysis')
 
 import numpy as np
 import pandas as pd
@@ -26,7 +27,7 @@ import matplotlib.pyplot as plt
 from f_functions import load_XML, if_spheric_to_cart, if_cart_to_spheric #, f_pickle_load
 
 #%%
-fpath = 'C:\\Users\\ys2605\\Desktop\\stuff\\VR\\UNITY\\data_out2'
+dpath = path1 + '/data_out2/'
 
 
 fname_xml = 'Terrain3data_2025_3_17_11h_57m_58s.xml'
@@ -37,59 +38,64 @@ fname_obj = 'MeshVerticesTerrain3_objectList_2025_3_13_11h_45m_52s.csv'
 
 mesh_y_offset = -39.6
 
-df = pd.read_csv(fpath + '\\' + fname_loc)
+df = pd.read_csv(dpath + '/' + fname_loc)
 
 #df_vert = pd.read_csv(fpath + '\\' + fname_vert)
 #df_obj = pd.read_csv(fpath + '\\' + fname_obj)
 
-#df2 = df.loc[~pd.isnull(df.data_in0)]
-df2 = df
+#df.y_pos = df.y_pos - mesh_y_offset
 
 #df2.y_pos = df2.y_pos - mesh_y_offset
+df2 = df
 
-xml_data = load_XML(fpath + '\\' + fname_xml)
+xml_data = load_XML(dpath + fname_xml)
 
+daq_idx = ~pd.isnull(df.data_in0)
+has_daq = bool(sum(daq_idx))
 
 #%%
 
-cum_d = df2.data_in0 - df2.data_in0[sum(pd.isnull(df.data_in0))]
-cum_ds = sc.ndimage.gaussian_filter1d(cum_d, 10)
-diff_ds= np.diff(cum_ds, prepend=0)
-
-vel = df2.data_in1 - df2.data_in1[sum(pd.isnull(df.data_in0))]
-cumvel = np.cumsum(vel)
-vel_s = sc.ndimage.gaussian_filter1d(vel, 5)
-cumvel_s = np.cumsum(vel_s)
-
-plt.close('all')
-
-plt.figure()
-plt.plot(df2.Time, cum_d/np.std(cum_d))
-plt.plot(df2.Time, cum_ds/np.std(cum_d))
-plt.plot(df2.Time, cumvel/np.std(cumvel))
-#plt.plot(df2.Time, cumvel_s/np.std(cumvel_s))
-plt.title('DAQ distance data')
-plt.legend(['dist volt', 'dist volt sm', 'rec dist'])
-
-plt.figure()
-plt.plot(df2.Time, vel/np.std(vel))
-plt.plot(df2.Time, vel_s/np.std(vel_s))
-plt.plot(df2.Time, diff_ds/np.std(diff_ds))
-plt.title('DAQ velocity data')
-plt.legend(['vel volt', 'vel volt sm', 'rec vel'])
-
-plt.figure()
-plt.plot(df2.Time, df2.x_pos - df.x_pos[0])
-plt.plot(df2.Time, df2.y_pos - df.y_pos[0])
-plt.plot(df2.Time, df2.z_pos - df.z_pos[0])
-plt.title('xyz positions')
-
-plt.figure()
-plt.plot(df2.Time, df2.x_rot_q - df.x_rot_q[0])
-plt.plot(df2.Time, df2.y_rot_q - df.y_rot_q[0])
-plt.plot(df2.Time, df2.z_rot_q - df.z_rot_q[0])
-plt.plot(df2.Time, df2.w_rot_q - df.w_rot_q[0])
-plt.title('xyzw rotations')
+if has_daq:
+    df2 = df.loc[~pd.isnull(df.data_in0)]
+    
+    cum_d = df2.data_in0 - df2.data_in0[sum(pd.isnull(df.data_in0))]
+    cum_ds = sc.ndimage.gaussian_filter1d(cum_d, 10)
+    diff_ds= np.diff(cum_ds, prepend=0)
+    
+    vel = df2.data_in1 - df2.data_in1[sum(pd.isnull(df.data_in0))]
+    cumvel = np.cumsum(vel)
+    vel_s = sc.ndimage.gaussian_filter1d(vel, 5)
+    cumvel_s = np.cumsum(vel_s)
+    
+    plt.close('all')
+    
+    plt.figure()
+    plt.plot(df2.Time, cum_d/np.std(cum_d))
+    plt.plot(df2.Time, cum_ds/np.std(cum_d))
+    plt.plot(df2.Time, cumvel/np.std(cumvel))
+    #plt.plot(df2.Time, cumvel_s/np.std(cumvel_s))
+    plt.title('DAQ distance data')
+    plt.legend(['dist volt', 'dist volt sm', 'rec dist'])
+    
+    plt.figure()
+    plt.plot(df2.Time, vel/np.std(vel))
+    plt.plot(df2.Time, vel_s/np.std(vel_s))
+    plt.plot(df2.Time, diff_ds/np.std(diff_ds))
+    plt.title('DAQ velocity data')
+    plt.legend(['vel volt', 'vel volt sm', 'rec vel'])
+    
+    plt.figure()
+    plt.plot(df2.Time, df2.x_pos - df.x_pos[0])
+    plt.plot(df2.Time, df2.y_pos - df.y_pos[0])
+    plt.plot(df2.Time, df2.z_pos - df.z_pos[0])
+    plt.title('xyz positions')
+    
+    plt.figure()
+    plt.plot(df2.Time, df2.x_rot_q - df.x_rot_q[0])
+    plt.plot(df2.Time, df2.y_rot_q - df.y_rot_q[0])
+    plt.plot(df2.Time, df2.z_rot_q - df.z_rot_q[0])
+    plt.plot(df2.Time, df2.w_rot_q - df.w_rot_q[0])
+    plt.title('xyzw rotations')
 
 
 #%% plotting land
@@ -174,6 +180,7 @@ ax1.plot([mouse_xyz[x_pt], mouse_xyz[x_pt] + mouse_dir_xyz_l[x_pt]*h_adj], [mous
 obj_x = np.asarray(xml_data['objList']['x'])
 obj_y = np.asarray(xml_data['objList']['y'])
 obj_z = np.asarray(xml_data['objList']['z'])
+obj_type = np.asarray(xml_data['objList']['type'])
 
 # objects
 ax1.plot(obj_x, obj_z, 'o', color='red')
@@ -188,7 +195,25 @@ obj_pos_xyz = np.concat([obj_x[:,None], obj_y[:,None], obj_z[:,None]], axis=1)  
 n_pt = 2
 obj1_xyz = obj_pos_xyz[n_pt,:]
 
-obj_dir = obj1_xyz - mouse_pos_xyz
+
+obj_idx = round(obj_type[n_pt])
+obj_shape_x = np.asarray(xml_data['objTypeList']['vert'][obj_idx]['x'])
+obj_shape_y = np.asarray(xml_data['objTypeList']['vert'][obj_idx]['y'])
+obj_shape_z = np.asarray(xml_data['objTypeList']['vert'][obj_idx]['z'])
+
+obj_shape_xyz = np.concat([obj_shape_x[:,None], obj_shape_y[:,None], obj_shape_z[:,None]], axis=1)
+
+plt.figure();
+plt.plot(obj_shape_x, obj_shape_y, '.')
+plt.title('object type %d' % obj_idx)
+
+obj1_xyz_vert = obj1_xyz + obj_shape_xyz
+
+obj_dir = obj1_xyz_vert
+# obj_dir_vert = obj1_xyz_vert - mouse_pos_xyz # this needs reshaping to work probably
+
+
+
 
 #x = np.exp(1j*phi)
 #phi2 = pd.Series(np.angle(np.exp(1j*phi)), name='phi')
@@ -219,11 +244,6 @@ ax2.plot(fov_w_pos, fov_h_pos)
 
 
 #%%
-
-
-plt.figure()
-plt.plot(phi)
-
 
 
 
