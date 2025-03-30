@@ -45,7 +45,7 @@ df = pd.read_csv(fpath + '\\' + fname_loc)
 #df2 = df.loc[~pd.isnull(df.data_in0)]
 df2 = df
 
-df2.y_pos = df2.y_pos - mesh_y_offset
+#df2.y_pos = df2.y_pos - mesh_y_offset
 
 xml_data = load_XML(fpath + '\\' + fname_xml)
 
