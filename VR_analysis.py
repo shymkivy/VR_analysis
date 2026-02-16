@@ -8,14 +8,12 @@ Created on Mon Sep 15 11:26:21 2025
 import sys
 import os
 
-path2 = ['C:/Users/ys2605',
-         'C:/Users/shymk']
+for user1 in ['ys2605', 'shymk']:
+    if os.path.isdir('C:/Users/' + user1):
+        path1 = 'C:/Users/' + user1 + '/Desktop/stuff/VR/VR_analysis/'
 
-for path3 in path2:
-    if os.path.isdir(path3):
-        path1 = path3 + '/Desktop/stuff/VR';
-
-sys.path.append(path1 + '/VR_analysis')
+sys.path.append(path1)
+sys.path.append(path1 + '/functions')
 
 import numpy as np
 import pandas as pd

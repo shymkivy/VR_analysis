@@ -136,3 +136,33 @@ def f_plot_pulse_times(pulse_data, trace_time):
     
     return ax1
 
+#%%
+
+def f_gauss_smooth_mov(mov, sigma=[0, 5,5]):
+    
+    mov_out = mov.copy()
+    
+    if sigma:
+        dims = mov_out.shape
+        
+        for n_d in range(len(dims)):
+            if len(sigma) > n_d:
+                if sigma[n_d]> 0:
+                    
+                    dims2 = mov_out.shape
+                    
+                    sigma0 = sigma[n_d]
+                    s_fr = np.ceil(sigma0).astype(int)
+                    x = np.linspace(-3*s_fr, 3*s_fr, s_fr*6+1)
+                    gauss_kernel = np.exp(-x**2 / (2 * sigma0**2))
+                    
+                    correction = np.convolve(np.ones(dims2[0]), gauss_kernel, mode='same')
+                    
+                    for npt1 in range(dims2[1]):
+                        for npt2 in range(dims2[2]):
+                            mov_out[:,npt1,npt2] = np.convolve(mov_out[:,npt1,npt2], gauss_kernel, mode='same')/correction
+                
+            mov_out = np.transpose(mov_out, (1, 2, 0))
+            
+    
+    return mov_out
