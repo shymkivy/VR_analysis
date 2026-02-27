@@ -26,8 +26,11 @@ data_path = 'F:/VR/data_proc/2p_fov_reg/'
 
 path_xls = ''
 
+mouse_id = 'L'
+
 vr_data = pd.read_excel('F:/VR/data_proc/VR_data.xlsx')
-vr_data_slice = vr_data.loc[0]
+n_dset = 14
+vr_data_slice = vr_data.loc[n_dset]
 
 
 tp_locs = np.array(json.loads(vr_data_slice['tp_fov_locs']))
@@ -35,6 +38,9 @@ wf_locs = np.array(json.loads(vr_data_slice['wf_locs']))
 
 wf_fov = tf.imread(os.path.join(data_path, vr_data_slice['wf_im']))
 twop_fov = tf.imread(os.path.join(data_path, vr_data_slice['tp_im']))
+
+
+vr_data2 = vr_data.loc[(vr_data.mouse_id == mouse_id)].reset_index(drop=True)
 
 
 #%%
@@ -45,8 +51,15 @@ plt.imshow(np.rot90(wf_fov, k=0, axes=(1,0)), aspect='auto')
 for n_p in range(wf_locs.shape[0]):     # wf_locs.shape[0]
     plt.plot(wf_locs[n_p,0], wf_locs[n_p,1], '.', color='red')
     plt.text(wf_locs[n_p,0], wf_locs[n_p,1], '%d' % (n_p))
-plt.text(np.mean(wf_locs[:,0]), np.mean(wf_locs[:,1]) , vr_data_slice['dset_name'], horizontalalignment='center', verticalalignment='center', color='red')
+plt.text(np.mean(wf_locs[:,0]), np.mean(wf_locs[:,1]) , vr_data_slice['dset_name'] + '; dset%d' % n_dset, horizontalalignment='center', verticalalignment='center', color='red')
 
+plt.figure()
+plt.imshow(np.rot90(wf_fov, k=0, axes=(1,0)), aspect='auto')
+plt.plot([wf_locs[0,0], wf_locs[1,0]], [wf_locs[0,1], wf_locs[1,1]], color='k')
+plt.plot([wf_locs[1,0], wf_locs[3,0]], [wf_locs[1,1], wf_locs[3,1]], color='k')
+plt.plot([wf_locs[3,0], wf_locs[2,0]], [wf_locs[3,1], wf_locs[2,1]], color='k')
+plt.plot([wf_locs[2,0], wf_locs[0,0]], [wf_locs[2,1], wf_locs[0,1]], color='k')
+plt.text(np.mean(wf_locs[:,0]), np.mean(wf_locs[:,1]) , vr_data_slice['dset_name'] + '; dset%d' % n_dset, horizontalalignment='center', verticalalignment='center', color='k')
 
 plt.figure()
 plt.imshow(np.rot90(twop_fov, k=0, axes=(1,0)), aspect='auto')
@@ -58,6 +71,23 @@ plt.title(vr_data_slice['dset_name'])
 if 0:
     plt.figure()
     plt.imshow(np.rot90(wf_fov, k=-1, axes=(1,0)), aspect='auto')
+
+
+#%%
+do_text = True
+plt.figure()
+plt.imshow(np.rot90(wf_fov, k=0, axes=(1,0)))
+for n_dset in range(len(vr_data2)):
+    vr_data_slice = vr_data.iloc[n_dset]
+    tp_locs = np.array(json.loads(vr_data_slice['tp_fov_locs']))
+    wf_locs = np.array(json.loads(vr_data_slice['wf_locs']))
+    plt.plot([wf_locs[0,0], wf_locs[1,0]], [wf_locs[0,1], wf_locs[1,1]], color='k')
+    plt.plot([wf_locs[1,0], wf_locs[3,0]], [wf_locs[1,1], wf_locs[3,1]], color='k')
+    plt.plot([wf_locs[3,0], wf_locs[2,0]], [wf_locs[3,1], wf_locs[2,1]], color='k')
+    plt.plot([wf_locs[2,0], wf_locs[0,0]], [wf_locs[2,1], wf_locs[0,1]], color='k')
+    if do_text:
+        plt.text(np.mean(wf_locs[:,0]), np.mean(wf_locs[:,1]) , 'dset%d' % n_dset , horizontalalignment='center', verticalalignment='center', color='k') # vr_data_slice['dset_name']
+    plt.axis('off')
 
 
 

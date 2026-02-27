@@ -20,10 +20,11 @@ sys.path.append(path1 + '/RNN_scripts/functions')
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import tifffile as tf
 
 from f_sd_utils import f_load_caim_data, f_gauss_smooth
 from f_analysis import f_hclust_firing_rates, f_circshift_rates
-from f_functions import f_load_bh_data, f_get_session_data, f_plot_session2, f_proc_movement, f_proc_lick_rew, f_proc_lick_rew_df #, f_plot_session
+from f_functions import f_load_bh_data, f_get_session_data, f_plot_session2, f_proc_movement, f_proc_lick_rew, f_proc_lick_rew_df, f_comp_FOV_adj, f_add_phase, f_get_monitor_coords, f_plot_monitor_outline, f_plot_lateral_over_time, f_plot_vertical_ov_time, f_plot_dist_ov_time, f_angles_to_movie #, f_plot_session
 from f_RNN_dred import f_run_dred
 
 
@@ -105,7 +106,7 @@ axs.legend([p1[0], p2[0]], ['rewards', 'licks'])
 #%%
 plt.close('all')
 
-n_dset = 12
+n_dset = 3
 est1 = data_ca[n_dset]
      
 S_sm = f_gauss_smooth(est1['S'], sigma_frames=6)
@@ -116,7 +117,7 @@ hclust_data = f_hclust_firing_rates(S_smn, standardize=True, metric='cosine', me
 if 0:
     
     plt.figure()
-    plt.imshow(hclust_data['similarity_matrix'][hclust_data['res_order'],:][:,hclust_data['res_order']], aspect='auto')
+    plt.imshow(hclust_data['similarity_matrix'][hclust_data['res_order'],:][:,hclust_data['res_order']])
     plt.title(mouse_id + (' dset %d; ' % n_dset) + bh_data[n_dset]['dset_name'])
     
     n_cell = 0
@@ -192,7 +193,7 @@ if 0:
     ax3.plot(mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], np.sign(lr_data['lick_trace']), color=lick_col2)
     ax3.plot(mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], np.sign(lr_data['rew_trace']), color=rew_col2)
     ax3.set_xlabel('time (sec)')
-    ax3.legend(['lick', 'reward'])
+    ax3.legend(['lick', 'reward'], location='southeast')
 else:
     fig, (ax1, ax2) = plt.subplots(2,1, sharex=True, gridspec_kw={'height_ratios': [3, 1]})
     ax1.imshow(S_smn[hclust_data['res_order'],:], aspect='auto', vmin=0, vmax=0.5, interpolation='none', extent=[float(est1['frame_times'][0]), float(est1['frame_times'][-1]), S_smn.shape[0],0]) 
@@ -204,10 +205,9 @@ else:
     ax2.plot(mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], np.sign(lr_data['lick_trace'])*0.8-2, color=lick_col2)
     ax2.plot(mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], np.sign(lr_data['rew_trace'])*0.8-3, color=rew_col2)
     ax2.set_xlabel('time (sec)')
-    ax2.legend(['distance', 'rotation', 'lick', 'reward'])
+    ax2.legend(['distance', 'rotation', 'lick', 'reward'], loc='lower right')
 
 if 0:
-
     fig, (ax1, ax2) = plt.subplots(2,1, sharex=True, gridspec_kw={'height_ratios': [3, 1]})
     ax1.imshow(S_smn[hclust_data['res_order'],:], aspect='auto', vmin=0, vmax=0.5, interpolation='none', extent=[float(est1['frame_times'][0]), float(est1['frame_times'][-1]), S_smn.shape[0],0]) 
     ax1.set_title(ftag2)
@@ -231,26 +231,25 @@ if 0:
 
 #%%
 S_smn_shuff = f_circshift_rates(S_smn)
-
 proj_data, exp_var, components, mean_all = f_run_dred(S_smn.T, subtr_mean=1, method=2)
-
 proj_data_shuff, exp_var_shuff, components_shuff, mean_all_shuff = f_run_dred(S_smn_shuff.T, subtr_mean=1, method=2)
 
-
 if 0:
-    plt.close('all')
+    # plt.close('all')
 
-    
     plt.figure()
     plt.plot(exp_var)
     plt.plot(exp_var_shuff)
+    plt.legend(['data', 'shuff'])
+    plt.title('Explained variance; dset %d' % n_dset)
     
     plt.figure()
     plt.plot(np.cumsum(exp_var))
     plt.plot(np.cumsum(exp_var_shuff))
-    
+    plt.legend(['data', 'shuff'])
+    plt.title('Cumulative variance; dset %d' % n_dset)
 
-    comp_pairs_plot = [[n*2, n*2+1] for n in range(8)]
+    comp_pairs_plot = [[n*2, n*2+1] for n in range(3)]
     
     # plotting behavior on frames
     plot_bh = 1
@@ -262,8 +261,11 @@ if 0:
             lick_frame_idx = lr_data['lick_frames'].astype(bool)
             plt.plot(proj_data[lick_frame_idx,comp_pair[0]], proj_data[lick_frame_idx,comp_pair[1]], '.', color='pink')
             plt.plot(proj_data[rew_frame_idx,comp_pair[0]], proj_data[rew_frame_idx,comp_pair[1]], '.', color='lightgreen')
-        plt.xlabel('comp %d' % comp_pair[0])
-        plt.ylabel('comp %d' % comp_pair[1])
+        plt.xlabel('comp %d' % (comp_pair[0]+1))
+        plt.ylabel('comp %d' % (comp_pair[1]+1))
+        plt.title('Neuronal activity; dset %d' % n_dset)
+        plt.legend(['Acticity', 'Licks', 'Rewards'])
+        
     
     # splitting movement and stationary frames
     idx_mov = mov_data['d_dist_frames'] > 0.01
@@ -271,31 +273,33 @@ if 0:
         plt.figure()
         plt.plot(proj_data[idx_mov,comp_pair[0]], proj_data[idx_mov,comp_pair[1]], linewidth= 1)
         plt.plot(proj_data[~idx_mov,comp_pair[0]], proj_data[~idx_mov,comp_pair[1]], linewidth= 1)
-        plt.xlabel('comp %d' % comp_pair[0])
-        plt.ylabel('comp %d' % comp_pair[1])
-    
+        plt.xlabel('comp %d' % (comp_pair[0]+1))
+        plt.ylabel('comp %d' % (comp_pair[1]+1))
+        plt.title('Neuronal activity; dset %d' % n_dset)
+        plt.legend(['Locomoting', 'Stationary'])
+
     # splitting right and left rotations
     idx_rot = mov_data['d_phi_frames'] > 0
     for comp_pair in comp_pairs_plot:
         plt.figure()
         plt.plot(proj_data[idx_rot,comp_pair[0]], proj_data[idx_rot,comp_pair[1]], linewidth= 1)
         plt.plot(proj_data[~idx_rot,comp_pair[0]], proj_data[~idx_rot,comp_pair[1]], linewidth= 1)
-        plt.xlabel('comp %d' % comp_pair[0])
-        plt.ylabel('comp %d' % comp_pair[1])
+        plt.xlabel('comp %d' % (comp_pair[0]+1))
+        plt.ylabel('comp %d' % (comp_pair[1]+1))
     
     # plotting components, different groups of cells
     for comp_pair in comp_pairs_plot:
         plt.figure()
         plt.plot(components[:,comp_pair[0]], components[:,comp_pair[1]], '.')
-        plt.xlabel('comp %d' % comp_pair[0])
-        plt.ylabel('comp %d' % comp_pair[1])
+        plt.xlabel('comp %d' % (comp_pair[0]+1))
+        plt.ylabel('comp %d' % (comp_pair[1]+1))
     
     num_comp = 80
     data_rec = np.dot(proj_data[:,:num_comp], components[:,:num_comp].T).T + mean_all[:,None]
     plt.figure()
     plt.imshow(data_rec, aspect='auto', vmin=0, vmax=0.5)
     
-#%%
+#%% reward trial average plots
 
 fr = 1/np.median(np.diff(est1['frame_times']))
 
@@ -316,12 +320,14 @@ for n_r in range(num_rew):
     idx1 = rew_frames2[n_r]
     S_smn_trials[:,:,n_r] = S_smn[:, idx1 + time_win[0] : idx1 + time_win[1]]
    
-plt.figure()
-plt.imshow(np.mean(S_smn_trials, axis=2)[hclust_data['res_order'],:], aspect='auto', vmin=0, vmax=0.15, interpolation='none', extent=[float(trial_time[0]), float(trial_time[-1]), S_smn.shape[0],0])
-plt.title('trial ave reward response')
-plt.xlabel('time (sec)')
+
 
 if 0:
+    plt.figure()
+    plt.imshow(np.mean(S_smn_trials, axis=2)[hclust_data['res_order'],:], aspect='auto', vmin=0, vmax=0.15, interpolation='none', extent=[float(trial_time[0]), float(trial_time[-1]), S_smn.shape[0],0])
+    plt.title('trial ave reward response')
+    plt.xlabel('time (sec)')
+    
     plt.figure()
     plt.imshow(S_smn_trials[hclust_data['res_order'],:,0], aspect='auto', vmin=0, vmax=0.5, interpolation='none', extent=[float(trial_time[0]), float(trial_time[-1]), S_smn.shape[0],0])
 
@@ -329,9 +335,9 @@ if 0:
 S_smn_trials2d = S_smn_trials.reshape(num_cells, num_avr_t * num_rew, order='F')
 
 plt.figure()
-plt.imshow(S_smn_trials2d[hclust_data['res_order'],:], aspect='auto', vmin=0, vmax=0.5, interpolation='none', extent=[float(trial_time[0]), float(trial_time[-1]), S_smn.shape[0],0])
+plt.imshow(S_smn_trials2d[hclust_data['res_order'],:], aspect='auto', vmin=0, vmax=0.5, interpolation='none')
 plt.title('trial ave reward response')
-plt.xlabel('time (sec)')
+plt.xlabel('Frames')
 
 proj_data_tr2d, exp_var_tr, components_tr, mean_all_tr = f_run_dred(S_smn_trials2d.T, subtr_mean=1, method=2)
 
@@ -370,6 +376,100 @@ if 0:
     plt.figure()
     plt.imshow(data_rec[hclust_data['res_order'],:], aspect='auto', vmin=0, vmax=0.5)
         
+#%% analyze monitor movements
+
+cam_params = {'aspect':     16/9,
+              'clip_len':   100,
+              'FOV_deg':    80,
+              'num_mon':    2}
+
+df_obj_data = bh_data[n_dset]['object_data']
+df_mov = bh_data[n_dset]['movement']
+
+mov_data = f_proc_movement(bh_data[n_dset], do_interp=1, interp_step = 0.1, plot_stuff = False, title_tag = ftag2)
+
+
+phi = mov_data['phi']
+theta = mov_data['theta']
+
+FOV_rad_adj, h_adj = f_comp_FOV_adj(cam_params)
+
+mouse_xyz = np.array((mov_data['x_pos'], mov_data['y_pos'], mov_data['z_pos'])).T
+obj_locs = np.vstack((df_obj_data.ObjLocX.to_numpy(), df_obj_data.ObjLocY.to_numpy(), df_obj_data.ObjLocZ.to_numpy())).T
+
+mon_r_phi = f_add_phase(phi, FOV_rad_adj/2*1.01)
+mon_l_phi = f_add_phase(phi, -FOV_rad_adj/2*1.01)   
+if 1:
+    vec_data_r = f_get_monitor_coords(mouse_xyz, mon_r_phi, theta, obj_locs, cam_params, remove_outside_objects = True)
+    vec_data_l = f_get_monitor_coords(mouse_xyz, mon_l_phi, theta, obj_locs, cam_params, remove_outside_objects = True)
+    
+    fig, ax1 = plt.subplots()
+    ax1.plot(mouse_xyz[:,0], mouse_xyz[:,2])
+    ax1.plot(mouse_xyz[0,0], mouse_xyz[0,2], 'ko')
+    ax1.plot(df_obj_data.ObjLocX, df_obj_data.ObjLocZ, '.')
+    #plt.plot(df_obj_events.ObjLocX, df_obj_events.ObjLocZ, 'o')
+    #plt.plot(df_mov['x_pos'][lick_mot_idx], df_mov['z_pos'][lick_mot_idx], 'ro')
+    ax1.plot(mouse_xyz[:,0][lr_data['rew_trace'].astype(bool)], mouse_xyz[:,2][lr_data['rew_trace'].astype(bool)], 'go')
+    ax1.set_title(ftag2)
+
+    for n_pt in np.arange(0,5000, 5000):
+        ax1.plot(mouse_xyz[n_pt,0], mouse_xyz[n_pt,2], 'o', color='lightgreen')
+        if cam_params['num_mon'] == 1:
+            # mouse
+            f_plot_monitor_outline(mouse_xyz[:,n_pt], phi[n_pt], theta[n_pt], cam_params, axis=ax1, color_cent = 'gray', color_edge = 'blue')
+
+        elif cam_params['num_mon'] == 2:
+            # mouse
+            f_plot_monitor_outline(mouse_xyz[n_pt,:], mon_l_phi[n_pt], theta[n_pt], cam_params, axis=ax1, color_cent = 'gray', color_edge = 'darkviolet')
+            f_plot_monitor_outline(mouse_xyz[n_pt,:], mon_r_phi[n_pt], theta[n_pt], cam_params, axis=ax1, color_cent = 'gray', color_edge = 'blue')
+            
+            n_fr = 0
+            obj_used = vec_data_r['obj_used']
+            for n_obj in range(len(obj_used)):
+                n_obj2 = obj_used[n_obj]
+                if vec_data_r['obj_mon_idx'][n_fr,:][n_obj]:
+                    obj_coords = obj_locs[n_obj2,:]
+                    ax1.plot(obj_coords[0], obj_coords[2], '.', color='magenta')
+            obj_used = vec_data_l['obj_used']
+            for n_obj in range(len(obj_used)):
+                n_obj2 = obj_used[n_obj]
+                if vec_data_l['obj_mon_idx'][n_fr,:][n_obj]:
+                    obj_coords = obj_locs[n_obj2,:]
+                    ax1.plot(obj_coords[0], obj_coords[2], '.', color='red')
+
+    if 0:
+        plt.figure()
+        plt.plot(np.sum(vec_data_r['obj_mon_idx'], axis=0))
+    
+    fig, (ax1, ax2, ax3) = plt.subplots(3,1, sharex=True)
+    f_plot_lateral_over_time(vec_data_r, mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], axis=ax1)
+    f_plot_vertical_ov_time(vec_data_r, mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], cam_params, axis=ax2)
+    f_plot_dist_ov_time(vec_data_r, mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], axis=ax3)
+    ax1.set_title('Right monitor')
+    
+    fig, (ax1, ax2, ax3) = plt.subplots(3,1, sharex=True)
+    f_plot_lateral_over_time(vec_data_l, mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], axis=ax1)
+    f_plot_vertical_ov_time(vec_data_l, mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], cam_params, axis=ax2)
+    f_plot_dist_ov_time(vec_data_l, mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], axis=ax3)
+    ax1.set_title('Left monitor')
+ 
+    if 0:
+        left_mon_frames = f_angles_to_movie(vec_data_l, mov_data['time'], cam_params, lat_samp = 51, vert_samp = 51)
+        right_mon_frames = f_angles_to_movie(vec_data_r, mov_data['time'], cam_params, lat_samp = 51, vert_samp = 51)
         
+        two_mon_frames = np.concatenate((left_mon_frames, right_mon_frames), axis = 2)
         
-        
+        tf.imwrite(os.path.join('F:/test_mov', 'two_mon.tif'), two_mon_frames.astype(np.uint8))   
+
+if 1:
+    fig, (ax1, ax2, ax3, ax4) = plt.subplots(4,1, sharex=True, gridspec_kw={'height_ratios': [6, 1, 1,1]})
+    ax1.imshow(S_smn[hclust_data['res_order'],:], aspect='auto', vmin=0, vmax=0.5, interpolation='none', extent=[float(est1['frame_times'][0]), float(est1['frame_times'][-1]), S_smn.shape[0],0]) 
+    ax1.set_title(ftag2)
+    ax1.set_ylabel('CS sorted neurons')
+    f_plot_lateral_over_time(mouse_xyz, mon_r_phi, theta, obj_locs, mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], cam_params, axis=ax2)
+    #f_plot_vertical_ov_time(mouse_xyz, mon_l_phi, theta, obj_locs, mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], cam_params, axis=ax2)
+    f_plot_dist_ov_time(mouse_xyz, mon_r_phi, theta, obj_locs, mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], cam_params, axis=ax3)
+    ax4.plot(mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], np.sign(lr_data['lick_trace']), color=lick_col2)
+    ax4.plot(mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], np.sign(lr_data['rew_trace']), color=rew_col2)
+    ax4.set_xlabel('time (sec)')
+    ax4.legend(['lick', 'reward'], loc='lower right')

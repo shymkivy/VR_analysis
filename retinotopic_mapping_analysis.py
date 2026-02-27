@@ -75,7 +75,6 @@ is_disp = np.zeros(num_frames, dtype=bool)
 for n_fr in range(len(frame_data)):
     is_disp[n_fr] = frame_data[n_fr][0]
 
-
 (T, d1, d2) = cam_data.shape
 
 cam_ave_ca = np.mean(np.mean(cam_data, axis=2), axis=1)
@@ -167,7 +166,8 @@ if 0:
 #%%
 
 base_duration = 1  #sec
-save_mov = 1
+save_mov = 0
+sm_sigma = 7
 
 trial_type = np.array(stim_data['stimulation']['direction'])
 trial_type_uq = np.unique(stim_data['stimulation']['direction'])
@@ -224,7 +224,7 @@ for n_tt in range(len(trial_type_uq)):
     
     trial_ave_mov_bs.append(trial_ave_mov2_bs)
     
-    trial_ave_mov2_bs_sm = f_gauss_smooth_mov(trial_ave_mov2_bs, sigma=[0,10,10])
+    trial_ave_mov2_bs_sm = f_gauss_smooth_mov(trial_ave_mov2_bs, sigma=[0,sm_sigma,sm_sigma])
     
     trial_ave_mov_bs_sm.append(trial_ave_mov2_bs_sm)
     
@@ -316,6 +316,9 @@ for n_tt in range(len(trial_type_uq)):
         
         plt.figure()
         plt.plot(np.angle(yf2[1,n_x,:]))
+        
+        plt.figure()
+        plt.imshow(-ang_im[1])
 
 #%% clean up images with 2d fft (not working so well)
 
@@ -370,17 +373,9 @@ base1 = np.mean(np.mean(trial_baseline_3d[n_tt], axis=0), axis=0)
 
 trial_ave1 = np.mean(trial_data_3d[n_tt], axis=0)
 
-
-
-trial_ave1
-
 gradmap1 = np.gradient(trial_ave1[0])
 
-
-
 temp_amp = ang_im[n_tt]
-
-
 
 if 0:
     plt.figure()
@@ -478,7 +473,8 @@ if 1:
     vasculature_map = np.mean(cam_data[1000:-1000,:,:], axis=0)
 
     altitude_map = ang_im[3]
-    azimuth_map = ang_im[2]
+    #azimuth_map = ang_im[2]
+    azimuth_map = -ang_im[1]
     altitude_power_map = amp_im[3]
     azimuth_power_map = amp_im[2]
 else:
@@ -510,6 +506,15 @@ if 0:
 
     axs[1,1].imshow(azimuth_power_map)
     axs[1,1].set_title('azimuth_power_map')
+    
+    
+    fig, axs  = plt.subplots(1,2)
+    axs[0].imshow(altitude_map)
+    axs[0].set_title('altitude_map')
+    axs[0].axis('off')
+    axs[1].imshow(azimuth_map)
+    axs[1].set_title('azimuth_map')
+    axs[1].axis('off')
 
 #%%
 
@@ -580,4 +585,20 @@ trial = rm.RetinotopicMappingTrial(altPosMap=altitude_map,
 
 _ = trial._getSignMap(isPlot=True)
 plt.show()
+
+#%%
+if 0:
+    plt.close('all')
+    
+    k = 1
+    
+    plt.figure()
+    plt.imshow(np.rot90(trial.altPosMapf, k=k), cmap='hsv', interpolation='nearest')
+    
+    plt.figure()
+    plt.imshow(np.rot90(trial.aziPosMapf, k=k), cmap='hsv', interpolation='nearest')
+    
+    plt.figure()
+    plt.imshow(np.rot90(trial.signMapf, k=k), vmin=-1, vmax=1, cmap='jet', interpolation='nearest')
+
 
