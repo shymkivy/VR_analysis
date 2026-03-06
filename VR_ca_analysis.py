@@ -24,9 +24,8 @@ import tifffile as tf
 
 from f_sd_utils import f_load_caim_data, f_gauss_smooth
 from f_analysis import f_hclust_firing_rates, f_circshift_rates
-from f_functions import f_load_bh_data, f_get_session_data, f_plot_session2, f_proc_movement, f_proc_lick_rew, f_proc_lick_rew_df, f_comp_FOV_adj, f_add_phase, f_get_monitor_coords, f_plot_monitor_outline, f_plot_lateral_over_time, f_plot_vertical_ov_time, f_plot_dist_ov_time, f_angles_to_movie #, f_plot_session
+from f_functions import f_load_bh_data, f_get_session_data, f_plot_session2, f_proc_movement, f_proc_lick_rew, f_proc_lick_rew_df, f_comp_FOV_adj, f_add_phase, f_get_monitor_coords, f_plot_monitor_outline, f_plot_lateral_over_time, f_plot_vertical_over_time, f_plot_dist_over_time, f_angles_to_movie #, f_plot_session
 from f_RNN_dred import f_run_dred
-
 
 #%%
 mouse_id = 'L'
@@ -45,6 +44,15 @@ lick_col = 'red'
 lick_col2 = 'lightcoral'
 rew_col = 'green'
 rew_col2 = 'limegreen'
+
+obj_size = {'x':        5,
+            'y':        10,
+            'z':        5,
+            'height':   2}
+
+
+# cylinders radius 5, half height 10.. coordinate at center.. height is y + height
+
 #%%
 data_ca = f_load_caim_data(data_dir, vr_data2.dset_name, caiman_tag = 'results_cnmf.hdf5', cuts_tag='h5cutsinfo', frame_data_tag = 'framedata', r_values_min = 0.5, min_SNR=1.5, thresh_cnn_min=0.8)
 
@@ -115,7 +123,6 @@ S_smn = S_sm/np.max(S_sm, axis=1)[:,None]
 hclust_data = f_hclust_firing_rates(S_smn, standardize=True, metric='cosine', method='average')
 
 if 0:
-    
     plt.figure()
     plt.imshow(hclust_data['similarity_matrix'][hclust_data['res_order'],:][:,hclust_data['res_order']])
     plt.title(mouse_id + (' dset %d; ' % n_dset) + bh_data[n_dset]['dset_name'])
@@ -143,7 +150,6 @@ if 0:
     
     plt.figure()
     plt.imshow(S_smn, aspect='auto')
-    
     
     plt.figure()
     plt.plot(est1['frame_times'], ~est1['vid_cuts_trace'])
@@ -193,7 +199,7 @@ if 0:
     ax3.plot(mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], np.sign(lr_data['lick_trace']), color=lick_col2)
     ax3.plot(mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], np.sign(lr_data['rew_trace']), color=rew_col2)
     ax3.set_xlabel('time (sec)')
-    ax3.legend(['lick', 'reward'], location='southeast')
+    ax3.legend(['lick', 'reward'], loc='lower right')
 else:
     fig, (ax1, ax2) = plt.subplots(2,1, sharex=True, gridspec_kw={'height_ratios': [3, 1]})
     ax1.imshow(S_smn[hclust_data['res_order'],:], aspect='auto', vmin=0, vmax=0.5, interpolation='none', extent=[float(est1['frame_times'][0]), float(est1['frame_times'][-1]), S_smn.shape[0],0]) 
@@ -266,7 +272,6 @@ if 0:
         plt.title('Neuronal activity; dset %d' % n_dset)
         plt.legend(['Acticity', 'Licks', 'Rewards'])
         
-    
     # splitting movement and stationary frames
     idx_mov = mov_data['d_dist_frames'] > 0.01
     for comp_pair in comp_pairs_plot:
@@ -320,8 +325,6 @@ for n_r in range(num_rew):
     idx1 = rew_frames2[n_r]
     S_smn_trials[:,:,n_r] = S_smn[:, idx1 + time_win[0] : idx1 + time_win[1]]
    
-
-
 if 0:
     plt.figure()
     plt.imshow(np.mean(S_smn_trials, axis=2)[hclust_data['res_order'],:], aspect='auto', vmin=0, vmax=0.15, interpolation='none', extent=[float(trial_time[0]), float(trial_time[-1]), S_smn.shape[0],0])
@@ -334,16 +337,16 @@ if 0:
 #%%
 S_smn_trials2d = S_smn_trials.reshape(num_cells, num_avr_t * num_rew, order='F')
 
-plt.figure()
-plt.imshow(S_smn_trials2d[hclust_data['res_order'],:], aspect='auto', vmin=0, vmax=0.5, interpolation='none')
-plt.title('trial ave reward response')
-plt.xlabel('Frames')
-
 proj_data_tr2d, exp_var_tr, components_tr, mean_all_tr = f_run_dred(S_smn_trials2d.T, subtr_mean=1, method=2)
-
 proj_data_tr3d = proj_data_tr2d.T.reshape(num_cells, num_avr_t, num_rew, order='F')
 
 if 0:
+    plt.figure()
+    plt.imshow(S_smn_trials2d[hclust_data['res_order'],:], aspect='auto', vmin=0, vmax=0.5, interpolation='none')
+    plt.title('trial ave reward response')
+    plt.xlabel('Frames')
+
+    
     plt.close('all')
     comp_pairs_plot = [[n*2, n*2+1] for n in range(5)]
     
@@ -368,9 +371,7 @@ if 0:
 
         plt.xlabel('comp %d' % comp_pair[0])
         plt.ylabel('comp %d' % comp_pair[1])
-    
-    
-        
+     
     num_comp = 10
     data_rec = np.dot(proj_data_tr3d.reshape(num_cells, num_avr_t* num_rew, order='F').T[:,:num_comp], components_tr[:,:num_comp].T).T + mean_all[:,None]
     plt.figure()
@@ -378,30 +379,34 @@ if 0:
         
 #%% analyze monitor movements
 
-cam_params = {'aspect':     16/9,
-              'clip_len':   100,
-              'FOV_deg':    80,
-              'num_mon':    2}
+cam_params = {'aspect':             16/9,          # 1920/1080
+              'FOV_axis':           'vertical',     # which axis is fixed
+              'FOV_deg':            65.9,           # 80
+              'cam_rotation_deg':   49.2,           # was 80/2
+              'clip_len':           100,
+              'num_mon':            2}
 
 df_obj_data = bh_data[n_dset]['object_data']
-df_mov = bh_data[n_dset]['movement']
+#df_mov = bh_data[n_dset]['movement']
+df_obj_events = bh_data[n_dset]['object_events']
+#df_events = bh_data[n_dset]['events']
+#df_terrain_data = bh_data[n_dset]['terrainData']
 
 mov_data = f_proc_movement(bh_data[n_dset], do_interp=1, interp_step = 0.1, plot_stuff = False, title_tag = ftag2)
-
 
 phi = mov_data['phi']
 theta = mov_data['theta']
 
-FOV_rad_adj, h_adj = f_comp_FOV_adj(cam_params)
+f_comp_FOV_adj(cam_params)
 
 mouse_xyz = np.array((mov_data['x_pos'], mov_data['y_pos'], mov_data['z_pos'])).T
 obj_locs = np.vstack((df_obj_data.ObjLocX.to_numpy(), df_obj_data.ObjLocY.to_numpy(), df_obj_data.ObjLocZ.to_numpy())).T
 
-mon_r_phi = f_add_phase(phi, FOV_rad_adj/2*1.01)
-mon_l_phi = f_add_phase(phi, -FOV_rad_adj/2*1.01)   
+mon_r_phi = f_add_phase(phi, cam_params['cam_rotation_rad']*1.0)
+mon_l_phi = f_add_phase(phi, -cam_params['cam_rotation_rad']*1.0)
 if 1:
-    vec_data_r = f_get_monitor_coords(mouse_xyz, mon_r_phi, theta, obj_locs, cam_params, remove_outside_objects = True)
-    vec_data_l = f_get_monitor_coords(mouse_xyz, mon_l_phi, theta, obj_locs, cam_params, remove_outside_objects = True)
+    vec_data_r = f_get_monitor_coords(mov_data, mon_r_phi, theta, bh_data[n_dset], cam_params, remove_outside_objects = True)
+    vec_data_l = f_get_monitor_coords(mov_data, mon_l_phi, theta, bh_data[n_dset], cam_params, remove_outside_objects = True)
     
     fig, ax1 = plt.subplots()
     ax1.plot(mouse_xyz[:,0], mouse_xyz[:,2])
@@ -411,6 +416,11 @@ if 1:
     #plt.plot(df_mov['x_pos'][lick_mot_idx], df_mov['z_pos'][lick_mot_idx], 'ro')
     ax1.plot(mouse_xyz[:,0][lr_data['rew_trace'].astype(bool)], mouse_xyz[:,2][lr_data['rew_trace'].astype(bool)], 'go')
     ax1.set_title(ftag2)
+    for n_ev in range(len(df_obj_events)):
+        obev = df_obj_events.iloc[n_ev]
+        
+        ax1.text(obev.ObjLocX, obev.ObjLocZ, 'r%d' % n_ev)
+        
 
     for n_pt in np.arange(0,5000, 5000):
         ax1.plot(mouse_xyz[n_pt,0], mouse_xyz[n_pt,2], 'o', color='lightgreen')
@@ -443,33 +453,46 @@ if 1:
     
     fig, (ax1, ax2, ax3) = plt.subplots(3,1, sharex=True)
     f_plot_lateral_over_time(vec_data_r, mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], axis=ax1)
-    f_plot_vertical_ov_time(vec_data_r, mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], cam_params, axis=ax2)
-    f_plot_dist_ov_time(vec_data_r, mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], axis=ax3)
+    f_plot_vertical_over_time(vec_data_r, mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], cam_params, axis=ax2)
+    f_plot_dist_over_time(vec_data_r, mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], axis=ax3)
     ax1.set_title('Right monitor')
     
     fig, (ax1, ax2, ax3) = plt.subplots(3,1, sharex=True)
     f_plot_lateral_over_time(vec_data_l, mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], axis=ax1)
-    f_plot_vertical_ov_time(vec_data_l, mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], cam_params, axis=ax2)
-    f_plot_dist_ov_time(vec_data_l, mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], axis=ax3)
+    f_plot_vertical_over_time(vec_data_l, mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], cam_params, axis=ax2)
+    f_plot_dist_over_time(vec_data_l, mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], axis=ax3)
     ax1.set_title('Left monitor')
  
-    if 0:
-        left_mon_frames = f_angles_to_movie(vec_data_l, mov_data['time'], cam_params, lat_samp = 51, vert_samp = 51)
-        right_mon_frames = f_angles_to_movie(vec_data_r, mov_data['time'], cam_params, lat_samp = 51, vert_samp = 51)
+    if 1:
+        num_samp = 101
+        left_mon_frames = f_angles_to_movie(vec_data_l, mov_data['time'], cam_params, obj_size, lat_samp = num_samp, vert_samp = num_samp)
+        right_mon_frames = f_angles_to_movie(vec_data_r, mov_data['time'], cam_params, obj_size, lat_samp = num_samp, vert_samp = num_samp)
         
         two_mon_frames = np.concatenate((left_mon_frames, right_mon_frames), axis = 2)
         
-        tf.imwrite(os.path.join('F:/test_mov', 'two_mon.tif'), two_mon_frames.astype(np.uint8))   
+        if 0:
+            tf.imwrite(os.path.join('F:/test_mov', 'two_mon_' + est1['dset_name'] + '.tif'), two_mon_frames.astype(np.uint8))   
 
-if 1:
+if 0:
     fig, (ax1, ax2, ax3, ax4) = plt.subplots(4,1, sharex=True, gridspec_kw={'height_ratios': [6, 1, 1,1]})
     ax1.imshow(S_smn[hclust_data['res_order'],:], aspect='auto', vmin=0, vmax=0.5, interpolation='none', extent=[float(est1['frame_times'][0]), float(est1['frame_times'][-1]), S_smn.shape[0],0]) 
     ax1.set_title(ftag2)
     ax1.set_ylabel('CS sorted neurons')
-    f_plot_lateral_over_time(mouse_xyz, mon_r_phi, theta, obj_locs, mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], cam_params, axis=ax2)
+    f_plot_lateral_over_time(vec_data_r, mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], axis=ax2)
     #f_plot_vertical_ov_time(mouse_xyz, mon_l_phi, theta, obj_locs, mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], cam_params, axis=ax2)
-    f_plot_dist_ov_time(mouse_xyz, mon_r_phi, theta, obj_locs, mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], cam_params, axis=ax3)
+    f_plot_dist_over_time(vec_data_r, mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], axis=ax3)
     ax4.plot(mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], np.sign(lr_data['lick_trace']), color=lick_col2)
     ax4.plot(mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], np.sign(lr_data['rew_trace']), color=rew_col2)
     ax4.set_xlabel('time (sec)')
     ax4.legend(['lick', 'reward'], loc='lower right')
+    
+    # righ and left look flipped, transitions from right edge of right to left edge of left
+    fig, (ax1, ax2, ax3) = plt.subplots(3,1, sharex=True, gridspec_kw={'height_ratios': [3, 1, 1]})
+    ax1.imshow(S_smn[hclust_data['res_order'],:], aspect='auto', vmin=0, vmax=0.5, interpolation='none', extent=[float(est1['frame_times'][0]), float(est1['frame_times'][-1]), S_smn.shape[0],0]) 
+    ax1.set_title(ftag2)
+    ax1.set_ylabel('CS sorted neurons')
+    f_plot_lateral_over_time(vec_data_l, mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], axis=ax2)
+    ax2.set_ylabel('Left mon')
+    f_plot_lateral_over_time(vec_data_r, mov_data['time'] - bh_data[n_dset]['bh_pulse_delay'], axis=ax3)
+    ax3.set_ylabel('Right mon')
+    

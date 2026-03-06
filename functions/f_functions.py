@@ -51,7 +51,7 @@ def f_load_bh_data(data_dir, ftag, params_xls):
     fpath_movement = data_dir + ftag + '_MovementData.csv'# 'tracking_2025_3_13_11h_46m_0s.csv'
     fpath_object_data = data_dir + ftag + '_ObjectData.csv'
     fpath_obj_events = data_dir + ftag + '_ObjectEvents.csv'
-    #fpath_terrain = dpath2 + ftag + '_Terrain4Data.csv'
+    fpath_terrain = data_dir + ftag + '_Terrain4Data.csv'
     fpath_events = data_dir + ftag + '_Events.csv'
     #fpath_daq = dpath2 + ftag + '_DAQ.csv'
     
@@ -97,7 +97,8 @@ def f_load_bh_data(data_dir, ftag, params_xls):
                 'movement':         pd.read_csv(fpath_movement),
                 'object_data':      pd.read_csv(fpath_object_data),
                 'object_events':    pd.read_csv(fpath_obj_events),
-                'events':           pd.read_csv(fpath_events)}
+                'events':           pd.read_csv(fpath_events),
+                'terrainData':      pd.read_csv(fpath_terrain)}
     return data_out
 
 #%%
@@ -620,16 +621,32 @@ def f_proc_lick_rew_df(bh_data_slice, plot_stuff = True, title_tag = ''):
 #%%
 
 def f_comp_FOV_adj(cam_params):
+    # unity fov formula
+    # first either horizontal or vertical axis is chosen as reference, then from there and aspec ratio the other is computed
+    #  h Fov = 2*arctan(tan(v Fov * 0.5) * aspectRatio)
+    # AspectRatio = tan(hFov * 0.5) / tan(vFov * 0.5);  width / height
     
     FOV_rad = cam_params['FOV_deg']/360*2*np.pi
-
-    d = cam_params['clip_len']
-    h = d/np.cos(FOV_rad/2)
-    w = h*np.sin(FOV_rad/2)
-    h_adj = np.sqrt((w*cam_params['aspect'])**2 + d**2)
-    FOV_rad_adj = np.asin((w*cam_params['aspect'])/(h_adj))*2
     
-    return FOV_rad_adj, h_adj
+    if cam_params['FOV_axis'] == 'vertical':
+        vFOV = FOV_rad
+        #hFOV = 2 * np.atan(np.tan(vFOV/2) * cam_params['aspect'])
+        hFOV = 2 * np.atan2(np.sin(vFOV/2) * cam_params['aspect'], np.cos(vFOV/2))
+    elif cam_params['FOV_axis'] == 'horizontal':
+        hFOV = FOV_rad
+        vFOV = 2 * np.atan2(np.sin(hFOV/2) / cam_params['aspect'], np.cos(hFOV/2))
+    
+    cam_params['vFOV_rad'] = vFOV
+    cam_params['hFOV_rad'] = hFOV
+    cam_params['cam_rotation_rad'] = cam_params['cam_rotation_deg']/360*2*np.pi
+    
+    # d = cam_params['clip_len']
+    # h = d/np.cos(FOV_rad/2)         # fov height/2
+    # w = h*np.sin(FOV_rad/2)         # fov width/2
+    # h_adj = np.sqrt((w*cam_params['aspect'])**2 + d**2)
+    # FOV_rad_adj = np.asin((w*cam_params['aspect'])/(h_adj))*2
+    
+    # return FOV_rad_adj, h_adj
 
 def f_add_phase(phase1, phase2):
     
@@ -637,18 +654,29 @@ def f_add_phase(phase1, phase2):
     
     return phase_out
 
-def f_get_monitor_coords(mouse_xyz, mon_phi, mon_theta, obj_locs, cam_params, remove_outside_objects = True):
+def f_get_monitor_coords(mov_data, mon_phi, mon_theta, bh_data_slice, cam_params, remove_outside_objects = True):
     
-    FOV_rad_adj, h_adj = f_comp_FOV_adj(cam_params)
+    df_obj_data = bh_data_slice['object_data']
+    df_obj_events = bh_data_slice['object_events']
+    df_terrain_data = bh_data_slice['terrainData']
+
+    mouse_xyz = np.array((mov_data['x_pos'], mov_data['y_pos'], mov_data['z_pos'])).T
+    obj_locs = np.vstack((df_obj_data.ObjLocX.to_numpy(), df_obj_data.ObjLocY.to_numpy(), df_obj_data.ObjLocZ.to_numpy())).T
+    obj_ev_locs = np.vstack((df_obj_events.ObjLocX.to_numpy(), df_obj_events.ObjLocY.to_numpy(), df_obj_events.ObjLocZ.to_numpy())).T
+    
     num_obj = obj_locs.shape[0]
     (num_t, num_d) = mouse_xyz.shape
-    
+
     obj_mouse_vec = np.zeros((num_t, num_d, num_obj), dtype=float)
     obj_mon_idx = np.zeros((num_t, num_obj), dtype=bool)
     obj_dist_all = np.zeros((num_t, num_obj), dtype=float)
     obj_lat_angle_all = np.zeros((num_t, num_obj), dtype=float)
     obj_vert_angle_all = np.zeros((num_t, num_obj), dtype=float)
+    num_rewards = 0
     for n_obj in range(num_obj):
+        
+        is_reward = np.sqrt(np.sum((obj_locs[n_obj,:] - obj_ev_locs)**2, axis=1)) == 0
+
         spher_vec_objs = f_cart_to_spheric_np(obj_locs[n_obj,:] - mouse_xyz)        # object locations vs mouse
         #spher_vec_objs[:,2] = spher_vec_objs[:,2]%(2*np.pi)
         obj_mouse_vec[:,:,n_obj] = spher_vec_objs
@@ -661,12 +689,18 @@ def f_get_monitor_coords(mouse_xyz, mon_phi, mon_theta, obj_locs, cam_params, re
         obj_vert_angle_all[:,n_obj] = vert_angle
         
         idx_dist = spher_vec_objs[:,0] < cam_params['clip_len']                 # distance from mouse
-        idx_lat = np.abs(lat_angle) < FOV_rad_adj/2           
+        idx_lat = np.abs(lat_angle) < cam_params['hFOV_rad']/2           
         #idx_lat = np.abs(mon_phi - spher_vec_objs[:,2]) < FOV_rad_adj/2
-        idx_vert = np.abs(vert_angle) < FOV_rad_adj/2/cam_params['aspect']           
+        idx_vert = np.abs(vert_angle) < cam_params['vFOV_rad']/2
         #idx_vert = np.abs(mon_theta - spher_vec_objs[:,1]) < FOV_rad_adj/2/cam_params['aspect']
+        if np.sum(is_reward):
+            reward_time = df_obj_events[is_reward].Time.values[0]
+            idx_not_rewarded = mov_data['time'] < reward_time
+            num_rewards += 1
+        else:
+            idx_not_rewarded = np.ones((num_t), dtype=bool)
         
-        in_fov_idx = idx_dist & idx_lat & idx_vert
+        in_fov_idx = idx_dist & idx_lat & idx_vert & idx_not_rewarded
         obj_mon_idx[:,n_obj] = in_fov_idx
     
     if remove_outside_objects:
@@ -685,28 +719,50 @@ def f_get_monitor_coords(mouse_xyz, mon_phi, mon_theta, obj_locs, cam_params, re
                     'obj_used':         obj_used,
                     'obj_dist':         obj_dist_all,
                     'obj_lat_angle':    obj_lat_angle_all,
-                    'obj_vert_angle':   obj_vert_angle_all}
+                    'obj_vert_angle':   obj_vert_angle_all,
+                    'num_rewards':      num_rewards}
     return ovj_vec_data
     
 
-def f_angles_to_movie(vec_data, time, cam_params, lat_samp = 51, vert_samp = 51):
+def f_angles_to_movie(vec_data, time, cam_params, obj_size, lat_samp = 51, vert_samp = 51):
     
-    lat_samp = 51
-    vert_samp = 51
     num_frames = time.shape[0]
-    FOV_rad_adj, h_adj = f_comp_FOV_adj(cam_params)
-    
+
     mon_frames = np.zeros((num_frames, lat_samp,vert_samp),dtype=int)
     for n_obj in range(vec_data['obj_used'].shape[0]):
         
         idx_mon_obj = vec_data['obj_mon_idx'][:,n_obj]
-
-        lat_angle_idx = np.round(((-vec_data['obj_lat_angle'][:,n_obj] + FOV_rad_adj/2)/FOV_rad_adj)*(lat_samp-1)).astype(int)
-        vert_angle_idx = np.round(((-vec_data['obj_vert_angle'][:,n_obj] + FOV_rad_adj/2)/FOV_rad_adj)*(vert_samp-1)).astype(int)
         
+        obj_dist = vec_data['obj_dist'][:,n_obj]
+        obj_x_ang = np.atan2(obj_size['x'], obj_dist)
+        
+        obj_x_ang_pix = np.round(obj_x_ang/cam_params['hFOV_rad']*(lat_samp-1))
+        
+        obj_y_ang = np.atan2(obj_size['y'], obj_dist)
+        obj_y_ang_pix = np.round(obj_y_ang/cam_params['vFOV_rad']*(vert_samp-1))
+        
+        lat_angle_idx = np.round(((-vec_data['obj_lat_angle'][:,n_obj] + cam_params['hFOV_rad']/2)/cam_params['hFOV_rad'])*(lat_samp-1)).astype(int)
+        vert_angle_idx = np.round(((vec_data['obj_vert_angle'][:,n_obj] + cam_params['vFOV_rad']/2)/cam_params['vFOV_rad'])*(vert_samp-1)).astype(int)
+
         for n_fr in range(num_frames):
             if idx_mon_obj[n_fr]:
+                edge_left = (lat_angle_idx[n_fr]-obj_x_ang_pix[n_fr]).astype(int)
+                edge_right = (lat_angle_idx[n_fr]+obj_x_ang_pix[n_fr]+1).astype(int)
+                edge_bottom = (vert_angle_idx[n_fr]+obj_y_ang_pix[n_fr]/obj_size['y']*obj_size['height']).astype(int)       # convert from y size to height
+                edge_top = (vert_angle_idx[n_fr]-obj_y_ang_pix[n_fr]).astype(int)                                           # y size
+                
+                # mark center
                 mon_frames[n_fr, vert_angle_idx[n_fr],lat_angle_idx[n_fr]] = 255
+
+                if edge_bottom < vert_samp:
+                    mon_frames[n_fr, edge_bottom, np.max([edge_left, 0]):np.min([edge_right+1, lat_samp])] = 255
+                if edge_top >= 0:
+                    mon_frames[n_fr, edge_top, np.max([edge_left, 0]):np.min([edge_right+1, lat_samp])] = 255
+                if edge_left >= 0:
+                    mon_frames[n_fr, np.max([edge_top, 0]):np.min([edge_bottom+1, vert_samp]), edge_left] = 255
+                if edge_right < lat_samp:
+                    mon_frames[n_fr, np.max([edge_top, 0]):np.min([edge_bottom+1, vert_samp]), edge_right] = 255
+                
                     
     return mon_frames
 
@@ -716,14 +772,14 @@ def f_plot_monitor_outline(mouse_xyz, mon_phi, mon_theta, cam_params, axis=None,
     else:
         ax1 = axis
     
-    FOV_rad_adj, h_adj = f_comp_FOV_adj(cam_params)
-    
     x_pt = 0
     z_pt = 2
 
     mon_dir_cart = f_spheric_to_cart(mon_phi, mon_theta)
-    mon_edge_r = f_spheric_to_cart(f_add_phase(mon_phi, FOV_rad_adj/2), mon_theta)
-    mon_edge_l = f_spheric_to_cart(f_add_phase(mon_phi, -FOV_rad_adj/2), mon_theta)
+    mon_edge_r = f_spheric_to_cart(f_add_phase(mon_phi, cam_params['hFOV_rad']/2), mon_theta)
+    mon_edge_l = f_spheric_to_cart(f_add_phase(mon_phi, -cam_params['hFOV_rad']/2), mon_theta)
+    
+    h_adj = cam_params['clip_len']
     
     ax1.plot([mouse_xyz[x_pt], mouse_xyz[x_pt] + mon_dir_cart[x_pt]*cam_params['clip_len']], [mouse_xyz[z_pt], mouse_xyz[z_pt] + mon_dir_cart[z_pt]*cam_params['clip_len']], 'o-', color=color_cent)
     ax1.plot([mouse_xyz[x_pt], mouse_xyz[x_pt] + mon_edge_r[x_pt]*h_adj], [mouse_xyz[z_pt], mouse_xyz[z_pt] + mon_edge_r[z_pt]*h_adj], 'o-', color=color_edge)
@@ -742,7 +798,7 @@ def f_plot_lateral_over_time(ovj_vec_data, time, axis=None):
     ax1.set_xlabel('time (sec)')
     ax1.set_ylabel('lateral pos (Rad)') 
 
-def f_plot_vertical_ov_time(ovj_vec_data, time, cam_params, axis=None):
+def f_plot_vertical_over_time(ovj_vec_data, time, cam_params, axis=None):
     if axis is None:
         _, ax1 = plt.subplots()
     else:
@@ -752,12 +808,12 @@ def f_plot_vertical_ov_time(ovj_vec_data, time, cam_params, axis=None):
         in_fov_idx = ovj_vec_data['obj_mon_idx'][:,n_obj].astype(bool)
         ax1.plot(time[in_fov_idx], ovj_vec_data['obj_vert_angle'][:,n_obj][in_fov_idx], '.')
     
-    FOV_rad_adj, h_adj = f_comp_FOV_adj(cam_params)    
-    ax1.set_ylim([-FOV_rad_adj/2/cam_params['aspect'], FOV_rad_adj/2/cam_params['aspect']])
+    f_comp_FOV_adj(cam_params)    
+    ax1.set_ylim([-cam_params['vFOV_rad']/2*1.1, cam_params['vFOV_rad']/2*1.1])
     ax1.set_xlabel('time (sec)')
     ax1.set_ylabel('vertical pos (Rad)')
     
-def f_plot_dist_ov_time(ovj_vec_data, time, axis=None):
+def f_plot_dist_over_time(ovj_vec_data, time, axis=None):
     if axis is None:
         _, ax1 = plt.subplots()
     else:
@@ -775,15 +831,13 @@ def f_plot_lateral_over_time2(mouse_xyz, mon_phi, mon_theta, obj_locs, time, cam
         _, ax1 = plt.subplots()
     else:
         ax1 = axis
-    
-    FOV_rad_adj, h_adj = f_comp_FOV_adj(cam_params)
-    
+
     for n_pt3 in range(obj_locs.shape[0]):
         spher_vec_objs = f_cart_to_spheric_np(obj_locs[n_pt3,:] - mouse_xyz)
         lat_angle = f_add_phase(mon_phi, - spher_vec_objs[:,2])
         vert_angle = f_add_phase(mon_theta, - spher_vec_objs[:,1])
         
-        in_fov_idx = (spher_vec_objs[:,0] < cam_params['clip_len']) & (np.abs(lat_angle) < FOV_rad_adj/2) & (np.abs(vert_angle) < FOV_rad_adj/2/cam_params['aspect'])
+        in_fov_idx = (spher_vec_objs[:,0] < cam_params['clip_len']) & (np.abs(lat_angle) < cam_params['hFOV_rad']/2) & (np.abs(vert_angle) < cam_params['vFOV_rad']/2)
         if np.sum(in_fov_idx):
             ax1.plot(time[in_fov_idx], lat_angle[in_fov_idx], '.')
     #plt.ylim([-FOV_rad_adj/2, FOV_rad_adj/2])
@@ -791,40 +845,36 @@ def f_plot_lateral_over_time2(mouse_xyz, mon_phi, mon_theta, obj_locs, time, cam
     ax1.set_xlabel('time (sec)')
     ax1.set_ylabel('lateral pos (Rad)') 
    
-def f_plot_vertical_ov_time2(mouse_xyz, mon_phi, mon_theta, obj_locs, time, cam_params, axis=None):
+def f_plot_vertical_over_time2(mouse_xyz, mon_phi, mon_theta, obj_locs, time, cam_params, axis=None):
     if axis is None:
         _, ax1 = plt.subplots()
     else:
         ax1 = axis
-    
-    FOV_rad_adj, h_adj = f_comp_FOV_adj(cam_params)    
-    
+
     for n_pt3 in range(obj_locs.shape[0]):
         spher_vec_objs = f_cart_to_spheric_np(obj_locs[n_pt3,:] - mouse_xyz)
         spher_vec_objs[:,2] = spher_vec_objs[:,2]%(2*np.pi)
         
-        in_fov_idx = (spher_vec_objs[:,0] < cam_params['clip_len']) & (np.abs(mon_phi - spher_vec_objs[:,2]) < FOV_rad_adj/2) & (np.abs(mon_theta - spher_vec_objs[:,1]) < FOV_rad_adj/2/cam_params['aspect'])
+        in_fov_idx = (spher_vec_objs[:,0] < cam_params['clip_len']) & (np.abs(mon_phi - spher_vec_objs[:,2]) < cam_params['hFOV_rad']/2) & (np.abs(mon_theta - spher_vec_objs[:,1]) < cam_params['vFOV_rad']/2)
         if np.sum(in_fov_idx):
             ax1.plot(time[in_fov_idx], mon_theta[in_fov_idx] - spher_vec_objs[in_fov_idx,1], '.')
-    ax1.set_ylim([-FOV_rad_adj/2/cam_params['aspect'], FOV_rad_adj/2/cam_params['aspect']])
+    ax1.set_ylim([-cam_params['vFOV_rad']/2*1.1, cam_params['vFOV_rad']/2*1.1])
     #ax1.set_title('vertical translation over time')
     ax1.set_xlabel('time (sec)')
     ax1.set_ylabel('vertical pos (Rad)')
     
     
-def f_plot_dist_ov_time2(mouse_xyz, mon_phi, mon_theta, obj_locs, time, cam_params, axis=None):
+def f_plot_dist_over_time2(mouse_xyz, mon_phi, mon_theta, obj_locs, time, cam_params, axis=None):
     if axis is None:
         _, ax1 = plt.subplots()
     else:
         ax1 = axis
-    
-    FOV_rad_adj, h_adj = f_comp_FOV_adj(cam_params) 
-    
+
     for n_pt3 in range(obj_locs.shape[0]):
         spher_vec_objs = f_cart_to_spheric_np(obj_locs[n_pt3,:] - mouse_xyz)
         spher_vec_objs[:,2] = spher_vec_objs[:,2]%(2*np.pi)
         
-        in_fov_idx = (spher_vec_objs[:,0] < cam_params['clip_len']) & (np.abs(mon_phi - spher_vec_objs[:,2]) < FOV_rad_adj/2) & (np.abs(mon_theta - spher_vec_objs[:,1]) < FOV_rad_adj/2/cam_params['aspect'])
+        in_fov_idx = (spher_vec_objs[:,0] < cam_params['clip_len']) & (np.abs(mon_phi - spher_vec_objs[:,2]) < cam_params['hFOV_rad']/2) & (np.abs(mon_theta - spher_vec_objs[:,1]) < cam_params['vFOV_rad']/2)
         if np.sum(in_fov_idx):
             ax1.plot(time[in_fov_idx], spher_vec_objs[in_fov_idx,0], '.')
     #plt.ylim([-FOV_rad_adj/2, FOV_rad_adj/2])
