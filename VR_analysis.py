@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from f_functions import f_load_fnames, f_load_bh_data, f_get_session_data, f_plot_session2, f_proc_movement, f_proc_lick_rew, f_proc_lick_rew_df, f_spheric_to_cart, f_cart_to_spheric_np, f_comp_FOV_adj, f_plot_monitor_outline, f_plot_lateral_over_time, f_plot_vertical_ov_time, f_plot_dist_ov_time # f_plot_session
+from f_functions import f_load_fnames, f_load_bh_data, f_get_session_data, f_plot_session2, f_proc_movement, f_proc_lick_rew, f_proc_lick_rew_df, f_spheric_to_cart, f_cart_to_spheric_np, f_comp_FOV_adj, f_plot_monitor_outline, f_plot_lateral_over_time #, f_plot_vertical_ov_time, f_plot_dist_ov_time # f_plot_session
 
 #%%
 
@@ -243,8 +243,8 @@ if 0:
 
     fig, (ax1, ax2, ax3) = plt.subplots(3,1, sharex=True)
     f_plot_lateral_over_time(mouse_xyz, mon_l_phi, theta, obj_locs, mov_data['time'], cam_params, axis=ax1)
-    f_plot_vertical_ov_time(mouse_xyz, mon_l_phi, theta, obj_locs, mov_data['time'], cam_params, axis=ax2)
-    f_plot_dist_ov_time(mouse_xyz, mon_l_phi, theta, obj_locs, mov_data['time'], cam_params, axis=ax3)
+    f_plot_vertical_over_time(mouse_xyz, mon_l_phi, theta, obj_locs, mov_data['time'], cam_params, axis=ax2)
+    f_plot_dist_over_time(mouse_xyz, mon_l_phi, theta, obj_locs, mov_data['time'], cam_params, axis=ax3)
     
         
     

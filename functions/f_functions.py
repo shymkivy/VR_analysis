@@ -785,7 +785,7 @@ def f_plot_monitor_outline(mouse_xyz, mon_phi, mon_theta, cam_params, axis=None,
     ax1.plot([mouse_xyz[x_pt], mouse_xyz[x_pt] + mon_edge_r[x_pt]*h_adj], [mouse_xyz[z_pt], mouse_xyz[z_pt] + mon_edge_r[z_pt]*h_adj], 'o-', color=color_edge)
     ax1.plot([mouse_xyz[x_pt], mouse_xyz[x_pt] + mon_edge_l[x_pt]*h_adj], [mouse_xyz[z_pt], mouse_xyz[z_pt] + mon_edge_l[z_pt]*h_adj], 'o-', color=color_edge)
 
-def f_plot_lateral_over_time(ovj_vec_data, time, axis=None):
+def f_plot_lateral_over_time(ovj_vec_data, time, axis=None, ylabel=True, xlabel=True):
     if axis is None:
         _, ax1 = plt.subplots()
     else:
@@ -794,11 +794,13 @@ def f_plot_lateral_over_time(ovj_vec_data, time, axis=None):
     for n_obj in range(ovj_vec_data['obj_used'].shape[0]):
         in_fov_idx = ovj_vec_data['obj_mon_idx'][:,n_obj].astype(bool)
         ax1.plot(time[in_fov_idx], ovj_vec_data['obj_lat_angle'][:,n_obj][in_fov_idx], '.')
+    
+    if xlabel:
+        ax1.set_xlabel('time (sec)')
+    if ylabel:
+        ax1.set_ylabel('lateral') 
 
-    ax1.set_xlabel('time (sec)')
-    ax1.set_ylabel('lateral pos (Rad)') 
-
-def f_plot_vertical_over_time(ovj_vec_data, time, cam_params, axis=None):
+def f_plot_vertical_over_time(ovj_vec_data, time, cam_params, axis=None, ylabel=True, xlabel=True):
     if axis is None:
         _, ax1 = plt.subplots()
     else:
@@ -810,10 +812,12 @@ def f_plot_vertical_over_time(ovj_vec_data, time, cam_params, axis=None):
     
     f_comp_FOV_adj(cam_params)    
     ax1.set_ylim([-cam_params['vFOV_rad']/2*1.1, cam_params['vFOV_rad']/2*1.1])
-    ax1.set_xlabel('time (sec)')
-    ax1.set_ylabel('vertical pos (Rad)')
+    if xlabel:
+        ax1.set_xlabel('time (sec)')
+    if ylabel:
+        ax1.set_ylabel('vertical')
     
-def f_plot_dist_over_time(ovj_vec_data, time, axis=None):
+def f_plot_dist_over_time(ovj_vec_data, time, axis=None, ylabel=True, xlabel=True):
     if axis is None:
         _, ax1 = plt.subplots()
     else:
@@ -822,9 +826,11 @@ def f_plot_dist_over_time(ovj_vec_data, time, axis=None):
     for n_obj in range(ovj_vec_data['obj_used'].shape[0]):
         in_fov_idx = ovj_vec_data['obj_mon_idx'][:,n_obj].astype(bool)
         ax1.plot(time[in_fov_idx], ovj_vec_data['obj_dist'][:,n_obj][in_fov_idx], '.')
-        
-    ax1.set_xlabel('time (sec)')
-    ax1.set_ylabel('distance')
+    
+    if xlabel:
+        ax1.set_xlabel('time (sec)')
+    if ylabel:
+        ax1.set_ylabel('distance')
 
 def f_plot_lateral_over_time2(mouse_xyz, mon_phi, mon_theta, obj_locs, time, cam_params, axis=None):
     if axis is None:
@@ -843,7 +849,7 @@ def f_plot_lateral_over_time2(mouse_xyz, mon_phi, mon_theta, obj_locs, time, cam
     #plt.ylim([-FOV_rad_adj/2, FOV_rad_adj/2])
     #ax1.set_title('lateral translation over time')
     ax1.set_xlabel('time (sec)')
-    ax1.set_ylabel('lateral pos (Rad)') 
+    ax1.set_ylabel('lateral') 
    
 def f_plot_vertical_over_time2(mouse_xyz, mon_phi, mon_theta, obj_locs, time, cam_params, axis=None):
     if axis is None:
@@ -861,7 +867,7 @@ def f_plot_vertical_over_time2(mouse_xyz, mon_phi, mon_theta, obj_locs, time, ca
     ax1.set_ylim([-cam_params['vFOV_rad']/2*1.1, cam_params['vFOV_rad']/2*1.1])
     #ax1.set_title('vertical translation over time')
     ax1.set_xlabel('time (sec)')
-    ax1.set_ylabel('vertical pos (Rad)')
+    ax1.set_ylabel('vertical')
     
     
 def f_plot_dist_over_time2(mouse_xyz, mon_phi, mon_theta, obj_locs, time, cam_params, axis=None):
