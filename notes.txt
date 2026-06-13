@@ -1,0 +1,1187 @@
+================================================================
+VR analysis — working notes
+================================================================
+A running log of methodology discussions for VR_ca_dimred.py and
+related ensemble-extraction work. Each entry is dated to when the
+discussion happened.
+
+
+================================================================
+2026-05-05 — Algorithms to consider for cal-imaging ensemble extraction
+================================================================
+
+Setup constraint: open-world VR, no trial structure (objects come and
+go continuously). This rules out trial-structured methods like TCA,
+LFADS-as-typically-applied, GPFA-on-trials.
+
+Already in the script:
+- PCA
+- NMF (frobenius; l1_ratio = 0, 0.5, 1.0)
+- SparsePCA / MiniBatchSparsePCA
+- KL-NMF (added 2026-05; uses sklearn 'mu' solver)
+
+Ruled out from past experience:
+- ICA / PCA→ICA (Lopes-dos-Santos style cell assemblies). Tested
+  previously, was inferior to plain NMF on this data.
+
+Queued to explore (in priority order):
+
+1. Stability across seeds (no package needed).
+   For each method+k, run NMF ~10 times with different random_state.
+   For each component, find its best match in each other run via
+   Hungarian assignment + correlation. Plot mean component-stability
+   vs k. Stable components = real ensembles; unstable = noise.
+   Right thing to do once plain-vs-KL is decided. Tells you both the
+   right component count AND which ensembles to trust.
+   Implementation: sklearn + scipy.optimize.linear_sum_assignment.
+
+2. seqNMF (Mackevicius et al. 2019).
+   NMF variant that finds sequential temporal patterns rather than
+   just synchronously co-active neurons. Highly relevant for VR
+   because navigation, place codes, and reward-anticipation produce
+   sequences that vanilla NMF misses (NMF treats time bins as
+   exchangeable).
+   Install: pip install seqnmf
+
+3. Consensus NMF / cNMF (Kotliar et al. 2019).
+   Multi-seed NMF + clustering; gives per-component stability scores
+   for free. This is essentially the packaged version of item #1.
+   Install: pip install cnmf-py
+
+4. CEBRA (Schneider et al. 2023).
+   Contrastive learning that aligns the latent embedding to a
+   behavioral variable (reward, position, velocity). Since lr_data
+   and mov_data are already aligned to the imaging frames, behavior-
+   aware embedding is feasible without extra data wrangling.
+   Install: pip install cebra
+
+5. dPCA (Kobak et al. 2016).
+   Demixed PCA. Even without trial structure, can decompose
+   population variance into components attributable to continuous
+   task variables (reward state, locomotion, object presence).
+   Install: pip install dPCA
+
+Methodological additions worth doing regardless of which method wins:
+- Cross-validated reconstruction error. Current rel_error is in-
+  sample, so high-component methods will look artificially best.
+- Shuffled null using existing f_circshift_rates to determine the
+  real dimensionality.
+- Marchenko-Pastur threshold for PCA — random-matrix-theory bound
+  on noise eigenvalues, gives a hard upper bound on real
+  dimensionality.
+
+Component-count sweep currently set to [5, 10, 20, 30, 50]. Capped
+at 50 because:
+  (a) KL with mu solver is slow at high k,
+  (b) right answer for ensemble extraction usually lives in 10-50,
+  (c) n_neurons / 4 to n_neurons / 2 is the useful upper bound.
+
+
+================================================================
+2026-05-05 — Why ridge / elastic-net / lasso NMF look ~identical at alpha_W = 0.0001
+================================================================
+
+Past observation: with l1_ratio = 0 vs 0.5 vs 1.0 and alpha_W = 0.0001,
+the three NMF variants give very similar results. Why:
+
+1. alpha_W = 0.0001 is tiny relative to the reconstruction loss.
+   The penalty term sits several orders of magnitude below ||X - WH||²,
+   so the l1/l2 split barely affects the optimum.
+
+2. NMF on cal-imaging data is already sparse-ish by construction:
+   - non-negativity constraint biases toward parts-based factors,
+   - nndsvda init produces sparse W and H,
+   - most neurons are silent most of the time after smoothing.
+   The marginal sparsity gain from L1 over L2 is small.
+
+To actually exercise the regularization, sweep alpha_W over
+[0, 0.001, 0.01, 0.1] with l1_ratio = 1 (lasso). Components will get
+progressively sparser. Run this AFTER plain-vs-KL settles, on the
+winning beta_loss; otherwise it's premature.
+
+
+================================================================
+2026-05-05 — KL divergence vs Frobenius loss in NMF
+================================================================
+
+Core difference is the implicit noise model:
+
+- Frobenius (||X - WH||²): assumes additive Gaussian noise with
+  constant variance. Every error counts the same regardless of where
+  in the data it happens.
+- KL divergence (Σ X log(X/WH) - X + WH): assumes Poisson noise
+  where variance scales with mean. Errors at high-rate points are
+  weighted differently than errors at silent points.
+
+Why KL is theoretically better-suited for spike rates:
+
+1. Variance-mean coupling is real in the data. A neuron firing at
+   rate 10 has higher variance than one at 0.5 (Poisson: σ² = μ).
+   Frobenius treats both errors equally and wastes component mass
+   trying to fit noise on silent neurons. KL automatically
+   downweights low-rate errors.
+
+2. Most of the data is small numbers. Cal imaging spike rates are
+   mostly near zero. Frobenius is dominated by squared-error
+   penalties → a few bright cells in a few frames dominate the loss.
+   KL penalizes proportionally, giving the dim majority a fairer say.
+
+3. KL produces sparser, more interpretable components. The loss is
+   asymmetric — under-estimating a high value costs more than over-
+   estimating a low value. Components fit active periods cleanly
+   without smearing mass onto silent regions.
+
+4. Multiplicative updates preserve non-negativity for free. KL's
+   gradient drives sklearn's 'mu' solver. W and H stay strictly ≥ 0
+   throughout; no correction needed.
+
+5. Better matched to the generative process. Spike events per frame
+   are approximately Poisson. KL's loss IS the Poisson log-likelihood
+   (up to constants) — when data is Poisson-ish, KL is doing
+   maximum-likelihood estimation.
+
+Trade-offs (where Frobenius still wins):
+
+- Speed. The mu solver is much slower than cd, typically 3-10× per
+  iteration, and often needs more iterations. Painful at high k.
+- Numerical fragility. log(X/WH) diverges if WH approaches zero
+  where X > 0. sklearn handles with epsilon clipping but can slow
+  convergence.
+- Cleaner theoretical guarantees. Frobenius NMF has richer
+  convergence/identifiability theory. KL has these but less mature.
+- Frobenius is correct when noise truly is Gaussian. E.g., raw or
+  denoised fluorescence traces (not spike rates) — frobenius is fine
+  there. The Poisson story only applies when X represents counts/rates.
+
+Practical analogy:
+  Frobenius NMF ≈ least-squares regression
+  KL NMF ≈ Poisson regression
+
+
+================================================================
+2026-05-05 — KL / JSD as a similarity matrix (vs cosine)
+================================================================
+
+Question: can KL be used to build similarity matrices like cosine is
+used at VR_ca_dimred.py:81?
+
+Yes, but two issues with raw KL:
+
+1. KL is not symmetric: KL(P||Q) ≠ KL(Q||P). Most downstream tools
+   (hclust, MDS, UMAP) assume a symmetric distance matrix.
+2. KL is defined on probability distributions. Both inputs need to
+   be non-negative AND each row should sum to 1 (or you get weird
+   scale-dependent behavior). For firing rates: L1-normalize each row.
+
+Symmetric variants you'd actually use:
+
+- Jensen-Shannon divergence (JSD). Most common.
+    from scipy.spatial.distance import jensenshannon
+    # Returns sqrt(JSD), which is a true metric.
+    # Symmetric, bounded in [0, sqrt(log 2)], handles zeros.
+
+  Full pairwise matrix:
+    from scipy.spatial.distance import pdist, squareform
+    P = X / X.sum(axis=1, keepdims=True)   # rows sum to 1
+    dist_mat = squareform(pdist(P, metric='jensenshannon'))
+
+- Symmetric KL: (KL(P||Q) + KL(Q||P)) / 2. Less common, less well-
+  behaved (still unbounded, blows up when supports differ).
+
+- Bhattacharyya coefficient: BC(P,Q) = Σ √(P_i × Q_i). Closer to
+  cosine in spirit — bounded [0, 1], symmetric. Use 1 - BC as distance.
+
+Cosine vs JSD comparison for clustering neurons:
+
+| Aspect          | Cosine                       | JSD                              |
+|-----------------|------------------------------|----------------------------------|
+| Bounded         | [-1, 1]                      | [0, sqrt(log 2)] (bits)          |
+| Symmetric       | Yes                          | Yes                              |
+| Handles zeros   | Fine                         | Fine (with sqrt form, base=2)    |
+| Scale-invariant | Yes (purely angular)         | Requires sum-1 normalization     |
+| Interpretation  | Angular alignment            | Distinguishability of distrs.    |
+| Speed           | Very fast                    | Slower (log + sum per pair)      |
+
+JSD is the principled choice when you're already in a KL/Poisson
+framework downstream (e.g., KL-NMF). For neural firing patterns,
+cosine and JSD usually give very similar clustering when the data is
+clean. JSD is more principled when:
+- Neuron rates have very different magnitudes (cosine washes that
+  out, JSD respects it).
+- You want an information-theoretic interpretation (JSD is in bits,
+  the average bits to distinguish the two distributions).
+- The downstream method (KL-NMF) shares the probability-distribution
+  view.
+
+Most likely it won't flip the answer for ensemble extraction — but
+worth A/B once KL-NMF results land, just to see if hclust ordering
+shifts.
+
+
+================================================================
+2026-05-06 — JSD vs cosine: when each one wins (deeper dive)
+================================================================
+
+Honest summary: JSD is NOT strictly better than cosine. They measure
+different things and which one is more useful depends on what you
+want to detect.
+
+What each measures:
+- Cosine: "do these neurons fire in the same temporal pattern,
+  regardless of how active each one is?" Geometric — angle between
+  vectors. Scale-invariant; doesn't care about absolute rates.
+- JSD: "do these neurons have the same temporal probability
+  distribution?" Information-theoretic — bits of "extra surprise" if
+  you used one neuron's firing-time distribution to predict the
+  other's. Requires valid probability distributions.
+
+After max- or L1-normalization the two converge a lot, but they
+diverge in specific ways.
+
+Cases where JSD does something cosine doesn't:
+
+1. Probability-mass weighting. Cosine treats all time bins equally —
+   a 0.01 vs 0.001 difference in a silent bin counts the same as
+   0.5 vs 0.4 in an active bin. JSD weighs by probability mass, so
+   differences in active bins matter more. For sparse cal-imaging
+   data, JSD focuses on the bins that actually carry information.
+
+2. Information-theoretic interpretation. JSD is in bits — JSD = 0.3
+   means "0.3 bits on average to distinguish samples drawn from P
+   vs Q". Cosine has no scalar interpretation like that.
+
+3. Distribution-shape changes. Bursty vs sustained firing of the
+   same total mass — cosine on max-normalized rates can be
+   misleading because the bursty one dominates a single bin. JSD's
+   probability-distribution view makes the comparison more honest
+   about WHERE the mass lives.
+
+4. Consistency with downstream KL-NMF. If KL-NMF wins, using JSD
+   upstream closes a small conceptual gap (both treat firing as
+   probability distributions instead of geometric vectors).
+
+Cases where cosine wins:
+
+1. Speed. Cosine is much faster — matters for large N.
+
+2. Anti-correlation detection. Cosine returns [-1, 1], so reciprocal
+   firing patterns get similarity = -1. JSD only measures
+   dissimilarity (≥ 0), no notion of "opposite" — reciprocal and
+   random patterns just both look "very different".
+
+3. Negative inputs. Cosine works on z-scored data or residuals. JSD
+   requires non-negative probability distributions, full stop.
+
+4. Established in cal-imaging literature. Cosine is the standard for
+   cell-assembly detection in rodent ephys/imaging papers — needs
+   no defending to reviewers.
+
+Practical take for our data:
+
+JSD is more principled IF we're in a KL framework downstream (i.e.
+KL-NMF). On max-normalized spike rates, the practical difference for
+hclust ordering is often modest — tree moves a little, heatmap looks
+slightly different, rarely dramatic.
+
+Strongest reason to use JSD: conceptual consistency with KL-NMF. If
+KL-NMF wins the benchmark and becomes the method of choice, JSD for
+the upstream hclust closes a small theoretical gap. If we stay with
+frobenius NMF, sticking with cosine is reasonable (faster, more
+standard).
+
+Decision: A/B both metrics with the same data. If they agree on
+ordering, use cosine (faster, more standard). If JSD finds structure
+cosine missed AND that structure is biologically interpretable,
+that's the case for switching.
+
+
+================================================================
+2026-05-18 — Combining monitor vectorization with neural dim-red
+================================================================
+
+Two pieces now sit side by side:
+
+A. Monitor vectorization (VR_ca_analysis.py ~378-470 + f_functions.py
+   :659-769).
+   - f_get_monitor_coords → per-object (lat_angle, vert_angle, dist,
+     in-FOV mask) per monitor, sampled on the behavior clock
+     mov_data['time'] (interp_step=0.1 s → ~10 Hz).
+   - f_angles_to_movie → synthetic pixel movie mon_frames
+     (num_frames, lat_samp, vert_samp); two_mon_frames concatenates
+     left+right.
+
+B. Neural dim-red (VR_ca_dimred.py).
+   - S_smn2 (cells × imaging frames, 60 Hz, hclust-ordered).
+   - dred_all: PCA + 4 NMF variants × k ∈ {5,10,20,30,50}, with
+     scores (T_img × k) and components (k × n_cells).
+
+Time alignment: behavior is 10 Hz on mov_data['time']; imaging is
+60 Hz on est1['frame_times']; offset = bh_data[n_dset]['bh_pulse_delay'].
+Standard move: resample monitor features onto imaging frame times
+(behavior_time + delay → align to frame_times) — preserves neural
+temporal structure, which is what we care about. Downsampling
+neural to 10 Hz is the alternative but throws away the high-rate
+calcium structure.
+
+TODO / Roadmap — four threads to develop (priority order =
+implementation order, but all are on the list):
+
+1. Encoding model: monitor → neural.
+   Regress neural ensemble scores (W from dred_all per algo/k) on
+   monitor features. Two feature sets:
+     - aggregated: per-monitor presence + nearest-object lat/vert/dist
+       (~8 dims). Easy, interpretable.
+     - pixel: two_mon_frames flattened (~20k dims). Needs PCA
+       precompression. Captures position/identity that aggregates miss.
+   Output: per-component R² across algos/k. Tells which ensembles are
+   visually driven vs internal (locomotion, reward, baseline).
+   Cross-validate in time blocks; in-sample R² is misleading for
+   high-dim regressors.
+
+2. Symmetric dim-red on monitor frames + CCA vs neural latents.
+   Run PCA/NMF on two_mon_frames (flattened). Then CCA between
+   monitor latents and neural latents from dred_all. Canonical
+   correlations rank shared structure without baking in a direction.
+   Complements #1 — encoding model finds "what visual stuff drives
+   neurons"; CCA finds "what subspace is shared in both directions."
+
+3. Event-triggered averages on neural ensembles.
+   PSTH-style triggers from object-enters-FOV / leaves-FOV (per side,
+   from vec_data_*['obj_mon_idx']), reward, lick. Average neural
+   component scores around each trigger. Closest to Tier 3 biology
+   overlays already in project_dimred_ensembles.md. Most directly
+   interpretable plot for "is this ensemble locked to visual events?"
+
+4. Behavior-supervised dim-red (CEBRA-style). (STARTING ON THIS NEXT)
+   Use monitor features as auxiliary signal to supervise a joint
+   embedding. Continuous CEBRA: neural at 60 Hz, behavior signal
+   resampled to same rate. Compare embedding vs unsupervised PCA/NMF
+   on whether visual-driven structure separates cleanly. Already on
+   the queue list in memory.
+   Open question to resolve before writing code: which behavior
+   feature set to use as supervision — aggregated scalars (small,
+   interpretable, easier sanity check) or PCA-compressed pixel movie
+   (higher information content but less interpretable).
+
+Cross-thread reuse:
+ - All four need the same behavior-feature builder (resample monitor
+   data to imaging frame times). Write that helper once, reuse
+   across approaches.
+ - #1 (encoding R²) and #4 (CEBRA decoding) share the cross-
+   validation harness. Write CV split once.
+
+
+================================================================
+2026-05-18 — Decoding diagnostics: negative R² and how to read it
+================================================================
+
+First CEBRA run, blocked-CV KNN(k=15) decoding from 3D embedding:
+  PCA-3 (unsup):  R² < 0 on both agg and pix targets
+  CEBRA-agg:      R² < 0 on both
+  CEBRA-pix:      R² < 0 on both, but pix > agg
+
+Note: pix-PCA features beat agg features as a SUPERVISION signal for
+CEBRA. Likely because:
+  - pix renders the actual visual scene (so distance → angular size is
+    baked in via projection); agg passes raw distance.
+  - pix carries spatial structure of multiple objects; agg only tracks
+    the nearest object per side.
+This is why we added agg_mode = 'angular' / 'salience' / 'angular_salience'
+gating in the build cell — to test whether closing the geometric gap on
+the agg side narrows the supervision difference.
+
+Why R² is going negative — root cause is NOT just that CEBRA failed:
+
+The decoding cell predicts the FULL target vector at once (8 agg cols
+or 20 pix-PCA cols) from a 3D embedding, then reports
+multioutput='uniform_average' over columns. R² per column is
+  R²_c = 1 - SS_res_c / SS_tot_c       (where SS_tot uses TEST fold mean)
+Several target columns have tiny SS_tot:
+  - presence_L/R: binary, mostly 0 → low variance
+  - vert: mice rarely look up/down → low variance
+  - pix-PCA components 10-20: little visual variance, just noise
+For these columns, even small errors give R²_c well below 0 (e.g. -10).
+The uniform average then drags the reported number negative even when
+lat and dist are actually decoded reasonably.
+
+PCA-3 baseline going negative is for the SAME reason — predicting 8 or
+20 simultaneously from 3 unsupervised dims is over-specified. The
+baseline isn't "broken," it's reporting the right thing about an
+under-specified question.
+
+Three loosening directions (queued as tasks):
+
+(1) PCA decoding sweep — STARTING NEXT.
+    Vary n_neural_PCs as input embedding (1..50). Decode each behavior
+    feature INDIVIDUALLY (8/10 agg cols + 20 pix-PCA cols, 28-30 curves
+    total). Per-column R² as function of n_pcs. Heatmap + line plots.
+    Tells us which features are in neural variance at all and how many
+    dims each needs. Replaces the misleading single-number decoding.
+
+(2) Per-feature R² for CEBRA, plus variance_weighted aggregation.
+    Same per-column decomposition for CEBRA embeddings. Adds
+    multioutput='variance_weighted' as an alternative aggregation that
+    down-weights low-variance columns (so presence doesn't dominate).
+
+(3) Restrict-targets ablation.
+    Drop presence and vert from targets — keep just [lat_L, dist_L,
+    lat_R, dist_R]. See if uniform_average becomes positive. Tests
+    whether the negative-R² is a column problem rather than an
+    embedding problem.
+
+Methodological note: KNN(k=15) on a 3D embedding may be too few
+neighbors when n_pcs gets larger (curse of dimensionality). At n_pcs=50
+the local neighborhood is sparse and k=15 may overfit. Worth re-running
+the chosen n_pcs at multiple k values to be safe.
+
+
+================================================================
+2026-05-18 — Adversarial nonstationarity in top pix-PCs (OPEN ISSUE)
+================================================================
+
+Issue: pix-PC1 and pix-PC2 real R² falls FAR below shuffled-control null
+in the PCA decoding sweep (VR_ca_cebra.py — shuffle cell). Bottom row
+of the per-feature Δ-R² plot shows real << null for those PCs.
+Task #8 tracks this with sub-tasks #9, #10, #11.
+
+What it's not:
+ - NOT "feature isn't in neural representation" — that pattern would
+   give real ≈ null, both near zero. Real being WAY below null means
+   the real decoder is actively misled, not just empty.
+ - NOT a CV blunder — the same code does the right thing for other
+   features. Only the slow-target ones break.
+
+Diagnosis (likely cause): adversarial nonstationarity.
+
+Why top pix-PCs specifically:
+ PC1 of the rendered pixel movie tends to be a slow, session-spanning
+ signal — e.g. "is any object on either monitor at all" (overall
+ brightness) or "left-monitor vs right-monitor balance". Both change
+ on minute timescales, not frame-to-frame. PC2 is similar (next slowest
+ mode). These are the slowest, most nonstationary features in the
+ target set.
+
+Mechanism in blocked CV:
+ 1. The decoder is trained on the first 4 of 5 contiguous time blocks.
+    The pix-PC1 trajectory across those blocks has some pattern,
+    say monotonically increasing.
+ 2. Neural drift also exists — global arousal, baseline shifts, etc.
+    During training, neural PC1 and pix-PC1 may correlate spuriously.
+ 3. The decoder learns that correlation as a direction.
+ 4. In the held-out block, the relationship has drifted — different
+    neural baseline, different visual content distribution. The
+    decoder applies the learned direction in the WRONG sign or scale.
+ 5. Predictions point opposite the truth → R² strongly negative.
+
+Why shuffling rescues it:
+ - circshift_target rolls the behavior by ~10 s. The slow structure
+   in pix-PC1 is largely preserved (a 10 s roll doesn't change minute-
+   timescale trends much).
+ - But the spurious training-block alignment with neural is destroyed.
+   The decoder, trained on no consistent relationship, just learns to
+   predict near the mean → R² ≈ 0 (mildly negative).
+ - So null R² > real R² for these specific PCs, not because the null
+   is good, but because the real is actively bad.
+
+Confirmation diagnostics queued (task #9):
+ - Plot X_pix[:, 0] and X_pix[:, 1] vs frame index — look for slow
+   drift across the session.
+ - Report per-fold R² (not just the 5-fold mean) for pix_PC1 and
+   pix_PC2. Adversarial pattern: one fold ~ +0.3, others ~ -3.
+   Null pattern: all folds near 0.
+
+Fixes queued:
+ - Task #10: detrend the targets. Subtract a Gaussian-smoothed
+   (σ ≈ 5-10 s) version of each target column from itself before
+   decoding. Removes the slow drift; decoder then learns fast
+   structure that generalizes across time blocks. Apply to both
+   X_agg and X_pix.
+ - Task #11: optionally also detrend the neural embedding columns.
+   Smaller expected effect; try if target detrend alone isn't enough.
+
+Why this matters methodologically:
+ If we don't fix this, the per-feature Δ R² plot is misleading for
+ the slow features — it would say "neural population doesn't encode
+ pix-PC1" when actually it might encode it, the blocked-CV decoder
+ just can't extract it without detrending. The whole point of having
+ a shuffled control was to give the right baseline; the control is
+ working correctly here, the DECODER is misbehaving on slow targets.
+
+Code reference: VR_ca_cebra.py, sections:
+ - PCA decoding sweep (lines ~510-650)
+ - Shuffled control (lines ~660-800)
+
+
+================================================================
+2026-05-19 — VR camera convention for this rig
+================================================================
+The camera in Unity is placed at exactly 0.4 world units above the
+terrain at the mouse's (x, z). mov_data['y_pos'] records this camera
+y (not body base, not a fixed altitude), so it varies as the mouse
+moves over terrain.
+
+Spawn behavior: at session start, the mouse spawns at y=15 (above
+terrain) and falls under Unity physics until it settles at
+terrain_y + 0.4. The first few frames (~0.5 s of real time, depends
+on fall distance) report inflated y_pos values and should be treated
+as transients for any downstream analysis.
+
+Implication for f_render_terrain:
+ - eye_height = 0 is correct — no offset needed; the renderer uses
+   mouse_xyz as-is. Camera ends up at terrain + 0.4 after settling.
+ - The mouse-vs-terrain alignment histogram peaks at ≈ 0.4 with some
+   spread from NN-lookup quantization on the discrete terrain grid;
+   a long tail toward larger delta values comes from spawn-and-fall
+   frames.
+
+================================================================
+
+
+================================================================
+2026-05-19 — h/y swap bug in f_angles_to_movie_v2 vertical edges
+================================================================
+
+Discovered while debugging "object below surface of terrain" after
+adding Z-buffer compositing. Despite the compositing being correct,
+parts of objects rendered underground were still visible.
+
+The renderer's edge formulas used obj_size['y'] and obj_size['height']
+on the WRONG sides of the silhouette. Conventions:
+
+  - obj_size['y']      = object half-extent above its registered center.
+  - obj_size['height'] = offset of the registered center above the ground
+                         (and thus the angular extent below the center
+                         that should be visible — the rest is underground).
+
+In pixel space, `vert_pix = (vert_angle + vFOV/2)/vFOV * (vert_samp-1)`,
+so positive vert_angle (object above camera) maps to LARGER pix index;
+larger pix = higher in world. The mask should therefore cover:
+
+  lower_pix (= bottom of object in world) = vert_idx - obj_h_ang_pix
+  upper_pix (= top    of object in world) = vert_idx + obj_y_ang_pix
+
+Pre-fix (v1 f_angles_to_movie AND v2 f_angles_to_movie_v2):
+
+  edge_top    = vert_idx - obj_y_ang_pix   # WRONG — applied y to the bottom
+  edge_bottom = vert_idx + obj_h_ang_pix   # WRONG — applied h to the top
+
+Net effect: the rendered silhouette extended the full obj_size['y']
+BELOW the center (into the underground), while the top was capped at
+only obj_size['height'] above center. The whole painted region sat
+~(y - height)/2 lower in screen-vertical than intended.
+
+The bug was invisible in clip_underground=False mode because that path
+uses obj_y_ang_pix on both sides (symmetric ±y around center) — the
+swap doesn't change anything when the two values are equal.
+
+Fixed in v2 only (both antialias and non-antialias paths). Legacy v1
+f_angles_to_movie left alone as the historical reference.
+
+How to verify: re-render with terrain + Z-buffer composite; the
+object's bottom should now sit at the terrain horizon at its xz
+location, and the top should reach center + obj_size['y']. With
+obj_size['height']=2 and obj_size['y']>2, the visible silhouette is
+taller post-fix than pre-fix.
+
+
+================================================================
+2026-05-19 (later) — obj_size['y'] convention changed: now FULL extent
+================================================================
+
+After the h/y swap fix (see previous entry), changed obj_size['y']
+from "half-extent above center" to "FULL vertical extent of geometry"
+to remove ambiguity. For a cylinder of height 20: obj_size['y']=20.
+For a 10x10 cube: obj_size['y']=10.
+
+Updated VR_ca_cebra.py (and VR_ca_analysis.py / VR_ca_dimred.py should
+match — check if you load behavior data from those scripts):
+    obj_size = {'x': 5, 'y': 20, 'z': 5, 'height': 2}   # cylinder
+    obj_size = {'x': 5, 'y': 10, 'z': 5, 'height': 2}   # cube
+
+f_angles_to_movie_v2 was updated to divide by 2 internally so the
+"half-extent above center" stays equal to obj_size['y']/2:
+    obj_y_ang_pix_f = arctan2(obj_size['y']/2, dist) / vFOV * (vert_samp-1)
+
+Note: obj_size['x'] and obj_size['z'] remain HALF-extents (radius for
+cylinders, half-side for cubes). Inconsistent with 'y' but harmless —
+the renderer applies them directly as half-widths.
+
+Symptom that prompted the switch: with the new full-extent convention
+but the old "treat as half-extent above center" code, the object
+upper edge overshot by obj_size['y']/2 in screen-up, which in this
+rig's flipped display orientation reads as the object extending below
+the terrain horizon line — i.e. "objects go underground."
+
+Verify by re-rendering: object's bottom at the terrain horizon at its
+xz location, top at center + obj_size['y']/2.
+
+
+================================================================
+2026-05-20 — vertical orientation fix: negate vert_angle in pixel mapping
+================================================================
+
+Symptom: in default ImageJ / matplotlib display (row 0 at top of
+screen) the rendered monitor frames were vertically inverted —
+terrain appeared at the top half of the screen and the sky / cylinder
+tops at the bottom. Confirmed visually with orientation debug stripes:
+a bright row-2 stripe sat at the top of the display (as expected),
+but the world's "above camera" content was rendering at large pix =
+bottom of the display.
+
+Root cause: the lateral pixel formula was already negated
+(`-vec_data['obj_lat_angle']`) so that positive lat_angle maps to the
+right column of the display, but the vertical formula was NOT
+negated. Positive vert_angle (object above camera) was mapping to
+larger pix = bottom of the display.
+
+Fix (applied to f_angles_to_movie_v2 antialias + non-antialias paths
+AND to f_render_terrain):
+- Negate vert_angle in the pixel-mapping formula. Now positive
+  vert_angle → smaller pix → top of display. Symmetric with lateral.
+- Revert the h/y swap fix from yesterday. With the negated mapping,
+  the V1-style edge naming (edge_top at small pix = world up, the
+  natural reading) is correct again:
+      edge_top    = vert_idx - obj_y_ang_pix     (top of geometry,
+                                                  small pix = top of display)
+      edge_bottom = vert_idx + obj_h_ang_pix     (ground,
+                                                  large pix = bottom of display)
+- Keep the obj_size['y']/2 division (from the convention switch).
+
+The diagnostic helper f_plot_obj_terrain_heights had the renderer's
+pixel formula duplicated; updated to match (also negates vert_a).
+Both helpers and the renderers MUST be updated together if the
+convention changes again.
+
+Legacy v1 f_angles_to_movie left alone (has both the swap bug AND the
+missing negation — historical reference only).
+
+
+================================================================
+2026-05-20 — terrain cell_size correction: 3-cell overlap, cs = 1.0
+================================================================
+
+Earlier convention (now corrected): cell_size derived as
+chunk_pitch / cell_max = 122 / 124 ≈ 0.984. This assumed 1-cell
+overlap between adjacent chunks.
+
+Direct check: pivoted two x-adjacent chunks (A at ChunkPosX=-610 and
+B at -488, pitch=122) and compared boundary rows. The RMS-diff
+between A's last 3 rows and B's first 3 rows formed an anti-diagonal:
+
+              B[x=0]   B[x=1]   B[x=2]
+A[x=122]    →  0.0000
+A[x=123]              0.0000
+A[x=124]                       0.0000
+
+So the actual overlap is **3 cells per side**, not 1. From the
+geometry:
+
+  A[124] world_x = A_center + (124 − 62) * cs
+  B[2]   world_x = B_center + (  2 − 62) * cs
+  ⇒ A_center + 62*cs = B_center − 60*cs
+  ⇒ 122*cs = B_center − A_center = chunk_pitch = 122
+  ⇒ cs = 1.0
+
+Final convention for this rig (locked in 2026-05-20):
+  - cells per chunk: 125 (indices 0..124, cell_max = 124)
+  - chunk_pitch (center-to-center): 122 world units
+  - cell_size: 1.0 world unit per cell
+  - chunk width: cell_max * cell_size = 124 world units
+  - overlap per side: 3 cells = 2 world units
+  - chunk_centered=True (ChunkPos is at the cell-62 center)
+  - flip_z=True
+
+Code change: `f_terrain_world_coords` now takes an explicit `cell_size`
+parameter (default 1.0). The chunk_pitch/cell_max derivation is gone.
+The same parameter threads through `f_render_terrain` (both stride>=1
+and stride<1 paths). `_terr_kw` in VR_ca_cebra.py now passes
+cell_size=1.0.
+
+Symptom that the old cs=0.984 produced: each chunk was compressed by
+~0.8% — small enough that object-vs-terrain alignment still came out
+within ±0.5 (matched obj_size['height']=2 inside NN-lookup noise),
+but mouse-vs-terrain peak landed at ~−0.2 (mouse appeared 0.2 units
+below the terrain surface). In rendered video this looked like the
+camera was buried in the ground.
+
+Verification: re-running f_plot_terrain_mouse_alignment with the new
+cell_size=1.0 should:
+ - shift the mouse-delta peak from ~−0.2 to ~+0.4
+ - tighten the std (heights no longer drifting onto sloped neighbors)
+
+For a different VR rig with similar Unity heightmap format: re-run
+the chunk-overlap diagnostic to determine the actual overlap before
+trusting cell_size = 1.0.
+
+
+================================================================
+2026-05-20 — Unity source confirms terrain + camera conventions
+================================================================
+
+Spent the session debugging why mouse_y appeared 0.2 below the terrain
+surface even after cell_size=1.0 was confirmed correct. Read the Unity
+source (C:\Users\ys2605\Desktop\stuff\VR\UNITY\mouse_ob\Assets\Scripts)
+and resolved it.
+
+TERRAIN COORDS — verified from MeshGenerator.cs (Terrain4):
+
+  Vector2 topLeft = (-1, 1) * MeshWorldSize/2
+  Vector2 percent = (x-1, y-1) / (numVertsPerLine - 3)
+  vertexPos = topLeft + (percent.x, -percent.y) * MeshWorldSize
+
+  With chunkSizeIndex=3, numVertsPerLine=125, meshScale=1:
+    MeshWorldSize = (125-3) * 1 = 122
+    world_x = -61 + (x-1)/122 * 122  =  x - 62
+    world_z =  61 - (y-1)/122 * 122  =  62 - y   (this is flip_z=True)
+
+  So cell_size = meshScale (= 1.0 for this rig), and chunk centers
+  are 122 world units apart. Cell-to-world is exactly what we have:
+    f_terrain_world_coords(... chunk_pitch=122, chunk_centered=True,
+                              cell_size=1.0, flip_z=True)
+
+  HOWEVER — vertices 0 and 124 are isOutOfMeshVertex (border for
+  normal calculation only, not in the rendered/collision mesh). The
+  actual mesh covers vertices 1..123 = world x ∈ [-61, +61] = 122
+  units. Adjacent chunks' RENDERED meshes overlap by exactly 1 vertex
+  at world x=61 (chunk A's vertex 123 = chunk B's vertex 1). The
+  "3-cell overlap" the raw data shows (A[122..124] = B[0..2]) is
+  1 in-mesh overlap + 2 out-of-mesh borders per side.
+
+  For NN/bilinear lookups against the heightmap, using the full
+  125x125 grid (including borders) is fine — Unity samples the
+  same Perlin noise at those world positions, so border heights
+  match the neighboring chunk's in-mesh heights.
+
+CAMERA Y OFFSET — verified from Movement.cs + landscape.unity:
+
+  mov_data['y_pos'] = rb.position.y in Movement.cs's
+    rb.transform.position (the Rigidbody anchor).
+
+  Unity scene hierarchy (landscape.unity) under the player:
+    Rigidbody
+     └─ Cam_googles      localPosition (0, -0.4, -1.5)
+         ├─ Camera_L_eye  localPosition (0, +1, +1)  Euler (0, -45, 0)
+         └─ Camera_R_eye  localPosition (0, +1, +1)  Euler (0, +45, 0)
+
+  Net camera Y offset above rb anchor = -0.4 + 1 = +0.6.
+
+  So camera_y = mouse_y + 0.6.
+  Observed mouse-vs-terrain delta = -0.2 → camera-vs-terrain = +0.4.
+  Matches the "camera is 0.4 above terrain" recollection.
+
+  The -0.2 mouse_y - terrain_y is correct/expected: the rb anchor
+  is positioned 0.6 below the eyes, so it sits 0.2 below the
+  terrain surface when the bottom of the mouse body is on the
+  ground.
+
+  There's also an xz offset of +1 (z) under the goggles, rotated by
+  rb yaw + tilted ±45° per eye. For y-only (terrain occlusion) this
+  doesn't matter; for super-precise per-eye geometry it would.
+
+SOLUTION — locked into VR_video_recon.py:
+ - cam_params['cam_height'] = 0.6 added.
+ - mov_data_eye = shallow copy with y_pos shifted by +cam_height.
+ - f_get_monitor_coords called with mov_data_eye (object angles
+   computed from camera position).
+ - f_render_terrain called with mouse_xyz_eye and eye_height=0
+   (shift already baked into mouse_xyz_eye).
+ - Result: terrain renders with the camera at terrain + 0.4 above
+   ground, consistent across both renderers.
+
+For different rigs / Unity scenes, re-derive cam_height from the
+landscape scene's player hierarchy (sum of localPosition.y from
+Rigidbody down to the eye camera).
+
+
+  -- 2026-05-20 (extension) --
+  Same cam_height=0.6 fix extended from VR_video_recon.py to:
+    - VR_ca_cebra.py  (line 110 cam_params, line 125 mov_data_eye,
+                       lines 142-143 f_get_monitor_coords)
+    - VR_ca_analysis.py (line 358 cam_params, line 378 mov_data_eye,
+                         line 391 mouse_xyz, lines 397-398
+                         f_get_monitor_coords)
+  All three scripts now compute object angles from camera position,
+  not rb anchor. CEBRA aggregate features + decoding outputs will
+  shift by ~1° in obj_vert_angle (consistent across frames). VR_ca_
+  dimred.py and VR_analysis.py don't call f_get_monitor_coords and
+  don't need the fix.
+
+
+  -- 2026-05-20 (legacy v1 cleanup) --
+  Brought f_angles_to_movie (legacy 4-edge outline renderer) up to v2's
+  conventions:
+    1. output shape changed from (T, lat, vert) → (T, vert, lat) so rows
+       are vert and cols are lat (was internally consistent only when
+       lat_samp == vert_samp).
+    2. vert_angle NEGATED in the pixel-mapping formula → default ImageJ
+       shows natural sky-up. Was rendering upside-down.
+    3. obj_size['y'] interpreted as FULL vertical extent (half-extent
+       above center = y/2). Was treating y as half-extent of the old
+       convention.
+    4. ground clip now via arctan2(obj_size['height'], dist), not the
+       small-angle approximation obj_y_pix * h/y the old code used.
+    5. edge_top / edge_bottom names match world up/down AND display
+       top/bottom (small pix = top of display = world up).
+    6. dtype uint8 (was int).
+    7. extra >=0 bound check on edge_top before painting horizontal
+       edges (the old code only checked < bound for edge_bottom).
+  Function is still the wireframe-outline variant (not filled, no
+  antialiasing, no depth compositing) — kept for visual debugging.
+  For production rendering use f_angles_to_movie_v2.
+
+
+================================================================
+2026-05-20 (cleanup) — split diagnostics out of f_functions.py
+================================================================
+
+f_functions.py was approaching 3050 lines, mixing production
+rendering toolkit with ~23 debug/sanity helpers. Split:
+
+  f_functions.py            → production only (~1570 lines)
+                              loaders, f_angles_to_movie + v2,
+                              f_render_terrain, f_composite_with_depth,
+                              f_terrain_world_coords, f_save_mon_movie.
+
+  f_render_diagnostics.py   → new file (~1500 lines)
+                              terrain coord sanity plots
+                              (f_plot_terrain_layout / _mouse_alignment /
+                               _object_alignment, f_terrain_coord_diagnostic,
+                               f_plot_mouse_vs_terrain, f_diag_chunk_overlap,
+                               f_check_obj_coord_system,
+                               f_run_terrain_diagnostics),
+                              chunk-0 hand-rolled lookups
+                              (f_diag_chunk0_mouse_height,
+                               _bilinear, _offset_sweep,
+                               _offset_sweep_2d, _offset_sweep_2d_bilinear),
+                              rendered-frame debug
+                              (f_add_orientation_stripes,
+                               f_plot_monitor_frame, f_plot_obj_terrain_heights,
+                               f_plot_monitor_outline),
+                              over-time plotters
+                              (f_plot_lateral/vertical/dist_over_time
+                               and *_over_time2).
+
+Dependency: f_render_diagnostics → f_functions (one-way).
+
+Updated import lines in VR_video_recon.py, VR_ca_cebra.py,
+VR_ca_analysis.py, VR_ca_dimred.py — each now has a two-line
+pattern (f_functions for prod helpers, f_render_diagnostics for
+debug).
+
+CLAUDE.md and memory updated.
+
+
+================================================================
+2026-05-20 — session wrap-up
+================================================================
+
+Major fixes locked in this multi-day push (all entries above):
+ - cell_size = 1.0 (correct interpretation of 3-cell chunk overlap;
+   was 122/124 ≈ 0.984).
+ - vert_angle negation in pixel mapping → natural sky-up in default
+   ImageJ for both renderers + diagnostics.
+ - h/y in object silhouette: render from ground (-height below center)
+   to top (+y/2 above center), with obj_size['y'] interpreted as full
+   geometry extent.
+ - cam_params['cam_height'] = 0.6: Rigidbody anchor → camera-eye Y
+   offset for this rig, derived from Unity landscape.unity hierarchy.
+   mov_data_eye built and passed to f_get_monitor_coords + renderers
+   in VR_video_recon.py, VR_ca_cebra.py, VR_ca_analysis.py.
+ - f_angles_to_movie (legacy) corrected to v2 conventions.
+ - f_save_mon_movie gained explicit overwrite=True.
+
+Refactors:
+ - Synthetic-video rendering + terrain debugging moved into a new
+   self-contained script: VR_video_recon.py (2026-05-20).
+ - Debug / sanity helpers split out of f_functions.py into
+   functions/f_render_diagnostics.py (~23 functions, ~1500 lines).
+   One-way dependency: f_render_diagnostics → f_functions.
+
+Documentation:
+ - notes.txt (this file): per-day dated entries with rationale.
+ - CLAUDE.md: updated file listings + function-by-function bullets.
+ - memory/ updated: project_terrain_coords, project_focus_files,
+   project_cebra_script (refreshed), project_render_diagnostics (new),
+   reference_unity_source (new), MEMORY.md hooks.
+
+Pending (open methodological issues, separate from rendering):
+ - #8  — adversarial nonstationarity in top pix-PCs.
+ - #12 — empty-frame encoding ambiguity.
+ - #17 — multi-object collapse choice.
+
+Pick one of #8/#12/#17 next session if rendering looks good after the
+kernel restart + re-run.
+
+
+================================================================
+2026-05-29 — Modular feature pipeline + new feature blocks
+================================================================
+
+Refactored the build cell in VR_ca_cebra.py from a monolithic ~230-line
+block into a single call to `build_feature_blocks(...)` (in
+functions/f_feature_helpers.py). The function returns a `built_blocks`
+dict keyed by block name. Downstream cells now select feature
+combinations by name (target_blocks=['agg', 'motion'], etc.) via the
+`combine_blocks(...)` helper.
+
+7 block kinds currently supported:
+  agg       — position channels per side                   (always built)
+  pix       — pixel-PCA components                          (always built)
+  motion    — object velocity channels per side             (build_motion)
+  pix_mot   — d/dt of each pix-PC trace        — task #29   (build_pix_motion)
+  self_mot  — mouse running speed + yaw rate   — task #23   (build_self_motion)
+  beh       — lick + reward events             — task #35   (build_lick_reward)
+  per_obj   — per-object identity-preserving                (build_per_obj)
+
+Module split: f_cebra_helpers.py (originally a feature-builder grab-bag)
+was renamed to f_feature_helpers.py. The new f_cebra_helpers.py holds
+only CEBRA-specific helpers: make_cebra_supervision (wraps the registry
+output with NaN→0 fill + z-score; CEBRA can't take NaN) and f_run_cebra
+(training wrapper).
+
+CEBRA fit cell now driven by a `cebra_supervisions` dict that maps
+model-name → list-of-block-names. cebra_agg / cebra_pix kept as
+backward-compat aliases; new entries (e.g. 'agg_motion': ['agg',
+'motion']) automatically propagate to embedding scatter, decoding A/B
+bar plot, Procrustes, and `input_source='cebra:<name>'` decoder.
+
+Other small additions:
+ - Procrustes embedding similarity diagnostic (task #33). Pairwise
+   disparity matrix across PCA-3 + every cebra_models entry + aligned-
+   overlay scatter for one chosen pair.
+ - Joint-R² metric (task #26). `multioutput='variance_weighted'` option
+   added to f_blocked_cv_r2 and _cv_r2_multi. Avoids drag from low-
+   variance binary columns (e.g. presence).
+ - Per-script `render_verbose` knob in VR_ca_cebra.py flows to
+   f_angles_to_movie_v2 and f_render_terrain.
+
+Rendering speedups:
+ - f_angles_to_movie_v2 (~50-125× per-object): in-FOV time filter (skip
+   frames where object not in monitor) + per-object spatial bbox clip
+   (compute coverage only over the bbox region, via np.ix_ cross-product
+   indexing for in-place reads/writes).
+ - f_render_terrain (~2-3×): replaced the (chunk × N_local) arctan2 +
+   modulo-wrap with a cheap cone test using sin/cos dot products. arctan2
+   now runs only on the ~25% of samples that pass the horizontal FOV
+   pre-filter. Math is exact, not approximate.
+
+Open issues that still bite, but now have richer tooling:
+ - #8: top pix-PC R² below shuffled null. Detrend fix (#10) still queued.
+   With pix_mot / self_mot blocks now available, can ask "which blocks
+   are drift-prone?" (likely position-style: agg, pix; less likely
+   velocity-style: motion, pix_mot, self_mot — differentiation is itself
+   a high-pass filter).
+ - #12: empty-frame encoding. Still using Option B (NaN-fill).
+ - #17: multi-object collapse. Salience-mean (Option a) + per-obj
+   identity (Option b) implemented.
+
+Next likely sessions: #10 (detrend), then either #3 (event-triggered
+averages around lick / reward / object-enter — the `beh` block makes
+this trivial now) or #31 (time-lagged PCA on pix-PC traces).
+
+================================================================
+2026-06-01 — Port of MATLAB ensemble_analysis_YS pipeline to Python
+================================================================
+Existing track in VR_ca_dimred.py runs an NMF/PCA sweep across k with
+in-sample reconstruction error + Hoyer sparsity + Hungarian
+component-stability across seeds + circshift-shuffle null on
+explained variance. That answers "which method is reconstructing well",
+not "which components are real ensembles" or "what is the right
+smoothing / k for held-out data". The MATLAB pipeline at
+C:\Users\ys2605\Desktop\stuff\ensemble_analysis_YS\ has both:
+out-of-sample CV-driven param selection, and threshold-based
+cell→ensemble assignment with a shuffle null. We are porting the
+relevant pieces.
+
+Four methods ported into functions/f_ensembles.py:
+
+  A. CV grid sweep (smooth_SD x num_comp) using leave-neuron-out test
+     error. Each fold smooths + normalizes train, fits NMF/PCA, then
+     predicts each held-out cell from the factor basis of the others
+     on the raw test fold. Reports test_err / train_err / test_norm
+     averaged across folds. Optional shuffled-null grid via
+     with_shuffle=True.
+       Entry: f_cv_estimate_grid → pandas.DataFrame.
+
+  B. Auto-num-comp via shuffle PCA eigenvalues. Fit PCA on real X +
+     n_shuf circshift-shuffled copies; count components whose
+     explained-variance ratio exceeds the per-shuffle max. Mean count
+     across shuffles → dimensionality_corr (ceil = recommended k).
+       Entry: f_estimate_dim_corr.
+
+  C. Threshold-based extraction. Per-component cutoff via signal_z
+     (median + 2.5 * MAD-like spread) or shuff (95th percentile of
+     50-shuffle NMF coeff/score pool). Assigns cells (coeffs > thresh)
+     and trial frames (scores > thresh) to ensembles. Output ens_out
+     mirrors MATLAB shape: cells.ens_list[i], cells.clust_ident,
+     cells.non_ens_list, ens_scores; same for trials.
+       Entry: f_ens_get_thresh + f_apply_thresh.
+
+  D. Cluster-based extraction. Filter cells whose mean pwcorr exceeds
+     the shuffle null at the 95th percentile per cell, then hclust on
+     coeffs (Euclidean default for NMF, cosine for PCA/ICA). Cells
+     below the filter stay labelled 0 ("unassigned"). Output mirrors
+     Method C.
+       Entry: f_extract_clust.
+
+Top-level orchestrator: f_ensemble_extract(X, num_comp=None,
+smooth_sigma_bins=None, dred_method=..., extraction=..., ...). If
+num_comp is None, calls Method B to auto-pick. Returns the merged
+ens_out dict.
+
+MATLAB-style plots in functions/f_ensemble_plots.py: f_plot_cv_grid
+(surface or 1D line of CV err; real blue, shuf black), f_plot_dim_estimate
+(Method B real vs shuf eigenvalues + dim_corr line), f_plot_raster_mean
+(sorted heatmap + linked mean trace + optional trial bands),
+f_plot_trial_indicator (coloured bands above raster),
+f_plot_ensemble_deets (per-ensemble 4-panel: cells sorted by coeff
+descending + sorted-coeff bar + mean trace with pink active-trial
+background + ensemble score trace; all x-axes linked),
+f_plot_comp_scatter (2D/3D, colored by ensemble label), f_plot_ens_overview
+(convenience that reproduces the MATLAB drivers end-of-script figure set).
+
+Design decision — moved f_NMF / f_PCA / f_sparsePCA /
+f_mini_batch_sparsePCA / f_dred_add_error / f_hoyer_sparsity /
+f_component_stability OUT of VR_ca_dimred.py into f_ensembles.py. The
+CV loop (A), the shuffle null (B), and the threshold shuffle (C) all
+refit NMF/PCA from inside the module — leaving these inline forced a
+circular import. The script keeps a single import line at the top so
+existing cells (sweep, Hoyer, stability) run unchanged. Surrounding
+comments (alpha_W sweep ranges per NMF variant, stability sweep
+explanation, etc.) preserved per the keep-old-code rule.
+
+Behavior-clamped exploration — three exploratory branches:
+
+  (a) Ensemble extraction on CEBRA latents (VR_ca_cebra.py, new cell).
+      Treat the CEBRA embedding (T, d_emb) as the scores matrix and
+      fit a per-cell ridge to get coeffs (n_cells, d_emb). Then run
+      f_ens_get_thresh + f_apply_thresh. The cell groups per latent
+      dim become the behavior-supervised ensembles.
+
+  (b) Behavior-residualized NMF (VR_ca_dimred.py, new cell). Build a
+      behavior block B via build_feature_blocks + make_cebra_supervision
+      (same registry as CEBRA), then X_resid = f_residualize_on_behavior
+      (X, B, ridge_alpha=1e-3). Run f_ensemble_extract on X_resid. The
+      remaining structure is behavior-independent.
+
+  (c) Constrained NMF (VR_ca_dimred.py, new cell + f_NMF_constrained
+      sketch in f_ensembles.py). Semi-supervised NMF where a block of
+      H rows is CLAMPED to behavior targets and the rest is free.
+      Alternating multiplicative updates with L2 ridge on W. First-pass;
+      hyperparameter sweeps and convergence diagnostics deferred.
+
+All three are if-0-toggled cells per the Spyder convention — they ride
+alongside the unsupervised pipeline rather than replacing it.
+
+Tracking: TODO.md #36 (+ sub-items 37–45). Memory: project_ensembles.md.
+
+
+================================================================
+2026-06-04/05 — VR_ca_cebra.py decoding refactor → functions/f_decoding.py
+================================================================
+Pulled the repeated decoding machinery out of VR_ca_cebra.py into a single
+new module functions/f_decoding.py (compute + plots together, per request).
+Done incrementally in four behaviour-preserving groups, each verified
+(synthetic equivalence tests + per-figure Agg smoke tests + the user
+confirming sweep/null/recon outputs unchanged in Spyder):
+
+  Group 1 — compute utils: f_imaging_fs (was a try/except median-diff snippet
+    repeated 3x), make_decoder (single ridge/ridgecv/knn factory + classifier
+    twins; replaced _make in f_blocked_cv_r2, the dead _make_decoder, and
+    _mk_diag), f_shuffle_neural (per-cell circshift null, 4 call sites),
+    f_pca_prefix (fit_transform-at-k, ~7 sites), f_apply_block_detrend
+    (per-block high-pass loop, 2 sites).
+  Group 2 — target building: build_target_columns (per-column targets, with
+    binary/presence split + block-selective detrend) for the sweep + grid;
+    build_target_matrix (concatenated multi-output target, + skip_presence)
+    for the decoding-vs-n_pcs + real-vs-recon cells; legacy_target_blocks
+    (unifies the two duplicated _legacy_map dicts). f_is_binary_col detector.
+  Group 3 — unified the last re-rolled CV loop: the per-fold diagnostic cell
+    now calls f_blocked_cv_r2(return_predictions=True) instead of its own
+    _fit_fold (verified bit-identical perfold/oof/pooled-R²). The real-vs-
+    reconstructed OOF loop was deliberately LEFT inline — its default
+    mask_pred_to_valid=False predicts every test frame incl. NaN-target empty
+    frames (extrapolation diagnostic) + hosts PLS/CCA, which f_blocked_cv_r2
+    can't reproduce.
+  Group 4 — extracted all decoding figures into f_decoding plot helpers
+    (bars, sweep summary, real-vs-null, feature heatmap, sweep lines, OOF
+    trace+scatter, per-feature null grid, grid delta-heatmap, grid focus
+    lines, real-vs-shuffle line, input raster, recon scatter/traces) and
+    added 8 SECTION banners after each #%% breaker.
+
+Net: VR_ca_cebra.py 2447 -> ~2014 lines; f_decoding.py ~22 functions.
+
+Two methodology changes rode along (not just refactor):
+ - Binary target handling. presence_L/R is 0/1 and base-rate-skewed, so its
+   blocked-CV R² is meaningless (SS_tot = n*p(1-p) tiny -> deeply negative
+   under block mean-drift). Now split off and scored with ROC-AUC (chance
+   0.5) via f_blocked_cv_r2(task='classification'): ridge->LogisticRegression
+   (C=1/alpha), ridgecv->LogisticRegressionCV, knn->KNeighborsClassifier.
+   The sweep/null plot presence on a separate AUC axis with its own shuffle
+   band. Validated: shuffled binary AUC collapses to ~0.5.
+ - OOF trace+scatter diagnostic (return_predictions). The scatter's OLS slope
+   disambiguates negative R²: slope~0 = decoder predicting train mean (blocked
+   -CV pessimism / low variance, Mechanism 1, not a real failure); tilted/neg
+   = drift-misled (#8); slope~1 = genuine decoding.
+
+Spyder gotcha fixed: the plot helpers originally returned fig, which made a
+trailing helper call echo the Figure inline in the IPython console on top of
+the separate window. Dropped `return fig` from all plot helpers.
+
+CEBRA/embedding-specific plots (loss curves, _plot_emb_scatter, Procrustes)
++ the per-fold 3-panel were left inline — different concern; candidate for a
+future f_cebra_plots.py if wanted.
+
+================================================================
+2026-06-06 — Visual-cortex-style monitor input representations (plan)
+================================================================
+Current monitor features decode weakly (position barely above/at chance; e.g.
+ang_size in-sample train R² only ~0.3 even at k=50 PCs, test negative). The two
+representations are at opposite wrong extremes vs how visual cortex encodes the
+scene:
+  - agg  = one object-CENTER point (lat/vert/dist) → no edges, no spatial
+           extent, no retinotopic location, only coarse center velocity.
+  - pix  = PCA on raw rendered intensity → top PCs are global brightness /
+           "anything on screen" / L-R balance (the slow drift modes behind #8).
+           Linear PCA on raw pixels is not aligned to any cortical computation.
+Cortex is LOCATION-selective and DIRECTION-selective (oriented edges at
+retinotopic locations, with motion), and applies nonlinearities (rectify,
+square) BEFORE a roughly linear readout. Our decoder is linear (ridge) with a
+front-end that has none of that.
+
+Organizing principle (canonical encoding-model pipeline, Hubel-Wiesel ->
+Adelson-Bergen motion energy -> Gallant-lab encoding models):
+    filter -> nonlinearity -> spatial/temporal pool -> compress -> linear decode
+i.e. put the nonlinear visual front-end into the FEATURES. Substrate is ideal:
+two_mon_frames is ~101x101 per monitor in ANGULAR coords (pixel ~ degree),
+crisp synthetic silhouettes, known geometry.
+
+Options (all become new built_blocks behind build_* knobs; compute on behavior
+clock then resample; PCA-compress; decode through f_blocked_cv_r2). Tiered
+cheap->expensive:
+  Tier 1 'grid'  — retinotopic tiling: per-cell occupancy/contrast/edge energy.
+                   Location selectivity; biggest conceptual fix; trivial.
+  Tier 2 'flow'  — dense optical flow (Farneback) pooled into the grid: speed,
+                   direction sin/cos, divergence(=local looming). Direction-of-
+                   edge-motion = the stated target. Realizes #24/Level C.
+  Tier 3 'gabor' — Gabor energy bank (orientation x SF) pooled into the grid =
+                   V1 simple/complex cells. Oriented edges at locations.
+  Tier 4a 'meng' — Adelson-Bergen motion energy (x-y-t oriented filters):
+                   principled direction+speed tuning ("moving edges").
+  Tier 4b 'cnn'  — pretrained-CNN early-conv feature maps: data-driven ceiling
+                   / benchmark (goal-driven nets best predict visual cortex).
+  Tier 5         — supporting: local looming (flow divergence), DoG center-
+                   surround SF/contrast channels, oriented-edge/HOG proxy,
+                   1-D angular histogram (#20 = degenerate grid).
+
+Will likely try all and pick empirically; expected winner if cells are
+location+direction selective = Tier 2 (flow on a retinotopic grid). Caveat:
+dimensionality revives the negative-R²/overfit dynamics -> always PCA-compress
++ blocked CV + shuffle null + OOF/train-vs-test diagnostics (all transfer
+unchanged). Motion/edge features are differentiated/rectified -> less drift-
+prone than raw pix (helps #8). Mouse acuity is low (~0.5 cyc/deg) + area-
+dependent SF/TF tuning -> keep banks SMALL (2-3 SFs, ~4 orientations).
+
+Full design + per-tier builder specs: PLAN_monitor_features.md. Tracking:
+TODO.md #47 (sub-tasks #48-#53). User has additional edge/edge-motion ideas to
+fold into the Tier-2/3 builder design before implementation.

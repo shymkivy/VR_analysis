@@ -6,20 +6,18 @@ Created on Mon Sep 15 11:26:21 2025
 """
 
 import sys
-import os
+from pathlib import Path
 
-for user1 in ['ys2605', 'shymk']:
-    if os.path.isdir('C:/Users/' + user1):
-        path1 = 'C:/Users/' + user1 + '/Desktop/stuff/VR/VR_analysis/'
+path1 = Path.home() / 'Desktop' / 'stuff' / 'VR' / 'VR_analysis'
 
-sys.path.append(path1)
-sys.path.append(path1 + '/functions')
+sys.path.append(str(path1))
+sys.path.append(str(path1 / 'functions'))
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from f_functions import f_load_fnames, f_load_bh_data, f_get_session_data, f_plot_session2, f_proc_movement, f_proc_lick_rew, f_proc_lick_rew_df, f_spheric_to_cart, f_cart_to_spheric_np, f_comp_FOV_adj, f_plot_monitor_outline, f_plot_lateral_over_time #, f_plot_vertical_ov_time, f_plot_dist_ov_time # f_plot_session
+from f_functions import f_load_fnames, f_load_bh_data_all, f_get_session_data, f_plot_session2, f_proc_movement, f_proc_lick_rew, f_proc_lick_rew_df, f_spheric_to_cart, f_cart_to_spheric_np, f_comp_FOV_adj, f_add_phase, f_plot_monitor_outline, f_plot_lateral_over_time, f_plot_vertical_over_time, f_plot_dist_over_time # f_plot_session
 
 #%%
 
@@ -42,12 +40,16 @@ params_xls = pd.read_excel(dpath + tag1 + '_params.xlsx')
 #df_save.to_csv(dpath + '//../RL_data.csv', index=False)
 
 
-bh_data = []
-                                                
-for ftag in flist:
-    
-    bh_data_slice = f_load_bh_data(dpath2, ftag, params_xls)
-    bh_data.append(bh_data_slice)
+# Old per-dataset loop — superseded by f_load_bh_data_all (no data_ca here, so
+# no alignment / pulse-diff diagnostics; behavior-only loading).
+# Kept commented for reference.
+#
+# bh_data = []
+# for ftag in flist:
+#     bh_data_slice = f_load_bh_data(dpath2, ftag, params_xls)
+#     bh_data.append(bh_data_slice)
+
+bh_data = f_load_bh_data_all(dpath2, flist, params_xls)
 
 #%%
 
@@ -79,7 +81,7 @@ num_dsets = len(bh_data)
 peak_reward_rate = np.zeros(num_dsets)
 #for n_dset in range(num_dsets):
 
-n_dset = 70    
+n_dset = min(70, num_dsets - 1)    # guard the hardcoded probe index
 
 ftag = bh_data[n_dset]['dset_name']
 ftag2 = tag1 + ftag
@@ -196,10 +198,12 @@ if 0:
 
 #%% analyze vid feed
 
-cam_params = {'aspect':     16/9,
-              'clip_len':   50,
-              'FOV_deg':    80,
-              'num_mon':    2}
+cam_params = {'aspect':             16/9,
+              'FOV_axis':           'vertical',
+              'FOV_deg':            80,
+              'cam_rotation_deg':   49.2,
+              'clip_len':           50,
+              'num_mon':            2}
 
 df_obj_data = bh_data[n_dset]['object_data']
 df_mov = bh_data[n_dset]['movement']
@@ -210,13 +214,13 @@ mov_data = f_proc_movement(bh_data[n_dset], do_interp=1, interp_step = 0.1, plot
 phi = mov_data['phi']
 theta = mov_data['theta']
 
-FOV_rad_adj, h_adj = f_comp_FOV_adj(cam_params)
+cam_params = f_comp_FOV_adj(cam_params)
 
 mouse_xyz = np.array((mov_data['x_pos'], mov_data['y_pos'], mov_data['z_pos'])).T
 obj_locs = np.vstack((df_obj_data.ObjLocX.to_numpy(), df_obj_data.ObjLocY.to_numpy(), df_obj_data.ObjLocZ.to_numpy())).T
 
-mon_r_phi = phi+FOV_rad_adj/2
-mon_l_phi = phi-FOV_rad_adj/2
+mon_r_phi = f_add_phase(phi, cam_params['cam_rotation_rad']*1.0)
+mon_l_phi = f_add_phase(phi, -cam_params['cam_rotation_rad']*1.0)
 
 if 0:
     
@@ -233,12 +237,12 @@ if 0:
         ax1.plot(mouse_xyz[n_pt,0], mouse_xyz[n_pt,2], 'o', color='lightgreen')
         if cam_params['num_mon'] == 1:
             # mouse
-            f_plot_monitor_outline(mouse_xyz[:,n_pt], phi, theta, n_pt, 0, cam_params, axis=ax1, color_cent = 'gray', color_edge = 'blue')
+            f_plot_monitor_outline(mouse_xyz[n_pt,:], phi[n_pt], theta[n_pt], cam_params, axis=ax1, color_cent = 'gray', color_edge = 'blue')
 
         elif cam_params['num_mon'] == 2:
             # mouse
-            f_plot_monitor_outline(mouse_xyz[:,n_pt], phi, theta, n_pt, -FOV_rad_adj/2, cam_params, axis=ax1, color_cent = 'gray', color_edge = 'green')
-            f_plot_monitor_outline(mouse_xyz[:,n_pt], phi, theta, n_pt, FOV_rad_adj/2, cam_params, axis=ax1, color_cent = 'gray', color_edge = 'blue')
+            f_plot_monitor_outline(mouse_xyz[n_pt,:], mon_l_phi[n_pt], theta[n_pt], cam_params, axis=ax1, color_cent = 'gray', color_edge = 'green')
+            f_plot_monitor_outline(mouse_xyz[n_pt,:], mon_r_phi[n_pt], theta[n_pt], cam_params, axis=ax1, color_cent = 'gray', color_edge = 'blue')
 
 
     fig, (ax1, ax2, ax3) = plt.subplots(3,1, sharex=True)
