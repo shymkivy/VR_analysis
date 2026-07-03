@@ -23,6 +23,7 @@ from sklearnex import patch_sklearn
 patch_sklearn()
 
 from f_utils import f_load_caim_data, f_gauss_smooth
+from f_pipeline import f_load_session
 from f_analysis import f_hclust_firing_rates, f_circshift_rates
 from f_functions import f_load_bh_data, f_get_session_data, f_plot_session2, f_proc_movement, f_proc_lick_rew, f_proc_lick_rew_df, f_comp_FOV_adj, f_add_phase, f_get_monitor_coords, f_angles_to_movie, f_angles_to_movie_v2 #, f_plot_session
 from f_render_diagnostics import f_plot_monitor_outline, f_plot_lateral_over_time, f_plot_vertical_over_time, f_plot_dist_over_time
@@ -53,16 +54,11 @@ import time
 
 #%% Config — mouse, paths, object size
 mouse_id = 'L'
+n_dset   = 3        # dataset index into the do_proc==1 rows (selects est1 below)
 
-data_dir = 'F:/VR/data_proc/' + mouse_id    # edit this  
+data_dir = 'F:/VR/data_proc/' + mouse_id    # edit this
 data_dir_bh = 'F:/VR/Bh_data/mice_gcamp/'
-# search for files to load using tags in the filename
-
-vr_data = pd.read_excel('F:/VR/data_proc/VR_data.xlsx')
-params_xls = pd.read_excel(data_dir_bh + mouse_id + '_params.xlsx')
-
-vr_data2 = vr_data.loc[(vr_data.mouse_id == mouse_id) & (vr_data.do_proc == 1)].reset_index(drop=True)
-num_dsets = len(vr_data2)
+vr_data_xlsx = 'F:/VR/data_proc/VR_data.xlsx'   # dataset table (f_load_session reads it)
 
 lick_col = 'red'
 lick_col2 = 'lightcoral'
@@ -77,17 +73,27 @@ obj_size = {'x':        5,
 
 # cylinders radius 5, half height 10.. coordinate at center.. height is y + height
 
-#%% Load calcium data
-data_ca = f_load_caim_data(data_dir, vr_data2.dset_name, caiman_tag = 'results_cnmf.hdf5', cuts_tag='h5cutsinfo', frame_data_tag = 'framedata', r_values_min = 0.5, min_SNR=1.5, thresh_cnn_min=0.8)
+#%% Load calcium + behavior + cheap vectorization (f_load_session)
+# Loads calcium + behavior, picks est1, runs the cheap vectorization (mov_data /
+# lr_data / vec_data_l/r). Behavior is only needed by the behavior-residualized
+# cells in Section 7, but it's cheap and keeps those cells self-contained.
+session = f_load_session(mouse_id, n_dset, data_dir, data_dir_bh, vr_data_xlsx)
+data_ca      = session['data_ca']
+bh_data      = session['bh_data']
+est1         = session['est1']
+cam_params   = session['cam_params']
+mov_data     = session['mov_data']
+lr_data      = session['lr_data']
+vec_data_l   = session['vec_data_l']
+vec_data_r   = session['vec_data_r']
+pulse_delay  = session['pulse_delay']
+beh_t        = session['beh_t']
+frame_t      = session['frame_t']
 
 #%% Pick dataset, smooth + hclust-sort + raster preview
-n_dset = 3
-
 num_comp = 50
 n_jobs = 5
 
-est1 = data_ca[n_dset]
-     
 S_sm = f_gauss_smooth(est1['S'], sigma_frames=6)
 S_smn = S_sm/np.max(S_sm, axis=1)[:,None]
 
@@ -904,7 +910,8 @@ if 0:
 # Regress neural data on a behavior block (built via the CEBRA registry),
 # then run the full ensemble pipeline on the residuals. The remaining
 # structure is the behavior-independent ensembles.
-# REQUIRES bh_data — load via VR_ca_cebra.py-style cells first.
+# bh_data / est1 / vec_data_l/r come from f_load_session above; a pixel block
+# would also need two_mon_frames (render first — not loaded by f_load_session).
 
 if 0:
     # Build behavior features via the same registry the CEBRA script uses.
@@ -912,7 +919,8 @@ if 0:
     from f_feature_helpers import build_feature_blocks, f_zscore
     from f_cebra_helpers import make_cebra_supervision
 
-    # Minimal call — assumes bh_data, est1, two_mon_frames, vec_data_l/r exist.
+    # Minimal call — bh_data, est1, vec_data_l/r from f_load_session; two_mon_frames
+    # needs a render (passed None here).
     built = build_feature_blocks(
         bh_data[n_dset], est1, vec_data_l, vec_data_r,
         two_mon_frames=None, n_pix_pca=10,

@@ -33,14 +33,16 @@ from sklearn.neighbors import KNeighborsRegressor, KNeighborsClassifier
 from sklearn.metrics import r2_score, roc_auc_score
 
 from f_feature_helpers import f_zscore
-from f_decoding import make_decoder
+from f_decoding import make_decoder, f_resolve_n_components, f_lag_embed
 
 
 def f_blocked_cv_r2(emb, target, n_folds=5, embargo=0, standardize=True,
                     decoder='ridge', ridge_alpha=1.0, k_nn=15,
-                    ridgecv_alphas=None, multioutput='uniform_average',
+                    ridgecv_alphas=None, n_components=None,
+                    multioutput='uniform_average',
                     Y_raw=None, n_pcs=None, random_state=42, return_std=False,
-                    return_predictions=False, task='regression'):
+                    return_predictions=False, task='regression', lags=None,
+                    fold_scheme='contiguous', n_blocks=None, fold_ids=None):
     """Unified blocked-CV decoding score (single- or multi-output), NaN-aware.
 
     One implementation behind the three former inline CV helpers in
@@ -67,6 +69,17 @@ def f_blocked_cv_r2(emb, target, n_folds=5, embargo=0, standardize=True,
     embargo : int
         # frames purged on EACH side of the test block (removed from train) to
         cut autocorrelation leakage. 0 = train right up to the test boundary.
+    fold_scheme : {'contiguous', 'interleaved'}
+        'contiguous' (default) — each fold is one time-block (the original scheme).
+        'interleaved' — T is split into n_blocks small contiguous blocks round-robin'd
+        to folds, so every fold's test set spans the whole session (avoids a fold
+        landing on a single flat epoch → catastrophic per-fold R²). Mildly leakier.
+    n_blocks : int | None
+        # small blocks for fold_scheme='interleaved' (default n_folds*10).
+    fold_ids : array (T,) | None
+        Explicit per-frame fold/group assignment (overrides fold_scheme). Each distinct
+        value is held out once → leave-group-out CV, e.g. pass a per-frame session id for
+        leave-session-out across pooled datasets. n_folds is set to the #distinct groups.
     standardize : bool
         z-score embedding columns using TRAIN-fold stats only (stops a high-
         variance PC from dominating KNN distance / the Ridge penalty).
@@ -102,6 +115,12 @@ def f_blocked_cv_r2(emb, target, n_folds=5, embargo=0, standardize=True,
                            only values in {0, 1}; else regression. Lets the
                            caller stay metric-agnostic; the metric used is
                            reported in dict['metric'] (predictions mode).
+    lags : list[int] | None
+        Decoder FIR: if given, lag-embed `emb` over these frame lags so target(t)
+        is decoded from the embedding over a window (bidirectional — τ<0 future,
+        τ>0 past; see f_lag_embed). lag-after-PCA only (raises if Y_raw is given —
+        use a precomputed embedding). Lag-undefined end rows are excluded from CV;
+        OOF idx stays in original frame coordinates. None ⇒ instantaneous (default).
 
     Returns
     -------
@@ -131,9 +150,19 @@ def f_blocked_cv_r2(emb, target, n_folds=5, embargo=0, standardize=True,
         target = target[:, None]
     single = target.shape[1] == 1   # fit/score 1-D for one column (avoids the
                                     # sklearnex column-vector-y DataConversionWarning)
+    # lag-embed the neural input (decoder FIR): predict target(t) from the
+    # embedding over a window. lag-after-PCA only (emb path); end rows the lag
+    # leaves undefined are masked out of valid below. lags=None ⇒ unchanged.
+    if lags is not None and any(int(l) != 0 for l in lags):
+        if Y_raw is not None:
+            raise NotImplementedError(
+                'lags require a precomputed embedding (emb) — set pca_within_fold=False')
+        emb = f_lag_embed(np.asarray(emb, float), lags)[0]
     T = (Y_raw.shape[0] if Y_raw is not None else emb.shape[0])
     fold_size = T // n_folds
     valid = ~np.isnan(target).any(axis=1)
+    if lags is not None and emb is not None:
+        valid = valid & np.isfinite(emb).all(axis=1)   # drop lag-undefined ends
     if ridgecv_alphas is None:
         ridgecv_alphas = np.logspace(-2, 4, 13)
 
@@ -148,23 +177,49 @@ def f_blocked_cv_r2(emb, target, n_folds=5, embargo=0, standardize=True,
         raise ValueError('classification task requires a single target column')
     metric = 'roc_auc' if is_clf else 'r2'
 
-    def _make():
+    def _make(n_in=None, n_out=None):
         # Estimator construction consolidated into f_decoding.make_decoder so the
         # decoder choice can't drift between here and the diagnostic cells.
+        # pls/cca need a per-fold rank clamp (dims vary across folds).
+        nc = (f_resolve_n_components(n_components, n_in, n_out)
+              if decoder in ('pls', 'cca') else None)
         return make_decoder(decoder, ridge_alpha=ridge_alpha, k_nn=k_nn,
-                            ridgecv_alphas=ridgecv_alphas, task=task)
+                            ridgecv_alphas=ridgecv_alphas, n_components=nc, task=task)
+
+    # Fold assignment. 'contiguous' (default) keeps fold_of=None → the original per-fold
+    # time-block slicing below (byte-identical). 'interleaved' ("chop") round-robins small
+    # blocks into folds so no fold is entirely a flat epoch. fold_ids = explicit per-frame
+    # groups (leave-group-out, e.g. leave-session-out) — overrides fold_scheme.
+    fold_of = None
+    if fold_ids is not None:
+        _, fold_of = np.unique(np.asarray(fold_ids), return_inverse=True)   # dense 0..K-1
+        n_folds = int(fold_of.max()) + 1
+    elif fold_scheme == 'interleaved':
+        nb = int(n_blocks or (n_folds * 10))
+        block_size = max(1, T // nb)
+        fold_of = (np.minimum(np.arange(T) // block_size, nb - 1) % n_folds)
+    elif fold_scheme != 'contiguous':
+        raise ValueError("fold_scheme must be 'contiguous' or 'interleaved', "
+                         f"got {fold_scheme!r}")
 
     r2s = []
     r2s_train = []                                   # per-fold TRAIN score (in-sample);
                                                     # only filled when return_predictions
     p_idx, p_true, p_hat, p_fold = [], [], [], []   # OOF collectors
     for f in range(n_folds):
-        te_lo = f * fold_size
-        te_hi = (f + 1) * fold_size if f < n_folds - 1 else T
-        te_idx = np.zeros(T, dtype=bool); te_idx[te_lo:te_hi] = True
-        ban = np.zeros(T, dtype=bool)
-        if embargo > 0:
-            ban[max(0, te_lo - embargo):min(T, te_hi + embargo)] = True
+        if fold_of is None:                          # contiguous (unchanged)
+            te_lo = f * fold_size
+            te_hi = (f + 1) * fold_size if f < n_folds - 1 else T
+            te_idx = np.zeros(T, dtype=bool); te_idx[te_lo:te_hi] = True
+            ban = np.zeros(T, dtype=bool)
+            if embargo > 0:
+                ban[max(0, te_lo - embargo):min(T, te_hi + embargo)] = True
+        else:                                        # interleaved ("chop")
+            te_idx = (fold_of == f)
+            ban = te_idx.copy()
+            if embargo > 0:                          # dilate ±embargo around every run
+                ban = np.convolve(te_idx.astype(np.int64),
+                                  np.ones(2 * embargo + 1, np.int64), 'same') > 0
         tr = (~te_idx) & (~ban) & valid
         te = te_idx & valid
         if tr.sum() < 2 or te.sum() < 2:
@@ -178,8 +233,8 @@ def f_blocked_cv_r2(emb, target, n_folds=5, embargo=0, standardize=True,
         if standardize:
             mu = Xtr.mean(axis=0); sd = Xtr.std(axis=0); sd[sd == 0] = 1.0
             Xtr = (Xtr - mu) / sd; Xte = (Xte - mu) / sd
-        reg = _make()
         if is_clf:
+            reg = _make()                              # pls/cca not valid here
             ytr = target[tr].ravel(); yte = target[te].ravel()
             if np.unique(ytr).size < 2:        # can't fit a 1-class train fold
                 r2s.append(np.nan); r2s_train.append(np.nan); continue
@@ -198,13 +253,18 @@ def f_blocked_cv_r2(emb, target, n_folds=5, embargo=0, standardize=True,
             pred = pred[:, None]
         else:
             yt_fit = target[tr][:, 0] if single else target[tr]   # 1-D if 1 col
+            reg = _make(Xtr.shape[1], 1 if single else yt_fit.shape[1])
             reg.fit(Xtr, yt_fit)
             pred = reg.predict(Xte)
+            if single and np.ndim(pred) == 2:          # pls/cca return 2-D always
+                pred = pred[:, 0]
             yte_true = target[te][:, 0] if single else target[te]
             r2s.append(r2_score(yte_true, pred, multioutput=multioutput))
             if return_predictions:                     # in-sample (train) R²
-                r2s_train.append(r2_score(yt_fit, reg.predict(Xtr),
-                                          multioutput=multioutput))
+                ptr = reg.predict(Xtr)
+                if single and np.ndim(ptr) == 2:
+                    ptr = ptr[:, 0]
+                r2s_train.append(r2_score(yt_fit, ptr, multioutput=multioutput))
             else:
                 r2s_train.append(np.nan)
         if return_predictions:

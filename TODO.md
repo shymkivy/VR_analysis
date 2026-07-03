@@ -252,10 +252,17 @@ decoded through the existing harness. Full design + per-tier builder specs in
         `'flow'`). Farneback dense flow → per-cell speed, dir sin/cos,
         divergence (local looming). Direction-of-edge-motion. Realizes
         **#24 / Level C**. Likely winner if cells are location+direction tuned.
-  - [ ] **#50** — Tier 3: Gabor energy bank + grid (`f_gabor_features`, block
+  - [x] **#50** — Tier 3: Gabor energy bank + grid (`f_gabor_features`, block
         `'gabor'`). Orientation × SF complex-cell energy = V1 simple/complex.
-  - [ ] **#51** — Tier 4a: motion-energy model (Adelson–Bergen, block `'meng'`).
-        x–y–t oriented filters → principled direction+speed tuning.
+        Done 2026-06-16: quadrature bank (even DC-removed), √(even²+odd²) energy,
+        FFT-conv (T-chunked) → grid mean-pool; `f_gabor_bank` for viz; registered
+        + wired into `VR_ca_encoding.py` build cell (n_pca=20). A/B vs agg/pix open.
+  - [x] **#51** — Tier 4a: motion-energy model (Adelson–Bergen, block `'meng'`).
+        x–y–t oriented filters → principled direction+speed tuning. Done
+        2026-06-17: complex spatial Gabor × complex temporal Gabor, |·|² opponent
+        energy, halo-chunked; `f_motion_energy_features`. Also added optional
+        `'phase'` stat to `'gabor'` (cosφ/sinφ → velocity via FIR). Both wired
+        into encoder+decoder visual_specs. A/B vs agg/pix/flow open.
   - [ ] **#52** — Tier 4b: pretrained-CNN front-end (block `'cnn'`). Early-conv
         feature maps; data-driven ceiling / benchmark.
   - [ ] **#53** — Tier 5 supporting channels: local looming (flow divergence),
@@ -344,6 +351,175 @@ to `VR_ca_dimred.py`; CEBRA-latent variant cell appended to
           with H_clamp = behavior block. Cell in `VR_ca_dimred.py`.
           First-pass implementation — defer hyperparameter sweeps to
           a follow-up issue.
+
+---
+
+## Strategic review 2026-06-13 (PROJECT_GOAL.md + REVIEW_2026-06)
+
+Reframe (see `PROJECT_GOAL.md`): the project is a BIDIRECTIONAL stimulus↔neural
+map; the ENCODING arm (stimulus→calcium per neuron) is the primary deliverable
+and the opto-target source, and it does not yet exist. Decoding (current
+pipeline) is the validation arm. `REVIEW_2026-06_decoding_gaps_and_tasks.md`
+P-numbers mapped to real IDs below. Verify-checklist results recorded in
+`notes.txt` 2026-06-13.
+
+- [~] **#57** — Encoding arm (REVIEW P1-1) — **PRIMARY**. New `VR_ca_encoding.py`
+      + `functions/f_encoding.py` (compute) + `f_encoding_plots.py` (visuals),
+      mirroring the f_decoding split. Per-neuron ridge from a LAGGED feature
+      design matrix (built_blocks visual + self_mot + beh); locomotion is a
+      PREDICTOR not a target. Score = held-out per-neuron correlation,
+      ceiling-normalized (#58). Output a tuning table (cell → best feature
+      block / retinotopic location-direction) = seed of the opto generator
+      (#64). Variance-partition nested models for the areal gradient.
+  - [x] **v1 minimal validation pass** (2026-06-13): `f_encoding.py`
+        (`f_lag_embed`, `f_encode_per_neuron`, `f_encode_null`, `f_encode_summary`)
+        + `VR_ca_encoding.py`. Short causal FIR (lags via `f_lags_from_ms`),
+        multi-output ridge through `f_blocked_cv_r2`, per-neuron OOF Pearson r vs
+        circshift null. Run on a dark-condition session. NEXT: variance partition,
+        tuning table.
+      *Working ceiling stance (2026-06-13, supersedes #58):* use the FULL-feature
+      model r (predict each cell from ALL blocks, best model) as the per-cell
+      RELATIVE ceiling — judge a feature/model by how much of r_full it recovers.
+      Soft positive controls = `self_mot`/running (strongly drives mouse V1) +
+      reward/lick timing (the self_mot-only sanity gate already does this). Null =
+      circshift. Caveat: r_full conflates feature-incompleteness with cell noise,
+      so it is a relative anchor, NOT an absolute "X% explained".
+- [?] **#58 (PARKED / maybe)** — Event-aligned noise ceiling (REVIEW P0-3).
+      Deferred 2026-06-13: it's really a TUNING analysis in disguise — you must
+      pick which event defines each cell's "signal", which is cell-type-dependent
+      and circular (assumes the tuning to measure the ceiling). Speculative +
+      interpretation-heavy for free foraging. Revisit only if the r_full relative
+      ceiling proves insufficient. (Idea: align to object FOV-entry / looming /
+      capture, split-half reliability = ceiling, weighted to transition epochs.)
+      *Superseded 2026-06-16:* user prefers a SHUFFLE TEST over a noise ceiling.
+      Done — `f_encode_null_dist` (N circshift nulls) + `f_encode_signif` (per-cell
+      one-sided p, BH-FDR q, null-referenced z) in `f_encoding.py`; significance
+      cell in `VR_ca_encoding.py`. Rank opto candidates by z among FDR-sig cells.
+- [ ] **#59** — Transient vs sustained regimes (REVIEW P1-4). Onset/transient
+      channels (FOV-entry, motion-onset, looming-rate) + sustained presence; an
+      adaptation/history term (time-since-onset or exp trace of recent local
+      stimulus energy); STRATIFY decode/encode eval by regime (running vs
+      stationary, object moving vs static) — never only pooled. Extends the
+      `motion`/`self_mot` blocks (#21).
+- [~] **#60** — FIR / lag-embedding (REVIEW P2-1). Lag-augment the design
+      matrix: predict feature(t) from neural over [t−Δ,t+Δ] (decode) and
+      activity(t) from features over causal [t−Δ,t] (encode). Sweep Δ ~0.1–1.5 s.
+      The linear baseline an RNN must beat.
+      - ENCODE side: done (f_lag_embed + f_encode_per_neuron, VR_ca_encoding.py).
+      - DECODE side: done 2026-06-19 — f_lag_embed/f_lags_from_ms moved to
+        f_decoding (shared base); f_blocked_cv_r2 gains `lags` (lag-after-PCA on
+        the emb path, end rows masked, OOF idx unchanged); `decode_lags_ms`
+        (bidirectional ±300 ms) wired into VR_ca_cebra.py bar/sweep/null/recon/
+        diagnostic. Incompatible with pca_within_fold (raises).
+- [ ] **#61** — RNN encoder (REVIEW P2-2) — only after #60. Reuse the
+      `RNN_scripts` / `f_RNN_dred` path; compare to FIR-linear on the SAME
+      ceiling-normalized metric.
+- [ ] **#62** — Decoder-correctness remainder (REVIEW P0-1; most of P0-1 already
+      done — see notes 2026-06-12). Optional per-fold CEBRA refit (nested-CV) or
+      drop the CEBRA decodability claim; raise CEBRA `out_dim` to 8–32 where an
+      embedding feeds a decoder (3 only for scatter); surface pooled-OOF R²
+      alongside per-fold in the headline cells. Links #46, #56.
+- [ ] **#63** — Horizon + ground/sky channels (REVIEW P0-2, DOWNGRADED). Add the
+      terrain→sky horizon edge (render and/or a 'horizon elevation per monitor'
+      scalar) + global ground/sky luminance split. Skip detailed grass texture
+      (low acuity; ground flow ≈ redundant with self_mot). The dark-condition
+      session is the real input-fidelity fix / clean debug dataset.
+- [ ] **#64** — Opto pattern generator (REVIEW P3-2) — endgame. From #57: for a
+      specified stimulus event emit predicted population vector; rank cells by
+      (predicted drive × encoding reliability × ensemble stability); intersect
+      targetable cells → ranked ≤50-cell holographic list.
+- [ ] **#65** — CV / cross-session ensemble identity (REVIEW P3-1). Extend
+      `f_ensemble_extract` (#42) from cross-seed STABILITY to temporal-CV
+      membership (same cells co-fire in held-out time) + cross-session identity
+      (opto targets must re-identify on a new day).
+
+- [~] **#66** — Cross-dataset decoding + encoding quality (region × session).
+      Run enc/dec quality over ALL do_proc datasets; compare by brain REGION and
+      separate region effects from per-session quality (some sessions just
+      perform better). Plot SUMMARY scores only, not per-dataset figures.
+      *Architecture — precompute-and-cache features (decouple render from analysis):*
+  - [~] **Feature-generation script** `VR_feature_gen.py` + helper
+        `functions/f_feature_cache.py` (`f_save_features` / `f_load_features` /
+        `f_features_path` / `f_features_exist`, joblib + gen-config staleness
+        check) — DONE 2026-06-24. `VR_feature_gen.py` loops MICE × do_proc
+        datasets: render + `build_feature_blocks` + `build_visual_blocks` → save
+        `built_blocks` + frame_t + side_tags + meta + gen_config (staleness). Cache
+        FEATURES only (neural stays in data_ca); `SAVE_MOVIE` flag optionally adds
+        two_mon_frames. Informative names `<mouse>_<dset>_<GEN_TAG>_features.joblib`
+        (`tag` added to `f_features_path`/`f_features_exist`) + `<tag>_config.json`
+        provenance sidecar (`f_write_config_json`). Config = an INLINE `cfg` dict in
+        the script (Spyder-edited; module/JSON config forms tried then dropped).
+  - [x] Analysis scripts (encoding / cebra) get a `load_cached_features` knob →
+        `f_load_features(...)` instead of the inline build cell (2026-06-24: an
+        `if 0:` "load cached features" cell in each, run INSTEAD of render+build).
+        Keep the inline build for single-dataset feature-method DEV.
+  - [x] **Pipeline modularization (phases 1-3, 2026-06-26)**: `functions/f_pipeline.py`
+        — `f_load_session` / `f_vectorize_session` / `f_acquire_features` /
+        `f_build_features` / `f_render_session` factor the load/build/render glue;
+        wired into cebra/encoding/dimred + VR_feature_gen (helpers → f_feature_gen.py).
+        Load/build junction replaced the `if 0:` cell (cebra: `load_cached_features`
+        switch in cell 1). `f_resolve_feature_file` tag = FILTER + index. VR_feature_gen
+        gained DSETS/MAX_DATASETS/OVERWRITE + tqdm; `example_frames` saved every cache.
+  - [x] **DECODING cross-dataset (2026-06-29)**: `f_run_decode_sweep`/`f_run_decode_null`
+        (shared single=multi compute) in f_decoding.py; `f_decode_cache.py`; cebra
+        save-decode cell (`DECODE_TAG`, F:/VR/decode); `VR_decode_analysis.py` loads
+        decode caches → tidy DataFrame → per-block/region summary plots. Region meta
+        still None in the save (below).
+  - [ ] **ENCODING cross-dataset (NEXT, PRIMARY)**: mirror the decode pipeline — shared
+        `f_run_encode`, `f_encode_cache.py`, save cell in VR_ca_encoding.py,
+        `VR_encode_analysis.py`, + the tuning table (cell → best block / retinotopy → #64).
+  - [ ] Per-dataset score compute already returns dicts (f_encode_*, f_blocked_cv_r2)
+        — loop them over the cached features into a results DataFrame (row per
+        dataset or dataset×cell) with metadata (region, n_cells, SNR, running frac).
+  - [ ] Identify the **region metadata source**: per-session label (a `VR_data.xlsx`
+        column?) vs per-cell from retinotopic registration
+        (`retinotopic_mapping_analysis.py` field-sign areamaps). Per-session label
+        is the pragmatic first cut; per-cell is the rigorous version (later).
+  - [ ] Cross-dataset summary plots ONLY (not per-dataset figures): median/quantile
+        per-neuron encoding r per dataset grouped/colored by region; frac>null;
+        decoding R² per key feature per region; session-quality covariates
+        (n_cells, mean SNR, running frac) alongside to disentangle region vs quality.
+      *Defer (after encoding matures):* ceiling-normalized (#58) cross-dataset
+      scores; per-cell region (retinotopic registration); variance-partition by
+      region; full all-models comparison across datasets.
+
+- [x] **#67** — Model factory consolidation (2026-06-13). Lifted PLS/CCA out of
+      the recon cell's hand-rolled loop into the shared `make_decoder` +
+      `f_blocked_cv_r2` (new `f_resolve_n_components` per-fold rank clamp;
+      single-output 2D-pred ravel). Encoding (`f_encoding` + `VR_ca_encoding.py`)
+      and the decode bar/sweep/decoding-vs-n_pcs cells now select
+      ridge/ridgecv/knn/pls/cca via one path; recon cell de-duplicated.
+      Extends #28.
+
+- [~] **#68** — Feature-selection groundwork: least features for best decode/encode
+      (2026-07-01; extends #47/#50/#51/#66). Reframe: separate Chain-1 (feature→MOVIE
+      fidelity, neuron-free) from Chain-2 (activity↔features). Working basis = gabor
+      MAGNITUDE (form) + MENG (motion); phase is a hypothesis to falsify, not a default.
+      Rationale in notes.txt 2026-07-01.
+  - [x] **Chain-1 built** — `functions/f_feature_recon.py` + `VR_feature_recon.py`:
+        reconstruct a mouse-acuity-LOWPASS target movie from each feature set
+        (mag / phase / meng / mag+meng / all / pix) via blocked-CV ridge → OOF
+        variance-weighted R², motion-stratified + example frames. Compiles +
+        synthetic-tested; NOT yet run on real data.
+  - [ ] **Run Chain-1** on a real (ideally dark-condition) session: does meng add over
+        gabor magnitude, and where (motion-stratified)? Sweep the acuity cutoff (σ≈0.3–0.5
+        px at 0.5 cpd — render already ≈ acuity, so also try coarser toward the grid scale).
+        Reconstruct vs LAGGED mag so meng's motion isn't double-counted.
+  - [ ] **Test A** (neural, Chain-2): phase unique Δr given mag+meng via
+        `f_encode_block_importance` — if ≈0, drop phase.
+  - [ ] **Test B** (duality): coarse-grid+phase vs fine-grid-no-phase — same encoding r?
+        → keep whichever is fewer features.
+  - [ ] Match meng speed bands (`tf`/`λ`) to the MEASURED on-screen object/optic-flow
+        velocity distribution rather than guessing.
+  - [ ] Later: the feature-PARAMETER × score sweep (grid density / #orient / #SF / #PCs)
+        using the PARKED `functions/f_feature_optim.py` (extract superset once, subset
+        cheaply), scored through the existing encoder/decoder on a frame subset.
+
+REVIEW items folded into existing tasks (no new ID):
+- P1-2 (object target definedness / presence-location hurdle model) → **#12**.
+  Presence already AUC-scored; presence-in-R² leak fixed 2026-06-12.
+- P1-3 (motion-energy over flow; flow degenerate on silhouettes) → amends
+  `PLAN_monitor_features.md` + reorders **#50/#51** ahead of **#49**.
 
 ---
 

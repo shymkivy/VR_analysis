@@ -23,6 +23,7 @@ import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from sklearn.linear_model import Ridge, RidgeCV, LogisticRegression, LogisticRegressionCV
 from sklearn.neighbors import KNeighborsRegressor, KNeighborsClassifier
+from sklearn.cross_decomposition import PLSRegression, CCA
 from sklearn.metrics import r2_score, roc_auc_score
 
 from f_feature_helpers import f_detrend_col, f_resolve_detrend_sigma
@@ -45,8 +46,20 @@ def f_imaging_fs(frame_t, default=60.0):
         return default
 
 
+def f_resolve_n_components(n_components, n_in, n_out):
+    """Clamp a requested PLS/CCA rank to the data: max(1, min(req, n_in, n_out)).
+
+    n_components=None → full rank = min(n_in, n_out). PLS/CCA require
+    n_components ≤ min(n_features_in, n_features_out), and the per-fold dims
+    vary, so callers resolve this before constructing the estimator.
+    """
+    cap = min(int(n_in), int(n_out))
+    req = cap if n_components is None else int(n_components)
+    return max(1, min(req, cap))
+
+
 def make_decoder(name, ridge_alpha=1.0, k_nn=15, ridgecv_alphas=None,
-                 task='regression'):
+                 n_components=None, task='regression'):
     """Build a decoder estimator by name — single source of truth.
 
     Mirrors the analog decoder with its classification twin when
@@ -57,10 +70,13 @@ def make_decoder(name, ridge_alpha=1.0, k_nn=15, ridgecv_alphas=None,
 
     Parameters
     ----------
-    name : {'ridge', 'ridgecv', 'knn'}
+    name : {'ridge', 'ridgecv', 'knn', 'pls', 'cca'}
     ridge_alpha : float       Ridge penalty (α). For classification, C = 1/α.
     k_nn : int                neighbors for the knn decoder.
     ridgecv_alphas : array    α grid for ridgecv; None → logspace(-2, 4, 13).
+    n_components : int         PLS/CCA latent rank (PRE-resolved via
+                              f_resolve_n_components by the caller; defaults to 1).
+                              Regression only.
     task : {'regression', 'classification'}
 
     Returns
@@ -77,13 +93,17 @@ def make_decoder(name, ridge_alpha=1.0, k_nn=15, ridgecv_alphas=None,
                                         max_iter=1000)
         if name == 'knn':
             return KNeighborsClassifier(n_neighbors=k_nn, weights='distance')
-        raise ValueError(f'unknown decoder: {name!r}')
+        raise ValueError(f'unknown / non-classification decoder: {name!r}')
     if name == 'ridge':
         return Ridge(alpha=ridge_alpha)
     if name == 'ridgecv':
         return RidgeCV(alphas=ridgecv_alphas)
     if name == 'knn':
         return KNeighborsRegressor(n_neighbors=k_nn, weights='distance')
+    if name == 'pls':
+        return PLSRegression(n_components=n_components or 1, scale=True)
+    if name == 'cca':
+        return CCA(n_components=n_components or 1, scale=True)
     raise ValueError(f'unknown decoder: {name!r}')
 
 
@@ -167,6 +187,45 @@ def f_pca_prefix(Y, n_pcs, random_state=42):
     at the max and slice prefixes; for a single k, call this directly.
     """
     return PCA(n_components=n_pcs, random_state=random_state).fit_transform(Y)
+
+
+def f_lags_from_ms(ms_list, fs):
+    """Convert a list of millisecond lags to sorted unique integer frame lags."""
+    return sorted({int(round(m * fs / 1000.0)) for m in ms_list})
+
+
+def f_lag_embed(X, lags, names=None):
+    """Lag-embedding of a matrix (causal AND acausal lags). Shared by the encoder
+    (lag the FEATURES) and the decoder (lag the neural EMBEDDING).
+
+    For X (T, d) and integer frame lags, return (T, d*len(lags)) where the
+    column-group for lag τ holds `X[t-τ]`. Convention:
+      τ > 0  → PAST input (target LAGS the input; e.g. stimulus-driven).
+      τ < 0  → FUTURE input (target LEADS the input; predictive/motor).
+      τ = 0  → instantaneous.
+    Undefined rows are NaN: first max(0, max τ) and last max(0, -min τ); trim both
+    ends (or mask them) before scoring. Column order is lag-major.
+
+    Returns (X_design, design_names). design_names None if names is None, else
+    `f'{name}@{tau}'` per column.
+    """
+    X = np.asarray(X, dtype=float)
+    T, d = X.shape
+    lags = [int(l) for l in lags]
+    cols, out_names = [], (None if names is None else [])
+    for tau in lags:
+        Xl = np.full((T, d), np.nan)
+        if tau == 0:
+            Xl[:] = X
+        elif tau > 0:
+            Xl[tau:] = X[:T - tau]          # past input (target lags input)
+        else:
+            k = -tau
+            Xl[:T - k] = X[k:]              # future input (target leads input)
+        cols.append(Xl)
+        if names is not None:
+            out_names.extend(f'{nm}@{tau}' for nm in names)
+    return np.concatenate(cols, axis=1), out_names
 
 
 def f_apply_block_detrend(X, block_name, detrend_blocks, detrend_sigma_sec, fs):
@@ -324,6 +383,180 @@ def legacy_target_blocks(choice):
         raise ValueError(f'legacy target choice {choice!r} not recognized; '
                          f'available: {list(_LEGACY_TARGET_BLOCKS)}')
     return list(_LEGACY_TARGET_BLOCKS[choice])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Group 3b — decoding-sweep orchestration (the per-dataset decode compute)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Default n_pcs grid + lag window, matching the VR_ca_cebra.py sweep cell.
+DEFAULT_N_PCS_SWEEP = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 20, 25, 30, 35, 40, 45, 50]
+
+
+def _make_cv_fn(cfg, embargo_fr, decode_lags):
+    """Build the blocked-CV scorer closure shared by the sweep + null (one
+    f_blocked_cv_r2 config, so real and null run the IDENTICAL pipeline)."""
+    from f_cebra_helpers import f_blocked_cv_r2     # lazy: avoids circular import
+
+    def _cv(emb, y, Y_raw=None, n_pcs=None, task='regression'):
+        return f_blocked_cv_r2(
+            emb, y, n_folds=cfg.get('n_folds', 5), embargo=embargo_fr,
+            standardize=cfg.get('standardize_emb', True), decoder=cfg.get('decoder', 'knn'),
+            ridge_alpha=cfg.get('ridge_alpha', 1.0), k_nn=cfg.get('k_nn', 15),
+            ridgecv_alphas=cfg.get('ridgecv_alphas'), n_components=cfg.get('n_components', 20),
+            Y_raw=Y_raw, n_pcs=n_pcs, task=task, lags=decode_lags)
+    return _cv
+
+
+def f_run_decode_sweep(built_blocks, Y_neu, frame_t, cfg, verbose=True):
+    """Per-feature blocked-CV decoding sweep (R² × n_neural_PCs) for ONE dataset.
+
+    The shared single-dataset decode compute — factored out of VR_ca_cebra.py so the
+    single-dataset (cebra) and any multi-dataset path run the SAME code. Orchestrates
+    build_target_columns + f_pca_prefix + f_blocked_cv_r2 (no new decoder).
+
+    cfg keys (defaults in parens): sweep_target_blocks (required), n_pcs_sweep
+    (DEFAULT_N_PCS_SWEEP), n_folds (5), decoder ('knn'), k_nn (15), ridge_alpha (1.0),
+    n_components (20), ridgecv_alphas (None), standardize_emb (True), embargo_sec (0.0),
+    detrend_sigma_sec (None), detrend_blocks (None), detrend_embedding (False),
+    pca_within_fold (False), decode_lags_ms ([0]).
+
+    Returns a dict ('sweep') consumed by the cebra plots + f_run_decode_null:
+        r2_mat (F×P), auc_mat (Fb×P), targets_all/targets_bin (with y arrays),
+        group_rows, groups_present, n_pcs_sweep, embargo_fr, decode_lags, fs, max_pcs,
+        pca_neu_full, detrend_sigma_fr, cfg.
+    """
+    blocks = cfg['sweep_target_blocks']
+    n_pcs_sweep = list(cfg.get('n_pcs_sweep', DEFAULT_N_PCS_SWEEP))
+    detrend_blocks = cfg.get('detrend_blocks')
+    detrend_sigma_sec = cfg.get('detrend_sigma_sec')
+    detrend_embedding = cfg.get('detrend_embedding', False)
+    pca_within_fold = cfg.get('pca_within_fold', False)
+
+    fs = f_imaging_fs(frame_t)
+    embargo_fr = int(round(cfg.get('embargo_sec', 0.0) * fs))
+    detrend_sigma_fr = (detrend_sigma_sec * fs) if detrend_sigma_sec else None
+    decode_lags = f_lags_from_ms(cfg.get('decode_lags_ms', [0]), fs)
+
+    targets_all, targets_bin = build_target_columns(
+        built_blocks, blocks, detrend_blocks=detrend_blocks,
+        detrend_sigma_sec=detrend_sigma_sec, fs=fs, split_binary=True)
+
+    # Fit PCA once at max k; prefixes give exact lower-k embeddings.
+    max_pcs = max(n_pcs_sweep)
+    pca_neu_full = f_pca_prefix(Y_neu, max_pcs)
+    if detrend_embedding and detrend_sigma_fr and not pca_within_fold:
+        pca_neu_full = np.column_stack([
+            f_detrend_col(pca_neu_full[:, j], detrend_sigma_fr)
+            for j in range(pca_neu_full.shape[1])])      # task #11
+
+    _cv = _make_cv_fn(cfg, embargo_fr, decode_lags)
+
+    r2_mat = np.full((len(targets_all), len(n_pcs_sweep)), np.nan)
+    for fi, (grp, name, y) in enumerate(targets_all):
+        for ki, n_pcs in enumerate(n_pcs_sweep):
+            r2_mat[fi, ki] = (_cv(None, y, Y_raw=Y_neu, n_pcs=n_pcs) if pca_within_fold
+                              else _cv(pca_neu_full[:, :n_pcs], y))
+        if verbose:
+            print(f'  {grp:3s}  {name:14s}  '
+                  + '  '.join(f'k={k:2d}:{r:+.2f}' for k, r in zip(n_pcs_sweep, r2_mat[fi])))
+
+    auc_mat = np.full((len(targets_bin), len(n_pcs_sweep)), np.nan)
+    for fi, (grp, name, y) in enumerate(targets_bin):
+        for ki, n_pcs in enumerate(n_pcs_sweep):
+            auc_mat[fi, ki] = (_cv(None, y, Y_raw=Y_neu, n_pcs=n_pcs, task='classification')
+                               if pca_within_fold
+                               else _cv(pca_neu_full[:, :n_pcs], y, task='classification'))
+        if verbose:
+            print(f'  {grp:3s}  {name:14s}  [AUC]  '
+                  + '  '.join(f'k={k:2d}:{a:.2f}' for k, a in zip(n_pcs_sweep, auc_mat[fi])))
+
+    group_rows = {}
+    for ri, (grp, _, _) in enumerate(targets_all):
+        group_rows.setdefault(grp, []).append(ri)
+    groups_present = list(group_rows.keys())
+
+    return {'r2_mat': r2_mat, 'auc_mat': auc_mat,
+            'targets_all': targets_all, 'targets_bin': targets_bin,
+            'group_rows': group_rows, 'groups_present': groups_present,
+            'n_pcs_sweep': n_pcs_sweep, 'embargo_fr': embargo_fr,
+            'decode_lags': decode_lags, 'fs': fs, 'max_pcs': max_pcs,
+            'pca_neu_full': pca_neu_full, 'detrend_sigma_fr': detrend_sigma_fr,
+            'cfg': cfg}
+
+
+def f_run_decode_null(sweep, built_blocks, Y_neu, cfg_null, verbose=True):
+    """Shuffle-control null for f_run_decode_sweep — reruns the sweep N times on data
+    with the neural↔behavior alignment broken, reusing the sweep's targets + PCA so
+    real and null share ONE pipeline. cfg_null keys: n_shuffles (2), shuffle_mode
+    ('circshift_neural_percell' | 'circshift_target'), min_shift_frames (0),
+    shuffle_seed (42), independent_target_shifts (False).
+
+    Returns dict: r2_mat_null (S×F×P), auc_mat_null (S×Fb×P), cfg_null.
+    """
+    cfg = sweep['cfg']
+    n_pcs_sweep = sweep['n_pcs_sweep']
+    embargo_fr = sweep['embargo_fr']
+    decode_lags = sweep['decode_lags']
+    pca_within_fold = cfg.get('pca_within_fold', False)
+    detrend_embedding = cfg.get('detrend_embedding', False)
+    detrend_sigma_fr = sweep['detrend_sigma_fr']
+    max_pcs = sweep['max_pcs']
+    pca_neu_full = sweep['pca_neu_full']
+    targets_all, targets_bin = sweep['targets_all'], sweep['targets_bin']
+
+    n_shuffles   = cfg_null.get('n_shuffles', 2)
+    shuffle_mode = cfg_null.get('shuffle_mode', 'circshift_neural_percell')
+    min_shift    = cfg_null.get('min_shift_frames', 0)
+    seed         = cfg_null.get('shuffle_seed', 42)
+    indep        = cfg_null.get('independent_target_shifts', False)
+
+    T_img = Y_neu.shape[0]
+    rng = np.random.default_rng(seed)
+    r2_mat_null  = np.full((n_shuffles, len(targets_all), len(n_pcs_sweep)), np.nan)
+    auc_mat_null = np.full((n_shuffles, len(targets_bin), len(n_pcs_sweep)), np.nan)
+    _cv = _make_cv_fn(cfg, embargo_fr, decode_lags)
+
+    for ns in range(n_shuffles):
+        if shuffle_mode == 'circshift_target':
+            if indep:
+                targets_shuf = [(g, n, np.roll(y, int(rng.integers(min_shift, T_img - min_shift))))
+                                for g, n, y in targets_all]
+                targets_bin_shuf = [(g, n, np.roll(y, int(rng.integers(min_shift, T_img - min_shift))))
+                                    for g, n, y in targets_bin]
+            else:
+                shift = int(rng.integers(min_shift, T_img - min_shift))
+                targets_shuf = [(g, n, np.roll(y, shift)) for g, n, y in targets_all]
+                targets_bin_shuf = [(g, n, np.roll(y, shift)) for g, n, y in targets_bin]
+            pca_for_null = None if pca_within_fold else pca_neu_full
+            Y_for_null = Y_neu
+        elif shuffle_mode == 'circshift_neural_percell':
+            Y_shuf = f_shuffle_neural(Y_neu, rng, min_shift=min_shift)
+            Y_for_null = Y_shuf
+            pca_for_null = None if pca_within_fold else f_pca_prefix(Y_shuf, max_pcs)
+            if detrend_embedding and detrend_sigma_fr and not pca_within_fold:
+                pca_for_null = np.column_stack([
+                    f_detrend_col(pca_for_null[:, j], detrend_sigma_fr)
+                    for j in range(pca_for_null.shape[1])])
+            targets_shuf, targets_bin_shuf = targets_all, targets_bin
+        else:
+            raise ValueError(f'unknown shuffle_mode: {shuffle_mode!r}')
+
+        for fi, (grp, name, y) in enumerate(targets_shuf):
+            for ki, n_pcs in enumerate(n_pcs_sweep):
+                r2_mat_null[ns, fi, ki] = (_cv(None, y, Y_raw=Y_for_null, n_pcs=n_pcs)
+                                           if pca_within_fold
+                                           else _cv(pca_for_null[:, :n_pcs], y))
+        for fi, (grp, name, y) in enumerate(targets_bin_shuf):
+            for ki, n_pcs in enumerate(n_pcs_sweep):
+                auc_mat_null[ns, fi, ki] = (
+                    _cv(None, y, Y_raw=Y_for_null, n_pcs=n_pcs, task='classification')
+                    if pca_within_fold
+                    else _cv(pca_for_null[:, :n_pcs], y, task='classification'))
+        if verbose:
+            print(f'  shuffle {ns+1:2d}/{n_shuffles} done')
+
+    return {'r2_mat_null': r2_mat_null, 'auc_mat_null': auc_mat_null, 'cfg_null': cfg_null}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

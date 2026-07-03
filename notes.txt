@@ -1185,3 +1185,464 @@ dependent SF/TF tuning -> keep banks SMALL (2-3 SFs, ~4 orientations).
 Full design + per-tier builder specs: PLAN_monitor_features.md. Tracking:
 TODO.md #47 (sub-tasks #48-#53). User has additional edge/edge-motion ideas to
 fold into the Tier-2/3 builder design before implementation.
+
+================================================================
+2026-06-12 — Multi-model audit of all five scripts + fixes
+================================================================
+Reviewed VR_ca_cebra.py, VR_analysis.py, VR_ca_analysis.py, VR_ca_dimred.py
+(+ functions/) with parallel Fable and Opus agents per script, reconciled to a
+consensus list. The mov_data imaging-clock refactor (#55) verified clean by both
+models on every script (no double/under-correction, shapes length-T consistent,
+removed keys unreferenced).
+
+Correctness fixes applied:
+- Presence binaries were silently dragging the multi-output / bar decoding R²:
+  build_target_matrix defaults skip_presence=False, but the cell comment claimed
+  auto-skip. With nan_absent=True, f_blocked_cv_r2 drops any NaN row so presence
+  collapses to a constant in the valid set (ss_tot=0, degenerate). Added
+  skip_presence_dec / bar_skip_presence knobs (default True). Presence is scored
+  via the AUC sweep instead. (#12/#26.)
+- Degenerate columns (<2 distinct valid values) were routed to the classifier →
+  silent NaN AUC, feature vanishing from the report. build_target_columns now
+  skips+warns them.
+- near_dist_thresh filtered the feature blocks + Y_neu but not S_smn2 /
+  frame_times → plot-length mismatches. Added filtered views S_raster /
+  t_img_plot (== full arrays when no filter) and switched the 5 plot cells.
+- detrend_embedding was applied to the real embedding but not the
+  circshift_neural_percell null → invalid null band. Now matched.
+- f_proc_lick_rew / f_get_monitor_coords: event times (rewards/licks/reward_time)
+  are behavior clock; under the imaging-clock refactor they now need an ev_shift
+  before binning onto mov_data['time']. Also guarded the np.where(...)[0][0]
+  event lookup (IndexError on a trailing event past the clock end) and the
+  rew_rate /0 at t=0 (time_cum[0] was exactly 0 after the elapsed-from-zero
+  change — a regression from the refactor; set time_cum[0]=dt_med).
+- Real-vs-reconstructed cell decoded without standardization (PC1 dominates KNN);
+  added standardize_rec (train-fold z-score). max_frames now guarded with a clear
+  error instead of a cryptic interp1d crash. CEBRA in-sample-embedding decoding
+  caveated in the bar cell (CV protects the decoder, not the embedding fit, so
+  CEBRA columns aren't comparable to the unsupervised PCA-3 baseline).
+
+Methodology decisions (NOT just bug fixes):
+- Shuffle null: min_shift REMOVED (set to 0 everywhere; seeded rng kept). A
+  nonzero min |shift| excludes the near-aligned shuffles, which on autocorrelated
+  data carry HIGH statistics — dropping them pulls the null down and inflates
+  significance (anti-conservative). Uniform random shifts over [0,T) are the
+  unbiased circular-shift null. For per-cell independent shifts on long
+  recordings the bias and the "leak" min_shift guarded against are both
+  negligible, so uniform is the clean choice. Reverses part of #46 (the seeded-
+  rng half of #46 stays). The circshift hardening was also propagated into the
+  dim-red / ensemble path (f_shuffle_data), which #46 had only fixed on the
+  CEBRA side — that null was leaky AND ignored its seed.
+- f_estimate_dim_corr (Method B dimensionality): switched the real-vs-shuffle
+  comparison from explained_variance_RATIO_ to explained_variance_ (raw
+  eigenvalues). Ratios are normalized within each fit, so the shuffle's flatter
+  spectrum gives smaller max-ratios and real components clear the bar too easily
+  (over-counts dimensions). Circular shift preserves total variance, so raw
+  eigenvalues are directly comparable (parallel-analysis logic); the dict key
+  max_lamb_shuf already implied eigenvalues. Method-B dimensionality will likely
+  drop after this.
+
+Expected: decoding numbers shift (presence dropped, recon standardized); null
+bands widen slightly (uniform null) and dimensionality drops (eigenvalue test).
+Intended corrections, not regressions.
+
+================================================================
+2026-06-13 — Strategic review reconciliation (PROJECT_GOAL / REVIEW)
+================================================================
+External (GitHub-only, repo-aware) Claude produced PROJECT_GOAL.md (north star)
+and REVIEW_2026-06_decoding_gaps_and_tasks.md. Reframe: the project is a
+BIDIRECTIONAL map (encoding + decoding), the ENCODING arm (stimulus→calcium per
+neuron, ceiling-normalized) is the primary deliverable and the source of the
+opto target, and it DOES NOT YET EXIST — current pipeline only decodes. Endgame
+is a ranked ≤50-cell holographic stimulation list (Walker/Sinz inception loop).
+
+The reviewer could not read functions/ or the back half of VR_ca_cebra.py and
+flagged its claims as hypotheses. Verified against ground truth (we had read
+those files in full):
+- f_blocked_cv_r2: train-ONLY standardization ✓; embargo purges BOTH sides ✓;
+  R² baseline is the TEST-fold mean (sklearn r2_score standard) — NOT a global
+  mean, so that P0-1c worry is moot; per-fold mean±std returned, pooled-OOF
+  available via return_predictions. Multi-output supported (per-neuron encoding
+  feasible by adaptation).
+- A leak-free production decoder ALREADY exists: the PCA-decoding sweep decodes
+  from neural PCs (up to 50) directly, with shuffle null + detrend/embargo. The
+  reviewer saw only to ~line 1000 (first decode-bar). The out_dim=3 critique
+  applies ONLY to CEBRA, not that path. The CEBRA in-sample leak is real and now
+  caveated.
+- f_flow_features = lucas_kanade (not Farnebäck); flow ≈0 off object edges on
+  the silhouette render is correct. Build cell already prints in-FOV / agg-NaN
+  fractions. f_run_cebra: out_dim=3, max_iter=5000, time_delta, NO per-fold
+  refit. Input is synthetic render only (no real-display capture).
+
+Conclusion: the review's P0-1 (decoder correctness) is largely already in place
++ closed by the 2026-06-12 fixes. The genuinely-additive gaps — now tracked in
+TODO.md: encoding arm (#57, P1-1, PRIMARY), event-aligned noise ceiling (#58,
+P0-3), transient/sustained regimes + onset/adaptation channels (#59, P1-4),
+FIR/lag embedding (#60, P2-1), RNN encoder (#61, P2-2), P0-1 remainder /
+per-fold-CEBRA-refit + raise out_dim (#62), horizon + ground/sky channels (#63,
+P0-2 downgraded), opto pattern generator (#64, P3-2), CV/cross-session ensemble
+identity (#65, P3-1). P1-2 folds into #12 (presence/location hurdle model);
+P1-3 (motion-energy over flow) amends PLAN_monitor_features.md / #50-#51.
+Recommended debug dataset: a dark-condition session (objects-only ≈ true
+stimulus → input-fidelity confound collapses).
+
+================================================================================
+2026-06-16  Tier 3 Gabor energy filter bank (#50) — DONE
+================================================================================
+Added f_gabor_features to functions/f_visual_features.py (block 'gabor'): the V1
+simple/complex-cell front-end the agg/pix blocks lack. Per (orientation ×
+wavelength), a quadrature Gabor pair (even cosine DC-removed so it responds to
+edges not flat luminance; odd sine); complex-cell ENERGY = sqrt(even^2 + odd^2)
+(phase-invariant) — or rectified |even| simple-cell if energy=False — mean-pooled
+into the retinotopic grid. Convolution via scipy fftconvolve over spatial axes,
+T-chunked (chunk_t) to bound memory on the (T,101,101) stacks. f_gabor_bank()
+exposes the kernels for visualization.
+
+Defaults: grid (6,6), 4 orientations, wavelengths (6,12) px/cycle. Low SF on
+purpose — pixel ~= 1 deg here and mouse acuity peaks ~0.5 cyc/deg, so lambda 6-12
+px (~0.08-0.17 cyc/deg) is the relevant coarse-silhouette band; don't over-resolve.
+Raw dims = ny*nx*n_orient*n_wav per side (288 for 6x6x4x2), x2 sides -> PCA-20
+via build_visual_blocks (reports cumulative EVR). Wired into VR_ca_encoding.py
+build cell + a kernel/energy sanity cell. Registered in VISUAL_FEATURE_REGISTRY
+next to grid/flow.
+
+Open: the actual A/B test — add 'gabor' to enc_blocks, run encode + per-cell
+shuffle significance, ask whether oriented-edge energy lifts r / FDR-sig cell
+count over agg/pix (PLAN_monitor_features.md success criterion). Tier 4 (meng/cnn)
+only if motion/edges show they help.
+
+================================================================================
+2026-06-17  Motion: gabor phase + motion-energy (meng, #51) + flow — all three
+================================================================================
+User insight: complex-cell ENERGY sqrt(even^2+odd^2) is phase-INVARIANT; the PHASE
+phi=atan2(odd,even) is edge position within the patch, and its temporal change =
+local velocity/direction (phase-based optical flow, Fleet-Jepson 1990). Direction
+is NOT a free byproduct of two static spatial gabors under a LINEAR readout —
+direction selectivity is nonlinear (needs x-y-t oriented filters squared =
+Adelson-Bergen motion energy, or correlation of shifted responses = Reichardt).
+Phase-based flow, motion energy, gradient flow all estimate the same spatiotemporal-
+frequency velocity; phase-based + motion-energy are the V1-grounded siblings.
+
+Built all three in f_visual_features.py:
+1) gabor PHASE — f_gabor_features now takes stats=('energy'|'phase'|'simple'). phase
+   = energy-gated unit phase as cos/sin pair (0 where no edge); the downstream FIR
+   reads its temporal change → velocity. Names carry a stat token gabE/gabC/gabS/gabR.
+2) MOTION ENERGY (meng, #51) — f_motion_energy_features: complex spatial Gabor
+   Cs=Ge+iGo per frame, temporally filtered by complex temporal Gabor (Te+iTo) for
+   one direction + conjugate for the other; |.|^2 = directional energy; opponent =
+   E_dir1-E_dir2 (signed, direction+speed selective). Temporal even DC-removed so
+   static frames give ~0. Halo-chunked over time for memory. output 'opponent'|'both'.
+3) OPTICAL FLOW (flow) — already built (LK numpy / Farneback cv2); note it's
+   degenerate on filled silhouettes (textureless interiors, aperture problem), which
+   is why meng/phase are preferred here.
+
+Why meng is the cleaner pick for our LINEAR pipeline: energy magnitude pools over
+the grid like gabor energy (no circular-phase handling) and the squaring nonlinearity
+is exactly what the ridge readout needs. Phase rep is more contrast-invariant but
+fiddlier (circular, must sin/cos-encode + energy-gate). Registered 'gabor'(updated)
++ 'meng'; wired into VR_ca_encoding.py (enc_blocks + visual_specs) and VR_ca_cebra.py
+(target_blocks_bar / sweep_target_blocks / visual_specs). Defaults: 6x6 grid, 4
+orient, meng wavelength 8px, temporal_freq 0.15 cyc/frame, n_pca 20-30.
+
+Open: the A/B — does meng/gabor-phase lift encoding r / FDR-sig cells / decode R2
+over agg/pix/flow? Tier 4b (cnn) only if these show motion/edges help.
+
+================================================================================
+2026-06-19  Decoder FIR — lag-embed the neural input (TODO #60, decode side)
+================================================================================
+The decoder predicted feature(t) from the INSTANTANEOUS neural state only. Neurons
+are time-shifted vs the stimulus (and behavior can precede neural), so decoding
+should read neural over a window [t-Δ,t+Δ]. Added bidirectional lag-embedding to
+the decode regression, mirroring the encoder.
+
+Design decisions:
+- Reuse f_lag_embed (not a copy). It lived in f_encoding, but f_blocked_cv_r2 (in
+  f_cebra_helpers) needs it and f_encoding imports f_cebra_helpers → cycle. Moved
+  f_lag_embed + f_lags_from_ms to f_decoding (the shared base both arms import),
+  re-exported from f_encoding for back-compat.
+- Centralized in f_blocked_cv_r2 via new `lags=None`: lag-embed emb once inside the
+  CV, mask the lag-undefined end rows out of `valid`. No trimming → OOF idx stays in
+  original frame coords (trace/scatter still align to frame_t). lags=None ⇒ byte-for-
+  byte unchanged (encoder + existing decode calls untouched).
+- LAG-AFTER-PCA (chosen): lag the precomputed neural PCs / CEBRA embedding (decode
+  from the latent trajectory over the window). Cheap, works with CEBRA. Incompatible
+  with pca_within_fold (would need lag-before-PCA on N*n_lags dims) → raises a clear
+  error. Default pca_within_fold=False, so the common path just works.
+- Bidirectional ±300 ms default (decode_lags_ms = range(-300,301,100)): neural may
+  LEAD (motor/predictive) or LAG (stimulus-driven) the feature. The null uses the
+  SAME lags (fair). Wired into VR_ca_cebra.py bar / sweep(real+null) / recon / OOF-
+  diagnostic, each with a local knob (Spyder-cell independence).
+
+Open: run the sweep with lags on — per-feature R² should rise for time-shifted
+features; a negative-lag peak for behavior-ish features mirrors the encoder latency
+finding from the other direction.
+
+================================================================================
+2026-06-24  Feature generation + cache script (VR_feature_gen.py, TODO #66)
+================================================================================
+Building features (render + build_feature_blocks + build_visual_blocks; gabor/meng
+dominate, minutes/dataset) was rerun on every analysis. Now built ONCE and cached.
+
+VR_feature_gen.py: loops MICE × do_proc datasets → render (f_angles_to_movie_v2) +
+build_feature_blocks + build_visual_blocks → f_save_features (joblib). Caches
+FEATURES only (neural stays in data_ca); SAVE_MOVIE flag optionally also stores
+two_mon_frames for cross-dataset recon/flow viz. Skips datasets whose cache exists
+unless FORCE. Per-dataset timing + summary table; one bad dataset doesn't kill the
+batch (try/except per dataset).
+
+Informative names: f_features_path gained a `tag` (= GEN_TAG) →
+<mouse>_<dset>_<GEN_TAG>_features.joblib, so different feature configs coexist.
+Each batch also writes <GEN_TAG>_config.json (f_write_config_json) as a
+human-readable provenance sidecar; f_save_features still embeds gen_config in each
+joblib for staleness detection (f_load_features warns on config mismatch;
+_config_diff now JSON-normalizes so tuple-vs-list config forms don't false-flag).
+
+PARAM FILE in 3 forms (user will compare ergonomics, prune later), picked by
+CONFIG_SOURCE in the script: feature_gen_config.py (Python, canonical, importable
+by the analysis staleness check) / feature_gen_config.json (hand-editable data;
+lists round-trip since extractors accept them) / inline CONFIG_INLINE dict.
+DUMP_JSON_AND_EXIT regenerates the JSON from the active config.
+
+Analysis scripts (VR_ca_cebra.py, VR_ca_encoding.py): added an `if 0:` "load cached
+features" cell — run INSTEAD of the render+build cells. Loads built_blocks/frame_t/
+side_tags (+ restores L/R movies if SAVE_MOVIE) in <1s. Neural still from data_ca.
+Caveat: the decoder near-distance filter needs vec_data_use (live build only).
+
+Open (#66): cross-dataset score loop into a results DataFrame by region; region
+metadata source (VR_data.xlsx column vs retinotopic registration); summary plots.
+
+================================================================================
+2026-07-01 — Modular pipeline + decode-analysis + feature-viz refactor (TODO #66)
+================================================================================
+functions/f_pipeline.py (NEW): the load/build/render orchestration shared by all
+analysis scripts. f_load_session (calcium+behavior+cheap vectorization+clock;
+behavior=False = calcium-only; owns DEFAULT_CAM_PARAMS/CAIM_KW), f_vectorize_session
+(vectorization only, for batch load-once), f_acquire_features (build via build_fn +
+autosave OR load a cache), f_build_features (SHARED render+extract = single source of
+truth), f_render_session (render half only). Wired into cebra/encoding/dimred
+(f_load_session) + VR_feature_gen (f_vectorize_session + f_build_features). Phases 1-3
+of the "factor the stable glue, keep exploratory params inline" plan.
+
+Feature cache: f_resolve_feature_file's `tag` is now a FILTER + index (GEN_TAG is
+shared across all datasets, so requiring a unique tag match was wrong — filter to the
+tag, pick by index/dset_name). f_pick_frames + example_frames: a few ORIGINAL rendered
+frames (default 8) saved into every cache EVEN WHEN SAVE_MOVIE=off (tiny), so viz can
+show the input next to a feature recon without re-rendering / holding the 96k movie.
+VR_feature_gen: helpers moved to functions/f_feature_gen.py; DSETS=None all datasets,
+MAX_DATASETS cap, OVERWRITE (was FORCE), 1-by-1 with gc.collect + tqdm bar.
+
+Decode-results pipeline (the decode arm's cross-dataset story, mirrors features):
+f_run_decode_sweep / f_run_decode_null factored out of the cebra sweep+null cells into
+f_decoding.py = the SHARED per-dataset compute (single = multi). f_decode_cache.py
+(joblib r2/auc + null + labels + cfg + meta; no y/neural). cebra gained a save-decode
+cell (DECODE_TAG, F:/VR/decode/<mouse>). VR_decode_analysis.py loads decode caches
+across datasets → tidy DataFrame → per-block plateau-R² / feature×dset heatmap /
+real-vs-null / region view. Analyzer LOADS only (decision: no batch decode-gen).
+NOTE: cebra keeps pca_neu_full + f_cv_r2_single (the grid/diagnostic cells still use
+them) — the sweep unpacks pca_neu_full back from f_run_decode_sweep's return.
+
+VR_feature_viz.py: refocused to visualize the DECODING features (pix/grid/flow/gabor/
+meng reconstructions vs original). Dropped the dense full-res optic-flow cell (not a
+decoding feature). All reconstruction is frame-economical: f_reconstruct_feature_movie
+(+ gabor phase) gained frame_idx → reconstruct ONLY the shown frames, never the full T
+(a 96k×101×202 float32 = 7.3 GB MemoryError otherwise). "Original" row = pix inverse-PCA
+(rank n_pix_pca, labelled with PC count) unless the true movie is cached/rendered; only
+the 8 example_frames are TRUE original.
+
+Quiver (per-patch gabor phase motion) fixes: (a) magnitude GATE — hide arrows where the
+gabor magnitude is low (no-edge cells had magnitude-independent spurious velocities);
+(b) global FIXED arrow scale from the speed percentile computed OVER GATED cells only
+(spurious no-signal speeds were inflating the reference → real arrows shrank to 1-2 px);
+(c) arrow_frac/arrow_width size knobs. f_gabor_flow_at computes the field only at the
+shown frames (local windows). Merged the gabor-mag/phase and quiver cells into ONE:
+rows = pix recon / gabor mag / gabor phase, optional quiver overlay on any/all rows
+(f_plot_movie_frames_compare gained a GENERIC motion-field overlay → reusable for future
+motion features), frames auto-picked at MOTION (f_pick_motion_frames, ‖Δ pix‖, modes
+spread / event). Removed f_plot_quiver_frames.
+
+Next: encoding-arm cross-dataset pipeline (PRIMARY #57) mirroring the decode one —
+f_run_encode + f_encode_cache + VR_encode_analysis + the tuning table (→ opto #64).
+
+================================================================================
+2026-07-01 — Feature-selection groundwork: Chain-1 movie reconstruction + the
+             gabor-magnitude / meng (+ phase?) basis (TODO #47/#66)
+================================================================================
+Goal (user): use the FEWEST features that still support decoding/encoding, and drive
+that with the reconstruction viz. Reframed the problem before writing code.
+
+TWO SEPARATE targets that were being conflated:
+  Chain-1  feature → MOVIE (neuron-free): how completely a feature set encodes the
+           STIMULUS. A fixed property of the transform. Measure once, offline.
+  Chain-2  activity ↔ features (the brain): decode/encode per feature block.
+Do NOT judge neural representation by movie-pixel reconstruction — that's dominated by
+whichever feature reconstructs the movie best (pix/mag), not by what neurons encode.
+Keep them apart; Chain-1 is the groundwork done here.
+
+Magnitude vs phase vs motion (the key design reasoning):
+  - gabor MAGNITUDE = phase-invariant oriented-edge energy = form; present whenever
+    there's contrast (static or moving). Loses within-patch position.
+  - PHASE (cosφ/sinφ) = WHERE the edge sits in the patch. User's insight: at a COARSER
+    grid, phase mostly encodes sub-cell position, which a FINER magnitude grid recovers
+    as a magnitude PATTERN — so "keep phase" ≈ "increase magnitude resolution" (a real
+    duality). Caveats: phase also carries polarity, and encodes sub-cell position more
+    COMPACTLY (fewer channels) than refining the grid.
+  - MOTION: user's target is neurons with RFs tuned to edge MOTION across the field.
+    Δmagnitude at a cell is direction-BLIND (energy rising ≠ which way). Δphase is a
+    direct local velocity (sign+speed) but noisy where energy≈0. meng (Adelson-Bergen)
+    is the principled model: oriented SPACE-TIME filters, direction+speed selective by
+    construction, read out as energy — the textbook DS-complex/MT cell = exactly the
+    target. So the working basis is MAGNITUDE (form) + MENG (motion); phase is a
+    hypothesis to FALSIFY (does it add unique Δr given mag+meng?), not a default keep.
+  - meng sees MONITOR motion, not world motion: in a navigating mouse a world-static
+    object still sweeps across the monitor (optic flow) → meng fires during running.
+    Shares variance with self_mot (that's why self_mot is an encoding PREDICTOR).
+  - Note: the encoder/decoder already lag-embeds, so lag-embedded PHASE gives the linear
+    model Δφ (velocity) for free — scoring phase WITHOUT lags underrates it.
+
+meng internals (walked the code, f_motion_energy_features): complex spatial Gabor
+Cs=even+i·odd per frame → temporally filter with complex temporal Gabor (te+i·to) and
+its conjugate (te−i·to) → R,L; energy |R|²,|L|² = direction-selective magnitude (phase-
+invariant); opponent eR−eL = signed direction, cancels flicker. n_orient orientations ×
+opponent sign = 2·n_orient directions; speed ≈ tfreq·wavelength px/frame (one (λ,tf) =
+one speed band); temporal_support = integration window. Δmag ≠ meng because meng temporal-
+filters the COMPLEX response then squares (keeps direction); Δmag squares first (direction
+gone), then differences.
+
+Reconstruction TARGET decision: reconstruct a mouse-ACUITY-SMOOTHED movie, not the raw
+render — don't penalize features for sharp silhouette edges the mouse can't resolve
+(removes a common unexplainable high-SF floor → fairer mag-vs-meng comparison). Use a
+SPATIAL LOWPASS, NOT rank reduction: PCA drops low-VARIANCE dirs, not high-SF ones — a
+sharp MOVING edge is high-variance so PCA keeps it (rank reduction fails the perceptual
+goal). If target = pix-PCA ('rank'), pix is circular (R²=1) → drop it as a competitor.
+Geometry check: FOV 65.9° vert over num_samp=101 ⇒ ~0.66°/row, ~0.98°/col; at 0.5 cpd
+acuity σ≈0.3–0.5 px (render already ≈ acuity) → SWEEP cutoff (or smooth toward the 6×6
+grid scale) to get a visible effect. meng's expected reconstruction win: motion-
+compensated super-resolution — velocity (meng) + coarse position (mag) + lag window let a
+decoder recover sub-grid trajectory of MOVING content (nothing for static); must be tested
+vs LAGGED mag (which already carries some motion), gain concentrated in high-motion frames.
+
+Built (compiles + synthetic-tested in the `rnn` conda env; NOT yet run on real data):
+  functions/f_feature_recon.py — f_truncate_session (subset build; f_build_features
+    forbids max_frames and the full movie is ~8 GB), f_acuity_sigma_px/f_deg_per_sample,
+    f_lowpass_movie (per-monitor), f_make_target (lowpass/rank/raw + target PCA),
+    f_assemble_features ((block,prefix): gabor_gabM/gabor_gabP/meng/pix), f_motion_score,
+    f_recon_score/f_recon_compare (blocked-CV ridge feature→movie-PCs, OOF variance-
+    weighted R², motion-stratified), f_recon_frames_at, f_plot_recon_bars.
+  VR_feature_recon.py — the driver (load→truncate→build→smooth-target→decode→frames).
+  functions/f_feature_optim.py — PARKED (multigrid gabor sweep for the LATER neural-
+    param optimization; Chain-1 came first).
+Open decisions parked for the neural stage: does phase add unique Δr given mag+meng
+(Test A), and phase-vs-grid duality (coarse-grid+phase vs fine-grid-no-phase, Test B).
+
+================================================================================
+2026-07-02 — Chain-1 recon R²: flat-fold blowup, pooled headline + interleaved CV
+================================================================================
+Symptom: gabor-magnitude movie reconstruction showed a per-fold-mean R² of ~ -17 while
+the OOF prediction trace clearly tracked the target and per-motion-subset R² were ~0.13
+-0.5. Diagnosed via new f_recon_diagnose cell.
+
+Cause: f_blocked_cv_r2's headline = MEAN of per-fold R². With 5 CONTIGUOUS folds the last
+fold lands on a flat, low-activity END epoch; r2_score normalizes each fold by THAT fold's
+own target variance, so a near-flat fold has a ~0 denominator and a small level offset →
+catastrophically negative R² (synthetic repro: one fold at -3009 → mean -601). The other
+folds are fine. r2_hi/r2_lo never saw it because they POOL across folds and demean within
+the motion subset. So "overall < both halves" was an estimator artifact, not bad recon.
+
+Fixes (both shipped):
+ 1. POOLED R² as the headline. f_recon_score already computes r2_pooled (one r2_score over
+    ALL OOF frames vs whole-session variance = global normalization); f_plot_recon_bars now
+    plots it as "overall (pooled)" so overall sits BETWEEN hi/lo. Also surfaced in
+    f_recon_compare (R²(fold) vs R²(pool)) and f_plot_pc_sweep (both lines).
+ 2. Interleaved ("chop") blocked-CV OPT-IN in the shared f_blocked_cv_r2
+    (fold_scheme='contiguous'|'interleaved', n_blocks default n_folds*10). Interleaved
+    round-robins small contiguous blocks into folds so every fold spans the session (never
+    all-flat); embargo dilates ±embargo around every test-block run (np.convolve). Contiguous
+    branch left BYTE-IDENTICAL (regression-guarded in test) — all 11 existing callers keep the
+    default, nothing threads the new kwarg except recon's cv_kw. Synthetic: interleaved kills
+    the catastrophic fold (all folds 0.30-0.40, mean 0.35, pooled 0.35). Tradeoff: mild
+    leakage (test blocks adjacent to train) → keep contiguous as the honest default for the
+    eventual NEURAL decode; interleaved is a Chain-1 stability/diagnostic option.
+ Caveat: two diagnostic fold-boundary visuals assume contiguity (f_decoding.py:956-957,
+    VR_ca_cebra.py:1582-1584) — not on the recon path, note only.
+Deferred: target high-pass/detrend of the slow drifting movie-PCs (TODO #8 root cause) so
+even the per-fold view behaves.
+
+Also added this session: f_recon_diagnose (per-fold vs pooled, per-fold train/test, per-PC
+pooled R²), f_plot_motion_traces (pix PCs + high-motion shading), f_plot_pred_overlay
+(true vs OOF pred per target PC), f_pc_sweep/f_plot_pc_sweep (recon R² vs #PCs, nested
+truncation, no re-extraction). motion = ‖Δ pix scores‖ per frame (on-screen change, not
+running).
+
+================================================================================
+2026-07-02 — Multi-session POOLED video decoder (Chain-1, one model across datasets)
+================================================================================
+Insight (user): the video decoder (feature→movie) is NEURON-FREE and session-invariant —
+a fixed function of the render + extractors, identical across sessions. So it needs only
+ONE decoder per feature set, and can pool many sessions for much larger, more varied
+train/test data and a cross-session generalization estimate (robust to single-session
+quirks like the flat-fold artifact). This is Chain-1 ONLY; the neural arms stay per-session.
+
+Feasibility (2 explore agents): RAW feature channels align across sessions (same grid/
+n_orient/wavelengths/stats/side → identical channel names/order), so pool RAW + fit ONE
+shared PCA; the cached per-session PCA SCORES do NOT align. Movie target needs a shared
+basis (f_make_target on the concatenated movie). Movies aren't cached by default (only 8
+example frames) → re-render per session (re-extracting raw features is then cheap). No
+pooled-fit existed anywhere (VR_decode_analysis aggregates RESULTS only).
+
+Design (user: extend the EXISTING VR_feature_recon.py, don't add a script) — a `dsets`
+selector; len==1 reproduces the single-session run byte-for-byte, len>1 pools:
+ - f_blocked_cv_r2 gained `fold_ids` (per-frame group array) → leave-group-out CV; pass
+   per-frame session id for LEAVE-SESSION-OUT. res['fold']=session id → per-session held-out
+   R² (the generalization headline). fold_ids=None unchanged (regression-guarded).
+ - Factored the PCA-application half of build_visual_blocks into f_apply_block_pca
+   (grouped/int/float n_pca) so the pooled path applies the SAME grouped-gabor PCA (no drift).
+ - f_accumulate_session (per session: truncate → render → build_visual_blocks(n_pca=None)
+   raw + raw movie) and f_pool_sessions (concat raw channels/movies across sessions, assert
+   channel-name alignment, fit ONE shared feature PCA per block + ONE shared movie-target
+   PCA, session_ids, motion from target scores zeroed at session joins). Pooled built_blocks
+   has the visual blocks only (no pix → pix dropped as a feature set; it's the trivial ceiling).
+ - VR_feature_recon.py: build cell branches on len(dsets); decode cell uses
+   fold_ids=session_ids when pooled and prints per-session held-out R²; feature_sets filtered
+   to present blocks; example-frame/motion-frame cells use a present block (pooled lacks pix).
+All compiles + synthetic-tested (f_apply_block_pca grouped/int; build_visual_blocks refactor
+intact; f_pool_sessions shapes/session_ids/join-zeroed motion + mismatch raises; fold_ids
+LOSO holds each session out once; fold_ids=None regression guard). NOT yet run on real data.
+Deferred: cross-mouse pooling, IncrementalPCA if pooled movies get large, SAVE_MOVIE reuse.
+
+================================================================================
+2026-07-02 — Gabor parameter-sweep harness to optimize the video decoder (TODO #68)
+================================================================================
+Goal: optimize gabor feature→movie reconstruction R² PER DATASET (cross-dataset is harder,
+validate later). First sweep = the CHEAP axes: n feature PCs × decoder lags × decoder
+type/alpha (all re-score only; grid/#orient/SF re-extract, deferred). Marginal by default,
+joint-capable. On L dset 4. New driver VR_feature_optim.py.
+
+MODULAR design (so the coming meng sweep doesn't duplicate code): the score/truncation/
+lags/decoder/marginal/plot logic is FEATURE-AGNOSTIC and lives once —
+  f_sweep_recon(configs=(meta,raw_X) iterable, target, cv_kw, fs, n_pca_list, lags_list,
+    decoder_list, motion) → rows; scores via f_recon_score (the ONLY CV path, pooled R²).
+  f_sweep_marginal(config_fn, baseline, axes) → vary one axis, hold others at baseline.
+  f_plot_sweep_marginal → line (numeric axes) / bar (lags/decoder).
+Only the extractor + config generator are feature-specific: f_extract_gabor_multigrid
+(conv once → pool all grids) + f_gabor_configs (yield per grid×#orient×SF subset via column
+selection). Refactored f_build_gabor_banks → generic f_build_banks(extract_fn, …) + a thin
+gabor wrapper (keeps n_orient/wavelengths meta for the parked neural sweep). meng sweep =
+add f_extract_meng_multigrid + f_meng_configs, reuse everything else.
+Efficiency: render + extract the bank ONCE; n_pca = nested PCA truncation, lags/decoder =
+re-score. decoder_list entries = (name, ridge_alpha|None); lags entries = ms lists (bidir ok).
+Metric = pooled R² (form; meng later judged on motion-stratified R²). target smoothing +
+n_target_pcs HELD FIXED across the sweep (moving them games the score).
+Compiles + synthetic-tested (config gen full/subset + non-divisor n_orient raises; engine row
+fields + nested n_pca climbs; marginal holds others at baseline; plot line+bar).
+
+MENG sweep added (same session): f_extract_meng_multigrid (Adelson–Bergen; conv+temporal ONCE
+→ pool all grids; VERIFIED byte-compatible with f_visual_features.f_motion_energy_features per
+grid) + f_build_meng_banks + f_meng_configs (subset orientation/SF/temporal-freq). Factored a
+generic _subset_cols(names, parse_fn, keep) + _parse_meng_name; f_gabor_subset now uses
+_subset_cols too (DRY, gabor regression-tested). Sweep gained the 'tf' (temporal-freq/speed)
+axis (f_sweep_marginal ext is baseline-driven so gabor omits tf, meng includes it). meng is
+judged on HIGH-motion R² (y='r2_hi') — it can't reconstruct static form, so full-scene pooled
+R² understates it. Driver VR_feature_optim.py: shared render+target, then separate GABOR and
+MENG sweep cells (+ a joint cell). Tested: meng byte-compat, multigrid pooling, config subset
+(orient×tf), engine+marginal with the tf axis, plot y='r2_hi'. NOT yet run on real data.
+Next: run gabor+meng on L4; then enable grid/#orient/SF axes (bigger master bank).

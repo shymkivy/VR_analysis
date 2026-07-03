@@ -110,12 +110,14 @@ Direction-of-motion of edges/objects at each location — the stated target.
 - **Read:** direction-selective cells → `'flow'` should beat both `'agg'` and
   `'motion'`.
 
-### Tier 3 — Gabor energy bank + grid  (#50)  [true V1 simple/complex cells]
+### Tier 3 — Gabor energy bank + grid  (#50)  [x] DONE 2026-06-16
 Oriented edges at locations and spatial frequencies.
-- **Builder:** `f_gabor_features(frames, n_orient, sf_list, grid, energy=True,
-  side_tag)`. Convolve with a Gabor bank (orientations × SFs); **complex-cell
-  energy** = √(even² + odd²) of each quadrature pair (phase-invariant); pool
-  into the grid.
+- **Builder:** `f_gabor_features(movie, grid, n_orient, wavelengths, sigma_scale,
+  gamma, stats=('energy',), chunk_t)` in `f_visual_features.py`. Quadrature Gabor
+  bank (orientations × wavelengths, even DC-removed); per-cell mean-pooled `stats`:
+  **energy** √(even²+odd²) (phase-invariant), **phase** (energy-gated cosφ/sinφ →
+  velocity via the FIR temporal change), **simple** (rectified |even|). FFT-conv
+  (T-chunked). `f_gabor_bank()` exposes the kernels for viz. Registered as `'gabor'`.
 - **Channels per cell:** energy per (orientation × SF). Keep small:
   e.g. 4 orientations × 2–3 SFs.
 - **Block name:** `'gabor'`. Dims large → PCA-compress (`n_gabor_pca`).
@@ -124,14 +126,20 @@ Oriented edges at locations and spatial frequencies.
   a cheap proxy = oriented-derivative / HOG per grid cell.
 - **Read:** orientation/edge tuning → `'gabor'` lifts R² over `'grid'`.
 
-### Tier 4a — Motion-energy model (Adelson–Bergen)  (#51)  [most principled motion]
+### Tier 4a — Motion-energy model (Adelson–Bergen)  (#51)  [x] DONE 2026-06-17
 Spatiotemporal oriented filters (quadrature pairs in x–y–t) → joint direction-
 AND speed-selective energy. Gold-standard model of direction-selective cortex
 ("moving edges" done right).
-- **Builder:** `f_motion_energy_features(frames, n_orient, n_speed, grid)`.
-- **Block name:** `'meng'`. Heaviest hand-built bank; PCA-compress.
-- **Do if** Tier-2 flow already shows motion helps and we want the principled
-  ceiling for direction tuning.
+- **Builder:** `f_motion_energy_features(movie, grid, n_orient, wavelengths,
+  temporal_freqs, temporal_support, output, chunk_t)` in `f_visual_features.py`.
+  Complex spatial Gabor Cs=Ge+iGo per frame → temporal-filter with complex
+  temporal Gabor (Te±iTo) for the two directions → |·|² energy → opponent
+  (E_dir1−E_dir2) or both; mean-pool to grid. Time-chunked (halo). Registered
+  as `'meng'`.
+- **Block name:** `'meng'`. PCA-compress.
+- Note: phase-based velocity is also available as the `'phase'` stat on the
+  `'gabor'` block (cosφ/sinφ → velocity via the downstream FIR temporal change);
+  `meng` is the energy-domain (poolable, linear-friendly) sibling.
 
 ### Tier 4b — Pretrained-CNN front-end  (#52)  [data-driven ceiling/benchmark]
 Early conv-layer feature maps of a pretrained vision (or motion) network as
@@ -185,12 +193,15 @@ f_<name>_features(movie, **params) -> (X, names)
     X     : (T, d) features on the same clock ; names : d base channel names
 ```
 No clock/PCA/per-side logic inside extractors. **Done:** `f_grid_features`
-(Tier 1) + shared `f_grid_bounds` (the grid every pooling tier reuses).
+(Tier 1), `f_flow_features` (Tier 2), `f_gabor_features` (Tier 3, stats
+energy/phase/simple), `f_motion_energy_features` (Tier 4a) + shared
+`f_grid_bounds` (the grid every pooling tier reuses).
 
 ### (ii) Feature registry — seed of the feature-SELECTION module
 `VISUAL_FEATURE_REGISTRY = {name: {fn, defaults, desc}}`. Choosing feature types
-= naming them in a `specs` dict with optional param overrides. Tiers 2–4 add one
-entry each; nothing else changes. **Done** (holds `'grid'`).
+= naming them in a `specs` dict with optional param overrides. Tier 4b (cnn) adds
+one entry; nothing else changes. **Done** (holds `'grid'`, `'flow'`, `'gabor'`,
+`'meng'`).
 
 ### (iii) Build driver — `build_visual_blocks(movies, side_tags, beh_t, frame_t,
 pulse_delay, specs, default_n_pca=...)`
