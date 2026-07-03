@@ -198,7 +198,15 @@ with moving objects. Spyder-based, cell-by-cell exploratory workflow.
   blocked-CV via `f_blocked_cv_r2`, returns OOF Pearson r + R²),
   `f_encode_null` (circshift target null), `f_encode_block_importance`
   (drop-one unique + block-alone marginal r), `f_encode_summary`. Model choice
-  (ridge/ridgecv/knn/pls/cca) threads through to `make_decoder`.
+  (ridge/ridgecv/knn/pls/cca) threads through to `make_decoder`. P2 sub-plan D1/D5
+  (2026-07-03): `f_encode_fit_weights` (per-neuron ridge on ALL rows → the WEIGHTS =
+  receptive field, reshaped (d_stim,n_lags,n_kept)), `f_rf_pixel_frames` (→ n_lags×H×W
+  spatiotemporal pixel RF), `f_rf_grid_location` (|W| pooled over channels → location map),
+  `f_encode_ceiling_fraction` (per-cell r/r_full, #57 relative ceiling).
+- `functions/f_encoding_plots.py` — encoding visuals (P2·D1, 2026-07-03): `f_plot_rf`
+  (a fitted RF `(n_lags,H,W)` as a frame-per-lag weight-movie, diverging 0-centered) +
+  `f_plot_rf_cells` (cells×lags grid). The RF viewer is the build's canary. Driven by the
+  D1 cells in `VR_ca_encoding.py`.
 - `functions/f_feature_cache.py` — per-dataset feature cache (TODO #66):
   `f_save_features` / `f_load_features` / `f_features_path` / `f_features_exist`
   (joblib; `tag`=GEN_TAG in the filename) + `f_write_config_json` (provenance

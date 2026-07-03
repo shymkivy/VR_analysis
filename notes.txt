@@ -1646,3 +1646,48 @@ R² understates it. Driver VR_feature_optim.py: shared render+target, then separ
 MENG sweep cells (+ a joint cell). Tested: meng byte-compat, multigrid pooling, config subset
 (orient×tf), engine+marginal with the tf axis, plot y='r2_hi'. NOT yet run on real data.
 Next: run gabor+meng on L4; then enable grid/#orient/SF axes (bigger master bank).
+
+================================================================================
+2026-07-03 — P2 encoding-arm kickoff: §4 audit + D0/D1/D5 (RF viewer + null ceiling)
+================================================================================
+Working from the researcher plan in ../reserrch_repo (PLAN_2026-07_master_overview.md +
+SUBPLAN_P2_encoding_model.md). P2 = the per-neuron encoding spine. Our whole prior
+video-recon effort = the plan's P7 (deferred presentation wrapper). Ran the sub-plan's §4
+audit against live code:
+ 4.1 visual features ARE on a retinotopic grid (raw names r{iy}c{ix}) but build_visual_blocks
+     PCA-collapses location by default → un-collapsed grid = wire-up (n_pca=None), not new.
+     grid default (6,6); monitor ~98°×66° → ~16°×11°/cell @6×6.
+ 4.2 every neuron gets the SAME design matrix (f_encode_per_neuron multi-output) — NOT
+     RF-conditioned. Confirmed gap.
+ 4.3 SINGLE global ridge λ (f_blocked_cv_r2); f_encode_block_importance = DROP-ONE separate
+     fits, not a joint banded partition → banded ridge + commonality = new (D3).
+ 4.4 target = f_gauss_smooth(S, sigma_frames=6); at 60 Hz that IS ~100 ms (plan correct);
+     σ hardcoded → make it a CV hyperparameter (D2). mov_data on imaging clock (#55) ✓.
+ 4.5 f_lag_embed/f_lags_from_ms in f_decoding: bidirectional (τ>0 past, τ<0 future), ms→frames,
+     lag-major cols 'name@tau', applied post-PCA, end rows NaN-trimmed. ✓
+ 4.6 pix block = PCA of two_mon_frames (can be an encoder input); no raw-pixel encoder → the
+     weights→monitor-frame RF is new (built in D1 via raw downsampled pixels).
+ 4.7 self_mot + beh ARE predictors (Y=neural is target) ✓. BUT self_mot = 2 ch:
+     self_d_dist = √(dx²+dz²) planar SPEED MAGNITUDE (collapses fwd+lat, drops translation
+     ANGLE) + self_d_phi = yaw. So fwd/lat/yaw (or mag+angle+yaw) is NOT present — small new
+     decomposition needed for D4 (project world vel onto heading phi). NO pupil/arousal data
+     → arousal band DROPPED (researcher: don't study arousal; ~ locomotion anyway).
+
+Built D0/D1/D5 (compute + viewer + synthetic gate; NOT yet run on a real session):
+ D1 f_encoding.f_encode_fit_weights(X_stim, Y, lags, alpha, standardize) — per-neuron RIDGE
+    on ALL rows returning WEIGHTS (the RF), reshaped (d_stim, n_lags, n_kept) [reuses
+    f_lag_embed lag-major]; f_rf_pixel_frames (→ n_lags×H×W spatiotemporal pixel RF);
+    f_rf_grid_location (|W| pooled over channels → location map, location-major).
+ D1 f_encoding_plots.py (NEW) — f_plot_rf (frame-per-lag weight-movie, diverging 0-centered)
+    + f_plot_rf_cells (cells×lags grid). The canary viewer.
+ D5 f_encode_ceiling_fraction(r_model, r_full) — per-cell r/r_full (#57 relative-ceiling
+    stance); null machinery (f_encode_null_dist/f_encode_signif/f_encode_summary) already exists.
+ Driver: VR_ca_encoding.py gained a PIXEL-RF cell (if 0; downsample movie → fit → view top-r
+    cells' RF) + a relative-ceiling cell (if 1; each block's median r/r_full).
+SYNTHETIC GATE PASSED (§6 steps 1–2, pixel): planted Gaussian-blob RF × temporal kernel →
+ recovered RF corr 0.99 to planted at the peak lag, blob at exact planted (4,17), temporal
+ peak lag recovered; ceiling_fraction + grid reshape + viewers OK. All files compile.
+Next (per §8): view real RFs on a dark session; then D2 (smoothness + σ-CV) → gate step 3.
+Deferred D-items: D2 smoothness, D3 banded/variance-partition, D4 behavior bands
+ (fwd/lat/yaw + capture-offset FIR), D6 per-cell lags, D7 estimator dual-readout (→P5), D8
+ regime, D9 separable/generative.

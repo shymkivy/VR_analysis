@@ -79,9 +79,9 @@ cv_kw = dict(n_folds=5, embargo=int(round(0.5 * fs_img)), standardize=True,
 # the one expensive step; everything after is column-subset + PCA + CV.
 if 1:
     # master bank
-    gb_grids       = [(6, 6), (8, 8), (12, 12), (16, 16)]     # grid axis
-    gb_n_orient    = 8                                         # master; n_orient axis divides it
-    gb_wavelengths = (2, 4, 6, 9, 13, 19)                         # master SF ladder; wl axis subsets it
+    gb_grids       = [(6, 6), (8, 8), (12, 12), (16, 16)]     # grid axis  seems relatively even 8, 12, 16
+    gb_n_orient    = 8                                         # master; n_orient axis divides it   4 good enough, maybe even 2
+    gb_wavelengths = (2, 4, 6, 9, 13, 19)                         # master SF ladder; wl axis subsets it  9 seems best
 
     banks = f_build_gabor_banks(mon_movies, side_tags, _sub['beh_t'], _sub['frame_t'],
                                 _sub['pulse_delay'], gb_grids, n_orient=gb_n_orient,
@@ -89,11 +89,11 @@ if 1:
     print(f'gabor bank grids={list(banks)}  raw dims {[banks[g]["X"].shape[1] for g in banks]}')
 
     # baseline = fixed point for the OTHER axes while one is swept ('grid' held as a 1-elem list)
-    baseline = {'grid': [(8, 8)], 'n_orient': 4, 'wl': (6, 13), 'n_pca': 40,
+    baseline = {'grid': [(12, 12)], 'n_orient': 4, 'wl': (6, 13), 'n_pca': 40,
                 'lags': [0], 'decoder': ('ridge', 1.0)}
     axes = {'grid':     [(6, 6), (8, 8), (12, 12), (16, 16)],
-            'n_orient': [2, 4],
-            'wl':       [(2,), (4,), (6,), (9,), (13,), (19,)], #, (6, 13), (4, 9, 19), (4, 6, 9, 13, 19)],
+            'n_orient': [2, 4, 8],
+            'wl':       [(9,)], #, (6, 13), (4, 9, 19), (4, 6, 9, 13, 19)],
             'n_pca':    [5, 10, 20, 40, 80, 120],
             'decoder':  [('ridge', 1.0), ('ridge', 10.0), ('ridgecv', None)]}
 

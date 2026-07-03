@@ -63,9 +63,9 @@ n_target_pcs = 120          # #target-movie PCs = the regression target       53
 # meng: opponent motion energy (direction+speed). pix built from n_pix_pca.
 # n_pca here = the BUILD MAX; the n_pcs sweep truncates DOWN from it (nested, free).
 visual_specs = {
-    'gabor': {'grid': (12, 12), 'n_orient': 4, 'wavelengths': (6, 12),
+    'gabor': {'grid': (8, 8), 'n_orient': 4, 'wavelengths': (9),      # 'wavelengths':(6, 12)  'grid': (12, 12)
               'stats': ('magnitude', 'phase'), 'n_pca': {'gabM': 120, 'gabP': 120}},
-    'meng':  {'grid': (12, 12), 'n_orient': 4, 'wavelengths': (6, 12),
+    'meng':  {'grid': (8, 8), 'n_orient': 4, 'wavelengths': (9),      # 'wavelengths':(6, 12)  'grid': (12, 12)
               'temporal_freqs': (0.15,), 'output': 'opponent', 'n_pca': 120},
 }
 
@@ -197,8 +197,8 @@ if 1:
 # skipped. For other groups: ('gabor','gabor_gabP') phase, or ('meng', None) whole block.
 # Uses cv_kw / lags / motion / target from the decode cell above.
 if 1:
-    sweep_block  = 'gabor'
-    sweep_prefix = 'gabor_gabM'        # 'gabor_gabM' mag | 'gabor_gabP' phase | meng→None
+    sweep_block  = 'meng'
+    sweep_prefix = 'gabor_gabP'        # 'gabor_gabM' mag | 'gabor_gabP' phase | meng→None
     k_list       = [2, 5, 10, 15, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 
     pc_series    = ('pooled', 'high', 'low')        # ('pooled','per_fold','high','low')

@@ -101,6 +101,74 @@ def f_encode_per_neuron(built_blocks, block_names, Y_enc, lags,
             'design_names': design_names, 'n_design': X_design.shape[1]}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# P2a — per-neuron WEIGHT fit (the RF) + reshape + relative ceiling  (sub-plan D1/D5)
+# f_encode_per_neuron gives CV SCORES; these give the fitted WEIGHTS = the receptive
+# field, plus the reshape back to monitor space and the r_full-relative ceiling.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def f_encode_fit_weights(X_stim, Y_enc, lags, alpha=1.0, standardize=True):
+    """Fit a per-neuron RIDGE encoder on ALL rows and return the WEIGHTS (the RF), not a
+    CV score. `X_stim` (T, d_stim) is the stimulus design in its NATIVE spatial layout —
+    raw movie pixels flattened, or raw grid features — so the weights reshape back to space.
+    `lags` = frame lags (f_lag_embed; lag-major columns). Weights are in standardized-X
+    units (RF SHAPE, not a calibrated gain) and fit on all data (CV scoring stays in
+    f_encode_per_neuron). Returns dict:
+        W        (d_stim, n_lags, n_kept)   weights reshaped by lag  [the RF]
+        W_flat   (d_design, n_kept),  intercept (n_kept,),  keep_cells (n_cells bool),
+        lags, d_stim, row_offset, alpha.
+    """
+    from sklearn.linear_model import Ridge
+    ll = [int(l) for l in lags]
+    X_design, _ = f_lag_embed(np.asarray(X_stim, float), ll)     # (T, d_stim*n_lags)
+    lo = max([0] + [l for l in ll if l > 0])                     # +lags → leading NaN rows
+    hi = max([0] + [-l for l in ll if l < 0])                    # -lags → trailing NaN rows
+    T = X_design.shape[0]
+    X = X_design[lo:T - hi]
+    Y = np.asarray(Y_enc, float)[lo:T - hi]
+    keep = np.isfinite(Y).all(axis=0) & (Y.std(axis=0) > 0)
+    Yk = Y[:, keep]
+    if standardize:
+        mu = X.mean(axis=0); sd = X.std(axis=0); sd[sd == 0] = 1.0
+        X = (X - mu) / sd
+    reg = Ridge(alpha=alpha, fit_intercept=True).fit(X, Yk)
+    W_flat = np.atleast_2d(reg.coef_).T if Yk.shape[1] == 1 else reg.coef_.T   # (d_design, n_kept)
+    d_stim, n_lags = int(np.asarray(X_stim).shape[1]), len(ll)
+    W = W_flat.reshape(n_lags, d_stim, -1).transpose(1, 0, 2)    # (d_stim, n_lags, n_kept)
+    return {'W': W, 'W_flat': W_flat, 'intercept': np.atleast_1d(reg.intercept_),
+            'keep_cells': keep, 'lags': ll, 'd_stim': d_stim, 'row_offset': lo, 'alpha': alpha}
+
+
+def f_rf_pixel_frames(fit, cell_idx, hw):
+    """Spatiotemporal PIXEL RF for one KEPT cell (index into fit['keep_cells']-True cells):
+    (n_lags, H, W) from the fitted weights — a short weight-movie (blob motion across lags =
+    direction tuning). Weights are signed (±)."""
+    H, W = hw
+    w = fit['W'][:, :, cell_idx]                     # (d_stim = H*W, n_lags)
+    return w.T.reshape(len(fit['lags']), H, W)
+
+
+def f_rf_grid_location(fit, cell_idx, grid, n_chan):
+    """Feature-grid RF LOCATION map for one kept cell: |weights| summed over the `n_chan`
+    channels per grid cell → (n_lags, ny, nx). Assumes the raw grid block is ordered
+    location-major (grid cell outer, channel inner), as f_gabor_features/f_grid_features emit."""
+    ny, nx = grid
+    w = fit['W'][:, :, cell_idx].reshape(ny * nx, n_chan, len(fit['lags']))
+    return np.abs(w).sum(axis=1).T.reshape(len(fit['lags']), ny, nx)
+
+
+def f_encode_ceiling_fraction(r_model, r_full, floor=0.05):
+    """Per-cell fraction of the full-model relative ceiling a feature/model recovers:
+    r_model / r_full (the #57 stance — read a feature by how much of r_full it reaches, not
+    as absolute variance). Cells whose ceiling r_full ≤ `floor` (≈chance) → NaN (ratio
+    meaningless there)."""
+    r_model = np.asarray(r_model, float); r_full = np.asarray(r_full, float)
+    out = np.full(r_model.shape, np.nan)
+    ok = r_full > floor
+    out[ok] = r_model[ok] / r_full[ok]
+    return out
+
+
 def f_encode_null(built_blocks, block_names, Y_enc, lags, rng, **kw):
     """Null encoding scores: per-cell circular-shift of the target (uniform null),
     same design + CV as f_encode_per_neuron. Breaks stimulus↔neural alignment,

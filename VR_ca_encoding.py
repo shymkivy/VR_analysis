@@ -632,3 +632,52 @@ if 1:
     fig.colorbar(im, ax=ax, fraction=0.04, label='unique Δr')
     ax.set_title(f'{dset_tag}\ntop-cell block importance (unique Δr)')
     fig.tight_layout()
+
+#%% P2·D1 — PIXEL-space receptive fields: fit each neuron from the raw movie, view top cells
+# The canary: fit weights (not a score) from lag-embedded DOWNSAMPLED pixels → reshape to a
+# monitor frame per lag = the spatiotemporal RF. Rank by the feature-model OOF r (`real`) to
+# pick responsive cells. Needs the raw movie in memory (build mode or a save_movie cache).
+if 0:
+    from f_encoding import f_encode_fit_weights, f_rf_pixel_frames
+    from f_encoding_plots import f_plot_rf
+
+    if mon_movies is None:
+        raise RuntimeError('pixel RF needs the raw movie — run in build mode or load a cache '
+                           'written with save_movie=True.')
+    pix_ds       = 4          # spatial downsample so the pixel design stays fittable
+    pix_lags_ms  = [0, 50, 100, 150, 200]
+    pix_alpha    = 1e4        # ridge penalty (fixed here; CV'd via D2 smoothness later)
+    n_view       = 6
+
+    _mov = two_mon_frames[:, ::pix_ds, ::pix_ds].astype(np.float32)   # (T, Hd, Wd)
+    _T, _Hd, _Wd = _mov.shape
+    pix_lags = f_lags_from_ms(pix_lags_ms, fs_img)
+    fitp = f_encode_fit_weights(_mov.reshape(_T, -1), Y_enc, pix_lags, alpha=pix_alpha)
+    print(f'pixel RF: movie {_mov.shape} → design {len(pix_lags)}×{_Hd * _Wd}d, '
+          f'{int(fitp["keep_cells"].sum())} cells kept')
+
+    # rank kept-in-both cells by the feature-model OOF r
+    _rall = np.full(fitp['keep_cells'].size, -np.inf)
+    _rall[np.where(real['keep_cells'])[0]] = real['r_per_cell']
+    _fit_ids = np.where(fitp['keep_cells'])[0]                        # original ids, fit order
+    _top = [i for i in np.argsort(_rall)[::-1] if fitp['keep_cells'][i]][:n_view]
+    for _oid in _top:
+        _cidx = int(np.where(_fit_ids == _oid)[0][0])
+        _rf = f_rf_pixel_frames(fitp, _cidx, (_Hd, _Wd))
+        f_plot_rf(_rf, pix_lags, fs=fs_img,
+                  title=f'{dset_tag}  cell{enc_cell_ids[_oid]}  pixel RF  (r={_rall[_oid]:+.2f})')
+
+#%% P2·D5 — relative ceiling: each block's OOF r as a fraction of the full-model r_full
+# Same lags → same kept cells across fits, so r_block and r_full align directly (#57 stance:
+# read a feature by how much of the full-model ceiling it recovers, not absolute variance).
+if 1:
+    from f_encoding import f_encode_ceiling_fraction
+
+    _full = f_encode_per_neuron(built_blocks, enc_blocks, Y_enc, lags, **_mkw)
+    r_full = _full['r_per_cell']
+    print(f'full model ({enc_blocks}): median r_full = {np.nanmedian(r_full):+.3f}')
+    print('  block         median r   median r/r_full  (over cells with r_full>0.05)')
+    for b in enc_blocks:
+        _rb = f_encode_per_neuron(built_blocks, [b], Y_enc, lags, **_mkw)['r_per_cell']
+        _frac = f_encode_ceiling_fraction(_rb, r_full)
+        print(f'  {b:12s}  {np.nanmedian(_rb):+.3f}      {np.nanmedian(_frac):.2f}')
