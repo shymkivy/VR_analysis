@@ -633,39 +633,82 @@ if 1:
     ax.set_title(f'{dset_tag}\ntop-cell block importance (unique Δr)')
     fig.tight_layout()
 
-#%% P2·D1 — PIXEL-space receptive fields: fit each neuron from the raw movie, view top cells
-# The canary: fit weights (not a score) from lag-embedded DOWNSAMPLED pixels → reshape to a
-# monitor frame per lag = the spatiotemporal RF. Rank by the feature-model OOF r (`real`) to
-# pick responsive cells. Needs the raw movie in memory (build mode or a save_movie cache).
+#%% P2·D1 — PIXEL-space receptive fields (first RF image): STA + ridge, per lag, top cells
+# The canary. Two RFs per cell from lag-embedded DOWNSAMPLED pixels: STA (f_encode_sta,
+# parameter-free reverse correlation — a fast first image, biased for correlated movies) and
+# the ridge encoder weights (f_encode_fit_weights, the principled RF; α fixed here → CV'd in
+# D2). Each reshapes to a monitor frame per lag = spatiotemporal RF. Rank by the feature-model
+# OOF r (`real`) to pick responsive cells. Needs the raw movie in memory (build mode / a
+# save_movie cache). Any session (all luminance pooled).
 if 0:
-    from f_encoding import f_encode_fit_weights, f_rf_pixel_frames
-    from f_encoding_plots import f_plot_rf
+    from f_encoding import f_encode_fit_weights, f_encode_sta
+    from f_encoding_plots import f_plot_rf_cells
 
     if mon_movies is None:
         raise RuntimeError('pixel RF needs the raw movie — run in build mode or load a cache '
                            'written with save_movie=True.')
     pix_ds       = 4          # spatial downsample so the pixel design stays fittable
     pix_lags_ms  = [0, 50, 100, 150, 200]
-    pix_alpha    = 1e4        # ridge penalty (fixed here; CV'd via D2 smoothness later)
-    n_view       = 6
+    pix_alpha    = 1e4        # ridge penalty (fixed; CV'd via D2 smoothness later)
+    n_view       = 5
 
     _mov = two_mon_frames[:, ::pix_ds, ::pix_ds].astype(np.float32)   # (T, Hd, Wd)
     _T, _Hd, _Wd = _mov.shape
+    _Xpix = _mov.reshape(_T, -1)
     pix_lags = f_lags_from_ms(pix_lags_ms, fs_img)
-    fitp = f_encode_fit_weights(_mov.reshape(_T, -1), Y_enc, pix_lags, alpha=pix_alpha)
-    print(f'pixel RF: movie {_mov.shape} → design {len(pix_lags)}×{_Hd * _Wd}d, '
+    sta  = f_encode_sta(_Xpix, Y_enc, pix_lags)                       # parameter-free
+    fitp = f_encode_fit_weights(_Xpix, Y_enc, pix_lags, alpha=pix_alpha)
+    print(f'pixel RF: movie {_mov.shape} → {len(pix_lags)} lags × {_Hd * _Wd}px, '
           f'{int(fitp["keep_cells"].sum())} cells kept')
 
-    # rank kept-in-both cells by the feature-model OOF r
+    # rank cells by the feature-model OOF r (same lags → sta/fitp share keep_cells)
     _rall = np.full(fitp['keep_cells'].size, -np.inf)
     _rall[np.where(real['keep_cells'])[0]] = real['r_per_cell']
     _fit_ids = np.where(fitp['keep_cells'])[0]                        # original ids, fit order
-    _top = [i for i in np.argsort(_rall)[::-1] if fitp['keep_cells'][i]][:n_view]
-    for _oid in _top:
-        _cidx = int(np.where(_fit_ids == _oid)[0][0])
-        _rf = f_rf_pixel_frames(fitp, _cidx, (_Hd, _Wd))
-        f_plot_rf(_rf, pix_lags, fs=fs_img,
-                  title=f'{dset_tag}  cell{enc_cell_ids[_oid]}  pixel RF  (r={_rall[_oid]:+.2f})')
+    _top_oid = [i for i in np.argsort(_rall)[::-1] if fitp['keep_cells'][i]][:n_view]
+    _cidx = [int(np.where(_fit_ids == o)[0][0]) for o in _top_oid]
+    _lbls = [f'cell{enc_cell_ids[o]}  r={_rall[o]:+.2f}' for o in _top_oid]
+    f_plot_rf_cells(sta,  _cidx, (_Hd, _Wd), fs=fs_img, labels=_lbls,
+                    suptitle=f'{dset_tag} — PIXEL RF (STA)  rows=cells, cols=lags')
+    f_plot_rf_cells(fitp, _cidx, (_Hd, _Wd), fs=fs_img, labels=_lbls,
+                    suptitle=f'{dset_tag} — PIXEL RF (ridge α={pix_alpha:g})  rows=cells, cols=lags')
+
+#%% P2·D2 — SMOOTHNESS-regularized pixel RF (legible vs the ridge/STA above), fixed λ
+# Generalized Tikhonov: couples neighboring pixels + adjacent lags → a clean RF where plain
+# ridge is salt-and-pepper. RUN THE D1 CELL FIRST (defines _Xpix, pix_lags, _Hd/_Wd, _cidx, _lbls).
+if 0:
+    from f_encoding import f_encode_fit_smooth
+    from f_encoding_plots import f_plot_rf_cells
+    sm_lam_space, sm_lam_lag, sm_lam_ridge = 50.0, 20.0, 1e-2
+
+    smf = f_encode_fit_smooth(_Xpix, Y_enc, pix_lags, (_Hd, _Wd), lam_space=sm_lam_space,
+                              lam_lag=sm_lam_lag, lam_ridge=sm_lam_ridge)
+    f_plot_rf_cells(smf, _cidx, (_Hd, _Wd), fs=fs_img, labels=_lbls,
+                    suptitle=f'{dset_tag} — PIXEL RF (SMOOTH λ_s={sm_lam_space:g} λ_t={sm_lam_lag:g})')
+
+#%% P2·D2 — JOINT deconv-σ × smoothness-λ CV → best (encoding OOF r), refit + view at best
+# σ (target smoothing) and lags/smoothness are partly redundant → ONE search (§2d). Re-smooths
+# the RAW deconvolved S per σ. RUN THE D1 CELL FIRST (uses _Xpix, pix_lags, _Hd/_Wd, _cidx, _lbls).
+if 0:
+    from f_encoding import f_encode_tune_sigma_lambda, f_encode_fit_smooth
+    from f_encoding_plots import f_plot_rf_cells
+    from f_utils import f_gauss_smooth
+    sigma_list = [2, 4, 6, 9]                      # frames @60 Hz ≈ 33/67/100/150 ms
+    lam_list   = [(10, 5), (50, 20), (200, 50)]    # (lam_space, lam_lag)
+
+    _Sraw = est1['S'][enc_cell_ids]                # raw deconvolved, aligned to Y_enc cells
+    rows, best = f_encode_tune_sigma_lambda(_Sraw, _Xpix, pix_lags, (_Hd, _Wd),
+                                            sigma_list, lam_list, n_folds=enc_n_folds,
+                                            embargo=embargo_fr)
+    print('best σ/λ (max median OOF r):', best)
+    _Ssm = f_gauss_smooth(_Sraw, sigma_frames=best['sigma_frames'])
+    _rm = np.max(_Ssm, axis=1, keepdims=True)
+    _Yb = (_Ssm / np.where(_rm == 0, 1.0, _rm)).T
+    smb = f_encode_fit_smooth(_Xpix, _Yb, pix_lags, (_Hd, _Wd),
+                              lam_space=best['lam_space'], lam_lag=best['lam_lag'])
+    f_plot_rf_cells(smb, _cidx, (_Hd, _Wd), fs=fs_img, labels=_lbls,
+                    suptitle=f'{dset_tag} — smooth RF @ best σ={best["sigma_frames"]}fr '
+                             f'λ=({best["lam_space"]:g},{best["lam_lag"]:g})')
 
 #%% P2·D5 — relative ceiling: each block's OOF r as a fraction of the full-model r_full
 # Same lags → same kept cells across fits, so r_block and r_full align directly (#57 stance:

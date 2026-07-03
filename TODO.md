@@ -382,9 +382,13 @@ P-numbers mapped to real IDs below. Verify-checklist results recorded in
         real session): `f_encode_fit_weights` (weights = RF) + `f_rf_pixel_frames` /
         `f_rf_grid_location` + `f_encoding_plots.f_plot_rf` (canary viewer);
         `f_encode_ceiling_fraction` (r/r_full). Pixel-RF + ceiling cells in `VR_ca_encoding.py`.
-        Synthetic STRF recovery passes (blob + peak lag). NEXT: view real RFs → D2 smoothness
-        + σ-CV. Deferred: D2/D3 banded+variance-partition/D4 behavior bands (fwd/lat/yaw +
-        capture-offset)/D6 per-cell lags/D7 estimator dual-readout (→P5)/D8 regime/D9.
+        Synthetic STRF recovery passes (blob + peak lag). Added STA baseline (`f_encode_sta`).
+        **D2 built + gated** (2026-07-03): `f_encode_fit_smooth` (Tikhonov/Laplacian smoothness),
+        `f_encode_smooth_cv`, `f_encode_tune_sigma_lambda` (σ×λ joint CV). Gate step 3 passes
+        (smooth beats ridge at low N: corr 0.57 vs 0.17). D2 driver cells in `VR_ca_encoding.py`.
+        Audit → `../reserrch_repo/AUDIT_P2_findings.md` (flags: self_mot=speed+yaw; #62 CEBRA leak).
+        NEXT: view real RFs (build mode); then D3 banded+variance-partition. Deferred: D3/D4
+        behavior bands (fwd/lat/yaw + capture-offset)/D6 per-cell lags/D7 dual-readout (→P5)/D8/D9.
       *Working ceiling stance (2026-06-13, supersedes #58):* use the FULL-feature
       model r (predict each cell from ALL blocks, best model) as the per-cell
       RELATIVE ceiling — judge a feature/model by how much of r_full it recovers.

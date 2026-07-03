@@ -1687,7 +1687,33 @@ Built D0/D1/D5 (compute + viewer + synthetic gate; NOT yet run on a real session
 SYNTHETIC GATE PASSED (§6 steps 1–2, pixel): planted Gaussian-blob RF × temporal kernel →
  recovered RF corr 0.99 to planted at the peak lag, blob at exact planted (4,17), temporal
  peak lag recovered; ceiling_fraction + grid reshape + viewers OK. All files compile.
-Next (per §8): view real RFs on a dark session; then D2 (smoothness + σ-CV) → gate step 3.
+
+2026-07-03 follow-up: researcher shipped the full P0-P9 sub-plan set + DECISIONS_open_items.md
+(master rev 4). P2 pivot: NO dark-vs-light split — all luminance pooled; visual/behavior read on
+DECOUPLED epochs (object-moving-still / running-no-object). Our D1/D5 unaffected (framing only).
+Wrote ../reserrch_repo/AUDIT_P2_findings.md (builder→researcher: the §4 audit + cross-pillar B
+items). Two flags to relay: (1) self_mot = speed-magnitude + yaw, NOT fwd/lat/yaw (P2a-9 assumes
+present → it's new work; project world vel onto heading phi); (2) #62 CEBRA single-fit leak
+UNFIXED (VR_ca_cebra.py:977, out_dim=3) → P5 untrustworthy until fixed. Added STA baseline
+f_encode_sta (parameter-free reverse correlation, same shape as fit_weights → same viewer;
+P3 method-3) — synthetic-recovers the planted blob (corr 0.91 @ peak lag vs ridge 0.99, biased
+as expected). Pixel-RF driver cell now shows STA + ridge side by side.
+Next: view real RFs (encoding weights or STA) on any session; then D2 (smoothness + σ-CV).
+
+2026-07-03 D2 (smoothness-regularized RF + σ×λ joint CV — synthetic-gated, not yet on real):
+f_encoding.py: factored _encode_design (design-build shared by fit_weights/sta/smooth — DRY).
+_grid_laplacian (4-neighbor graph Laplacian over H×W) + _chain_laplacian (adjacent lags) →
+_smooth_penalty P = lam_space·(I_lag⊗L_space) + lam_lag·(L_lag⊗I_space) + lam_ridge·I (lag-major
+weight order). f_encode_fit_smooth = generalized Tikhonov solve w=(XᵀX+P)⁻¹Xᵀy (legible RF;
+DOWNSAMPLE — d_design=prod(shape)·n_lags d×d solve). f_encode_smooth_cv = blocked-CV OOF r with
+the smooth solver (contiguous folds + embargo, train-only). f_encode_tune_sigma_lambda = re-smooth
+raw S per deconv σ × smoothness λ → median encoding r, pick best (σ≈redundant with lags → ONE CV,
+§2d; XᵀX is σ/λ-independent, cacheable — left simple). Gate step 3 PASSED: at low N + heavy noise,
+ridge corr 0.17 / TV 62 (salt-and-pepper) vs smooth corr 0.57 / TV 8 — data-efficiency claim
+reproduced. Refactor regression-checked (fit_weights/sta intact). Driver: VR_ca_encoding.py D2
+cells (smooth RF at fixed λ; σ×λ tune → refit+view at best) — reuse the D1 pixel design. All compile.
+Next: run D1+D2 on a real session (build mode); relay AUDIT flags to researcher (self_mot fwd/lat/yaw,
+#62 CEBRA). Then D3 (banded ridge + variance partition, needs the researcher's λ grid + fwd/lat/yaw).
 Deferred D-items: D2 smoothness, D3 banded/variance-partition, D4 behavior bands
  (fwd/lat/yaw + capture-offset FIR), D6 per-cell lags, D7 estimator dual-readout (→P5), D8
  regime, D9 separable/generative.

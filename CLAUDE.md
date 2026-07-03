@@ -202,7 +202,13 @@ with moving objects. Spyder-based, cell-by-cell exploratory workflow.
   (2026-07-03): `f_encode_fit_weights` (per-neuron ridge on ALL rows → the WEIGHTS =
   receptive field, reshaped (d_stim,n_lags,n_kept)), `f_rf_pixel_frames` (→ n_lags×H×W
   spatiotemporal pixel RF), `f_rf_grid_location` (|W| pooled over channels → location map),
-  `f_encode_ceiling_fraction` (per-cell r/r_full, #57 relative ceiling).
+  `f_encode_ceiling_fraction` (per-cell r/r_full, #57 relative ceiling), `f_encode_sta`
+  (parameter-free reverse-correlation RF baseline, same shape → same viewer). D2 (smoothness
+  + σ-CV): `f_encode_fit_smooth` (generalized Tikhonov ‖y−Xw‖²+wᵀPw, P = graph-Laplacian over
+  spatial neighbors + adjacent lags → legible RF where plain ridge is salt-and-pepper),
+  `f_encode_smooth_cv` (blocked-CV OOF r for the smooth solver), `f_encode_tune_sigma_lambda`
+  (JOINT deconv-σ × smoothness-λ search by encoding r). Shared `_encode_design` behind
+  fit_weights/sta/smooth.
 - `functions/f_encoding_plots.py` — encoding visuals (P2·D1, 2026-07-03): `f_plot_rf`
   (a fitted RF `(n_lags,H,W)` as a frame-per-lag weight-movie, diverging 0-centered) +
   `f_plot_rf_cells` (cells×lags grid). The RF viewer is the build's canary. Driven by the
