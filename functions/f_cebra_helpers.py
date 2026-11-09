@@ -37,12 +37,13 @@ from f_decoding import make_decoder, f_resolve_n_components, f_lag_embed
 
 
 def f_blocked_cv_r2(emb, target, n_folds=5, embargo=0, standardize=True,
-                    decoder='ridge', ridge_alpha=1.0, k_nn=15,
+                    decoder='ridge', ridge_alpha=1.0, k_nn=15, l1_ratio=0.5,
                     ridgecv_alphas=None, n_components=None,
                     multioutput='uniform_average',
                     Y_raw=None, n_pcs=None, random_state=42, return_std=False,
                     return_predictions=False, task='regression', lags=None,
-                    fold_scheme='contiguous', n_blocks=None, fold_ids=None):
+                    fold_scheme='contiguous', n_blocks=None, fold_ids=None,
+                    bands=None, band_alphas=None, pred_proc=None):
     """Unified blocked-CV decoding score (single- or multi-output), NaN-aware.
 
     One implementation behind the three former inline CV helpers in
@@ -83,9 +84,14 @@ def f_blocked_cv_r2(emb, target, n_folds=5, embargo=0, standardize=True,
     standardize : bool
         z-score embedding columns using TRAIN-fold stats only (stops a high-
         variance PC from dominating KNN distance / the Ridge penalty).
-    decoder : {'ridge', 'ridgecv', 'knn'}
+    decoder : {'ridge', 'ridgecv', 'knn', 'pls', 'cca', 'banded'}
         'ridgecv' tunes alpha by efficient leave-one-out CV inside each train
-        fold over ridgecv_alphas.
+        fold over ridgecv_alphas. 'banded' = per-band ridge (needs bands +
+        band_alphas; emb path only — bands index emb columns, so no Y_raw/PCA).
+    bands, band_alphas
+        for decoder='banded': per-emb-column band ids + {band_id: α}. Columns
+        aren't reordered by standardize, so bands stay aligned. Passed to
+        make_decoder → BandedRidge.
     ridge_alpha, k_nn, ridgecv_alphas
         Decoder hyperparameters. ridgecv_alphas defaults to logspace(-2, 4, 13).
     multioutput : str or array
@@ -183,8 +189,9 @@ def f_blocked_cv_r2(emb, target, n_folds=5, embargo=0, standardize=True,
         # pls/cca need a per-fold rank clamp (dims vary across folds).
         nc = (f_resolve_n_components(n_components, n_in, n_out)
               if decoder in ('pls', 'cca') else None)
-        return make_decoder(decoder, ridge_alpha=ridge_alpha, k_nn=k_nn,
-                            ridgecv_alphas=ridgecv_alphas, n_components=nc, task=task)
+        return make_decoder(decoder, ridge_alpha=ridge_alpha, k_nn=k_nn, l1_ratio=l1_ratio,
+                            ridgecv_alphas=ridgecv_alphas, n_components=nc, task=task,
+                            bands=bands, band_alphas=band_alphas)
 
     # Fold assignment. 'contiguous' (default) keeps fold_of=None → the original per-fold
     # time-block slicing below (byte-identical). 'interleaved' ("chop") round-robins small
@@ -224,15 +231,21 @@ def f_blocked_cv_r2(emb, target, n_folds=5, embargo=0, standardize=True,
         te = te_idx & valid
         if tr.sum() < 2 or te.sum() < 2:
             r2s.append(np.nan); r2s_train.append(np.nan); continue
-        if Y_raw is not None:
-            _p  = PCA(n_components=n_pcs, random_state=random_state)
-            Xtr = _p.fit_transform(Y_raw[tr])
-            Xte = _p.transform(Y_raw[te])
-        else:
-            Xtr, Xte = emb[tr], emb[te]
-        if standardize:
-            mu = Xtr.mean(axis=0); sd = Xtr.std(axis=0); sd[sd == 0] = 1.0
-            Xtr = (Xtr - mu) / sd; Xte = (Xte - mu) / sd
+        if pred_proc is not None:                        # unified within-fold predictor pipeline (f_proc):
+            from f_feature_helpers import f_proc          # fit on train rows, transform test rows (leak-free)
+            src = Y_raw if Y_raw is not None else emb
+            Xtr, _pf = f_proc(src[tr], pred_proc)
+            Xte, _ = f_proc(src[te], pred_proc, fit=_pf)
+        else:                                            # default: within-fold PCA (Y_raw) + standardize (EXACT prior)
+            if Y_raw is not None:
+                _p  = PCA(n_components=n_pcs, random_state=random_state)
+                Xtr = _p.fit_transform(Y_raw[tr])
+                Xte = _p.transform(Y_raw[te])
+            else:
+                Xtr, Xte = emb[tr], emb[te]
+            if standardize:
+                mu = Xtr.mean(axis=0); sd = Xtr.std(axis=0); sd[sd == 0] = 1.0
+                Xtr = (Xtr - mu) / sd; Xte = (Xte - mu) / sd
         if is_clf:
             reg = _make()                              # pls/cca not valid here
             ytr = target[tr].ravel(); yte = target[te].ravel()
@@ -304,7 +317,7 @@ def f_blocked_cv_r2(emb, target, n_folds=5, embargo=0, standardize=True,
     return (mean, std) if return_std else mean
 
 
-def make_cebra_supervision(group_names, built_blocks, blocks=None):
+def make_cebra_supervision(group_names, built_blocks, blocks=None, zscore=True):
     """Build a CEBRA-ready supervision matrix from registry blocks.
 
     Concatenates selected blocks, fills NaN with 0 (CEBRA can't handle NaN —
@@ -341,7 +354,9 @@ def make_cebra_supervision(group_names, built_blocks, blocks=None):
         ns.extend(blocks[g]['names'])
     X = np.concatenate(Xs, axis=1)
     X_filled = np.where(np.isnan(X), 0.0, X)
-    return f_zscore(X_filled), ns
+    # zscore=False → RAW columns (for PCA'd blocks this KEEPS the eigenvalue/variance weighting of the
+    # PC scores instead of equalizing every PC to unit variance). Default True = current behavior.
+    return (f_zscore(X_filled) if zscore else X_filled), ns
 
 
 def f_run_cebra(neural, behavior, out_dim=3, max_iter=5000,

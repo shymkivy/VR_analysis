@@ -1,0 +1,130 @@
+ Gabor wavelet pyramid model
+In Supplementary Methods 5 we described how the Gabor wavelet pyramid (GWP) model was
+used to estimate the receptive field of each voxel. In this section we provide specific details of
+the GWP model, such as how model parameters are determined.
+Basic framework
+The GWP model is applied to a specific region of the stimulus, called the field-of-view (FOV).
+The resolution is typically 64 px × 64 px, though in some cases, a resolution of 128 px × 128 px
+is used. The model describes how the portion of the stimulus within the FOV (henceforth simply
+referred to as the image) is transformed into a predicted response. Note that the GWP model does
+not include a temporal component because voxel-specific response timecourses are removed
+from the time-series data in pre-processing.
+Stimulus pre-processing
+To accommodate a variety of FOVs and resolutions, the stimuli used in the experiment were preprocessed at multiple resolutions. The dimensions of the pre-processed stimuli were given
+by min(500,round(29! x /8
+)) where x ranges from 0 to 24. For example, for x = 0 the stimuli were
+left at the original resolution of 500 px × 500 px, and for x = 10 the stimuli were downsampled to
+a resolution of 215 px × 215 px. Stimuli were converted to luminance values using the measured
+luminance response of the goggles (see below). The mean luminance across all stimuli was then
+subtracted.
+The luminance response of the goggles was measured with a Minolta LS-110 photometer
+(Konica Minolta Photo Imaging, Mahwah, NJ). The luminance response of the left-eye display
+was slightly different from that of the right-eye display; for analysis, the average of the two
+luminance responses was assumed. The minimum, maximum, and mean luminance was 0.8
+cd/m2
+, 11.1 cd/m2
+, and 6.3 cd/m2
+, respectively.
+Design of the wavelet pyramid
+The Gabor wavelet pyramid is illustrated in Supplementary Fig. 2. For the 64 px × 64 px model
+resolution, wavelets occur at five spatial frequencies: 1, 2, 4, 8, and 16 cycles per FOV. (For the
+128 px × 128 px model resolution, wavelets occur at six spatial frequencies: 1, 2, 4, 8, 16, and 32
+cycles per FOV.) At each spatial frequency f cycles per FOV, wavelets are positioned on an f × f
+grid. At each grid position wavelets occur at eight orientations, 0, 22.5°, 45°, ..., and 157.5°, and
+two quadrature phases, 0° and 90°. An isotropic Gaussian mask is used for each wavelet, and its
+size relative to spatial frequency is such that all wavelets have a spatial frequency bandwidth of 1
+octave and an orientation bandwidth of 41°. A luminance-only wavelet that covers the entire
+image is also included.
+Wavelets are truncated to lie within the bounds of the image, and are restricted in spatial extent
+by setting to zero the portions of the masks whose values are less than 0.01 of the peak value
+doi: 10.1038/nature06713 SUPPLEMENTARY INFORMATION
+www.nature.com/nature 25
+(Supplementary Fig. 2b). Each wavelet is made zero-mean and unit-length within the bounds of
+its associated mask.
+Transformation from image to predicted response
+The following steps transform a given image into the predicted response from the GWP model
+(Supplementary Fig. 3). First, the image is projected onto the set of Gabor wavelets. The
+projections for each quadrature pair of wavelets are then squared, summed, and square-rooted,
+yielding a set of input channels. These input channels reflect the contrast energy contained in
+quadrature wavelet pairs. (For the luminance-only wavelet, the projection is squared, multiplied
+by 2, and square-rooted.) Next, the input channels are weighted by a set of values called the
+kernel and then summed. Finally, a DC offset is added to the result.
+Wavelets positioned near the edge of the circular stimulus mask (see Supplementary Fig. 1) yield
+artifactually small projections. To avoid instability in parameter estimation, the projection for a
+given wavelet is set to zero if more than half of its associated mask lies beyond 90% of the
+stimulus radius.
+The quantification of contrast energy is a nonlinear operation that transforms the stimulus into a
+space where the relationship between stimulus and response is more linear; for this reason, the
+GWP model is termed a linearized model10. A purely linear model that characterizes the voxel
+response as a weighted sum of the raw wavelet projections yields very poor fits (data not shown).
+Estimation of model parameters
+Responses to the images used in the model estimation runs of the experiment are used to fit the
+GWP model. Formally, let p be the number of images, and q be the number of input channels.
+The voxel responses were modeled as
+y = Xh + c1 + n
+where y is the set of responses (p × 1), X is the set of input channels (p × q), h is the kernel
+(q × 1), c is the DC offset (1 × 1), 1 is a vector of ones (p × 1), and n is a noise term (p × 1).
+Model parameters were estimated using gradient descent with early stopping56. Gradient descent
+is an iterative fitting technique where the difference between the model fit and the data is
+gradually reduced. Early stopping is a form of regularization10 where the magnitude of model
+parameter estimates are shrunk in order to prevent overfitting.
+The specific procedure was as follows. A randomly selected 20% of the responses were removed
+and kept as a stopping set. The mean of the remaining responses yµ (1 × 1) was subtracted,
+yielding responses y! (p × 1). The mean of each input channel Xµ (1 × q) was subtracted and the
+standard deviation of each input channel X! (1 × q) was divided out, yielding input
+channels X! (p × q). The kernel was initialized to all zeros (h1 = 0) and then iteratively updated
+using gradient descent:
+hi+1 = hi ! "gi
+doi: 10.1038/nature06713 SUPPLEMENTARY INFORMATION
+www.nature.com/nature 26
+where hi is the kernel at iteration i, gi is the normalized error gradient at iteration i,
+and ! = 0.001 is the step size. The normalized error gradient is given by
+gi = X! T
+(X! hi ! y!) "
+# $
+% +&gi!1 "
+# $
+%
+where [x] = x / x represents vector length normalization, ! = 0.9 is a momentum parameter57,
+and g0 = 0. Iterations proceeded until the squared error on the stopping set no longer decreased,
+or until the squared error on the responses no longer decreased. The final estimate of the kernel
+was calculated as
+ˆ
+h = hfinal . / X!
+T
+where hfinal is the kernel at the last iteration and . / denotes element-by-element division. The
+final estimate of the DC offset was calculated as
+cˆ = y! ! Xµ
+ˆ
+h
+where the symbols are as defined earlier.
+Estimation of variance
+One hundred bootstrap samples were drawn from the original set of responses, and parameter
+estimates were obtained for each bootstrap sample. (The size of each bootstrap sample was equal
+to the number of responses, and the stopping set was selected after each bootstrap sample was
+drawn.) Standard errors on parameter estimates were calculated as the standard deviation across
+bootstraps. Final parameter estimates were calculated as the mean across bootstraps.
+To prevent artificially high variance of parameter estimates, the number of fitting iterations was
+held constant across bootstrap samples. This was accomplished as follows. Prior to
+bootstrapping, parameter estimates were obtained using gradient descent with early stopping on
+the original set of responses. The number of fitting iterations n was recorded. Then, for each
+bootstrap sample, parameter estimates were obtained using gradient descent for n iterations.
+Quantification of predictive power
+An objective measure of the quality of a receptive-field model is how well the model predicts
+responses to images not used for model estimation10. Here, the predictive power of a receptivefield model was calculated as the correlation (Pearson’s r) between measured and predicted
+responses for the images used in the image identification runs of the experiment. (There were
+120 images used in the image identification runs, and these were distinct from the 1,750 images
+used in the model estimation runs; see Methods in the main text.) A bootstrap procedure was
+used to estimate statistical significance of predictive power (r > 0, one-tailed p-values).
+Calculation of tuning curves
+Tuning curves for space, orientation, and spatial frequency were calculated for each receptivefield (RF) model. To calculate the spatial tuning curve, i.e. spatial envelope, of an RF, the
+wavelet mask associated with each input channel was normalized to sum to 1, and was then
+scaled by the absolute value of the kernel weight associated with that input channel. The spatial
+doi: 10.1038/nature06713 SUPPLEMENTARY INFORMATION
+www.nature.com/nature 27
+envelope was obtained by summing all wavelet masks. To calculate the orientation and spatial
+frequency tuning curves of an RF, a set of sinusoidal gratings were constructed at the same
+orientations and spatial frequencies used in the GWP model. At each combination of orientation
+and spatial frequency, gratings were constructed at multiple phases. The response of the RF to
+each grating was calculated, and tuning curves were obtained by averaging responses over one or
+more of the dimensions of orientation, spatial frequency, and phase.

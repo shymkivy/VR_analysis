@@ -1,23 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-VR_feature_viz.py — visualize the FEATURES WE DECODE FROM (TODO #47/#49/#66).
+VR_feature_viz_cache.py — visualize features from a BLOCK CACHE (joblib) (TODO #47/#49/#66).
 
-Loads a feature cache and reconstructs the image-space decoding blocks back to monitor
-movies, judged against the original input:
+Loads a feature-block cache (VR_feature_gen GEN_MODE='blocks', or a cebra/encoding build) and
+reconstructs the image-space decoding blocks back to monitor movies, judged against the original:
   - pix / grid / flow / gabor / meng reconstruction  (f_reconstruct_feature_movie)
   - gabor magnitude + phase                          (f_reconstruct_gabor_phase_movie)
   - gabor per-PATCH phase-quiver (motion from phase)  (f_gabor_flow_field + quiver)
-All read built_blocks only. The ORIGINAL input is the comparison baseline — shown from
-the few `example_frames` saved in the cache (cheap), or the full movie if cached / rendered.
+  - per-orientation feature-map panel                (f_reconstruct_feature_movie per channel)
+The ORIGINAL input is the comparison baseline — from the few `example_frames` in the cache
+(cheap), or the full movie if cached / rendered.
 
-Each feature cell BUILDS its movie, plots a few frames inline (vs original), and only
-SAVES the multi-page TIFF when make_movie=True. `save_orig` then also writes the matching
-ORIGINAL movie (same frames + filename tag) so they pair up in ImageJ. To raise a
-feature's fidelity, increase its grid / n_pca in visual_specs and REGENERATE — the viz
-reflects whatever resolution the features were built at.
-
-Split out of VR_ca_cebra.py on 2026-06-29. Spyder cell-based: run the load cell, then any
-viz cell.
+For the DENSE conv_repo (per-filter maps: activity diagnostic, → HDF5, sampled-block panel) use
+VR_feature_viz_conv_repo.py instead. Split out of VR_feature_viz.py on 2026-07-12. Spyder cells.
 """
 
 import sys
@@ -35,9 +30,11 @@ from f_functions import f_save_mon_movie
 from f_feature_viz import (f_plot_movie_frames, f_plot_movie_frames_compare,
                            f_reconstruct_feature_movie, f_reconstruct_gabor_phase_movie,
                            f_resolve_recon_n_pcs, f_gabor_flow_field, f_gabor_flow_at,
-                           f_render_flow_quiver_movie, f_pick_motion_frames)
+                           f_render_flow_quiver_movie, f_pick_motion_frames,
+                           f_gabor_flow_dense, f_render_flow_color, f_render_flow_quiver_dense,
+                           f_orig_frames, f_frame_indices, f_save_movie_pair)
 
-#%% Load a feature cache — pick by tag / index / filename (set the dir + selectors)
+#%% Load a feature-block CACHE — pick by tag / index / filename (set the dir + selectors)
 mouse_id     = 'L'
 features_dir = 'F:/VR/features/' + mouse_id
 dset_name    = ''          # filter the dir to one dataset (substring); '' = all files
@@ -60,63 +57,32 @@ gen_config   = bundle['gen_config']
 _ds          = meta.get('dset_name', _path.stem)
 # num_samp lives in gen_config: flat (cebra/encoding) or nested under 'render' (gen).
 num_samp     = gen_config.get('num_samp') or gen_config.get('render', {}).get('num_samp', 101)
-mon_hw       = (num_samp, num_samp)
-side         = 'both' if side_tags == ['L', 'R'] else side_tags[0]
-# Original input: full movie only when SAVE_MOVIE was set; a few example_frames always.
-movie = bundle.get('movie')
-orig_mov = movie                      # full original (L|R), or None — set by the cell below
+movie = bundle.get('movie')            # full original only when SAVE_MOVIE was set
 example_frames    = bundle.get('example_frames')
 example_frame_idx = bundle.get('example_frame_idx')
 print(f'loaded {_path.name}: blocks={list(built_blocks)}  side={side_tags}  '
       f'T={frame_t.size}  num_samp={num_samp}  movie={"yes" if movie is not None else "no"}  '
       f'example_frames={0 if example_frames is None else len(example_frame_idx)}')
 
-
-def _orig_for_side(arr):
-    """Crop an L|R original-frame array to the recon's side(s) so widths match."""
-    if arr is None or len(side_tags) == 2:
-        return arr
-    _h = arr.shape[2] // 2
-    return arr[:, :, :_h] if side_tags[0] == 'L' else arr[:, :, _h:]
+mon_hw   = (num_samp, num_samp)
+side     = 'both' if side_tags == ['L', 'R'] else side_tags[0]
+orig_mov = movie                       # full original (L|R), or None — set by the Original cell
 
 
+# Thin adapters that bind this script's loaded state (orig_mov / example_frames / out_dir …) to
+# the shared helpers in f_feature_viz.py — the logic lives there; these just fill in the globals
+# (late-bound, so orig_mov set by the Original-movie cell below is picked up at call time).
 def _orig_frames(pidx):
-    """Original frames at imaging-frame indices `pidx`, cropped to side: from the cheap
-    saved example_frames when pidx == example_frame_idx, else from orig_mov, else None."""
-    if pidx is None:
-        return None
-    if example_frames is not None and list(pidx) == list(example_frame_idx):
-        return _orig_for_side(np.asarray(example_frames))
-    if orig_mov is not None:
-        return _orig_for_side(np.asarray(orig_mov)[list(pidx)])
-    return None
-
-
-def _save_with_orig(feat_mov, stem, save_idx=None, pair=True):
-    """Save an already-frame-subset feature movie as <out_dir>/<stem>_<ds><_tag>.tif, and
-    (when save_orig and pair) the matching ORIGINAL as <...>_ORIG.tif at the SAME frames.
-    `save_idx` = the imaging-frame indices `feat_mov` was built at (for the original)."""
-    _mt = f'_{mov_tag}' if mov_tag else ''
-    f_save_mon_movie(feat_mov, f'{out_dir}/{stem}_{_ds}{_mt}.tif', gap_px=0)
-    msg = f'saved {stem} → {out_dir}/{stem}_{_ds}{_mt}.tif'
-    if pair and save_orig:
-        if orig_mov is None or save_idx is None:
-            msg += '  (save_orig set but no original movie — run the Original-movie cell)'
-        else:
-            _o = _orig_for_side(np.asarray(orig_mov)[list(save_idx)])
-            f_save_mon_movie(_o, f'{out_dir}/{stem}_{_ds}{_mt}_ORIG.tif', gap_px=0)
-            msg += '  (+_ORIG)'
-    print(msg)
+    return f_orig_frames(pidx, orig_mov, side_tags, example_frames, example_frame_idx)
 
 
 def _frame_indices(n_total, want, n):
-    """Indices to display/save: `want` (explicit list) → as-is; else the saved
-    example_frame_idx; else `n` evenly-spaced over n_total."""
-    if want is not None:
-        return [int(i) for i in want]
-    if example_frames is not None:
-        return list(example_frame_idx)
-    return list(np.unique(np.linspace(0, n_total - 1, min(n, n_total)).round().astype(int)))
+    return f_frame_indices(n_total, want, n, example_frames, example_frame_idx)
+
+
+def _save_with_orig(feat_mov, stem, save_idx=None, pair=True):
+    f_save_movie_pair(feat_mov, stem, out_dir, _ds, mov_tag=mov_tag, orig_mov=orig_mov,
+                      side_tags=side_tags, save_idx=save_idx, save_orig=save_orig, pair=pair)
 
 
 #%% Original monitor movie — the comparison baseline (render if not cached) + optional save
@@ -350,3 +316,91 @@ if 1:
                                                speed_pct=qv_speed_pct, norm=qv_norm,
                                                arrow_frac=qv_arrow_frac, arrow_width=qv_arrow_width)
             _save_with_orig(_qmov, f'gabor_quiver_o{gb_io}sf{gb_isf}', pair=False)
+
+
+#%% Gabor DENSE optic-flow movie — FULL-RES phase flow from the raw movie (all orientations)
+# Recomputes gabor at EVERY pixel of the raw monitor movie (needs orig_mov — run the Original-movie
+# cell: cached movie, or do_render=True), so it's high-res + independent of the coarse gabor block.
+# Per pixel: dφ/dt across orientations → 2-D motion vector (mag-weighted LS), temporally + spatially
+# smoothed. fl_mode 'color' = hue=direction/brightness=speed; 'quiver' = arrows over the magnitude bg.
+if 1:
+    fl_mode        = 'color'    # 'color' (smooth field) | 'quiver' (arrows)
+    fl_wave        = 6.0        # gabor wavelength (px/cycle) to track
+    fl_n_orient    = 4
+    fl_sign        = -1.0       # flip (±1) if motion looks inverted
+    fl_smooth_t    = 2.0        # temporal smoothing of dφ/dt (frames)
+    fl_smooth_xy   = 1.0        # spatial smoothing of the flow (px)
+    fl_frame_range = (0, 2000)  # imaging frames to compute/render
+    fl_speed_pct   = 98.0       # color: speed percentile → full brightness
+    fl_arrow_step  = 6          # quiver: arrow spacing (px)
+    fl_stride      = 2          # quiver: temporal subsample
+    fl_scale       = None
+    make_movie     = False
+
+    if orig_mov is None:
+        raise RuntimeError('dense flow needs the raw movie — run the Original-movie cell '
+                           '(cache with movie, or do_render=True).')
+    _W = orig_mov.shape[2] // len(side_tags)
+    _fr = fl_frame_range or (0, orig_mov.shape[0])
+    _sides = []                                   # explicit loop (Spyder comp-scope safe)
+    for _si, t in enumerate(side_tags):
+        _sm = orig_mov[_fr[0]:_fr[1], :, _si * _W:(_si + 1) * _W]
+        _flow = f_gabor_flow_dense(_sm, n_orient=fl_n_orient, wavelength=fl_wave,
+                                   smooth_t=fl_smooth_t, smooth_xy=fl_smooth_xy, sign=fl_sign)
+        if fl_mode == 'color':
+            _sides.append(f_render_flow_color(_flow, speed_pct=fl_speed_pct))
+        else:
+            _sides.append(f_render_flow_quiver_dense(_flow, arrow_step=fl_arrow_step,
+                                                     stride=fl_stride, scale=fl_scale))
+    fl_mov = np.concatenate(_sides, axis=2)
+    print(f'dense-flow {fl_mode} movie: {fl_mov.shape}')
+    f_plot_movie_frames(fl_mov, n=6, suptitle=f'{_ds} — dense gabor optic flow ({fl_mode})')
+    if make_movie:
+        _mt = f'_{mov_tag}' if mov_tag else ''
+        _out = f'{out_dir}/gabor_flow_{fl_mode}_w{fl_wave:.0f}_{_ds}{_mt}.tif'
+        f_save_mon_movie(fl_mov, _out, gap_px=0)
+        print(f'saved dense flow → {_out}')
+
+
+#%% Feature MAPS panel — what a gabor-mag (per orientation) or meng (per direction) block LOOKS like
+# One row per orientation of a chosen block/stat at a fixed SF (meng: + a fixed TF), vs the original,
+# at motion frames. Works on the grid 'gabor'/'meng' blocks. Reuses f_reconstruct_feature_movie.
+if 1:
+    import re as _re
+    panel_block = 'gabor'       # 'gabor' | 'meng'
+    panel_stat  = 'gabM'        # 'gabM' (gabor mag) | 'gabEv' | 'mengopp' (meng opponent) ...
+    panel_sf    = 0             # spatial-freq index shown
+    panel_tf    = 0             # temporal-freq index (meng only)
+    panel_npcs  = None          # inverse-PCA rank; None = all stored
+    panel_nfr   = 8
+
+    if panel_block not in built_blocks:
+        raise ValueError(f'{panel_block!r} not in cache: {list(built_blocks)}')
+    _blk = built_blocks[panel_block]
+    _kind = _blk.get('kind', panel_block.split('_')[0])          # non-'pix' → visual render
+    _is_meng = panel_stat.startswith('meng')
+    _rn = [n.split('_', 1)[1] for n in _blk['raw_names']]        # strip side tag
+    _suf = rf'{panel_stat}_o(\d+)sf{panel_sf}' + (rf'tf{panel_tf}' if _is_meng else '')
+    _oris = sorted({int(m.group(1)) for n in _rn for m in [_re.match(_suf, n)] if m})
+    if not _oris:
+        raise ValueError(f'no {panel_stat} channels at sf{panel_sf}'
+                         + (f'tf{panel_tf}' if _is_meng else '') + f' in {panel_block!r}')
+
+    _mblk = 'pix' if 'pix' in built_blocks else panel_block
+    _pidx = f_pick_motion_frames(built_blocks, panel_nfr, mode='spread', block=_mblk)
+    _scene = _orig_frames(_pidx)
+    _slbl = 'original'
+    if _scene is None and 'pix' in built_blocks:             # no true original → pix recon proxy
+        _scene = f_reconstruct_feature_movie(built_blocks['pix'], 'pix', mon_hw, side_tags,
+                                             frame_idx=_pidx)
+        _slbl = 'pix recon'
+    _rows, _labels = ([_scene], [_slbl]) if _scene is not None else ([], [])
+    for io in _oris:
+        _ch = f'{panel_stat}_o{io}sf{panel_sf}' + (f'tf{panel_tf}' if _is_meng else '')
+        _rows.append(f_reconstruct_feature_movie(_blk, _kind, mon_hw, side_tags,
+                                                 n_pcs=panel_npcs, channel=_ch, frame_idx=_pidx))
+        _labels.append(f'{panel_stat} o{io}')
+    f_plot_movie_frames_compare(_rows, _pidx, labels=_labels, cmaps=['gray'] * len(_rows),
+                                suptitle=f'{panel_block} — {panel_stat} per orientation (sf{panel_sf}'
+                                         + (f'tf{panel_tf}' if _is_meng else '') + ')')
+    print(f'{panel_block}: orientations {_oris}  frames {_pidx}')

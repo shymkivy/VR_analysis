@@ -1,5 +1,5 @@
-f_path = 'C:\Users\ys2605\Videos\Desktop\';
-fname = "2026_5_6.mp4";
+f_path = 'C:\Users\ys2605\Desktop\stuff\pres\11_9_26\vid\';
+fname = "Desktop 2026.11.08 - 23.53.09.05.mp4";
 
 
 [~, name, ~] = fileparts(fname);
@@ -13,15 +13,15 @@ height = vidObj.Height;
 width = vidObj.Width;
 fr = vidObj.FrameRate;
 
-time_range = [0, 76];
+time_range = [66, 76];
 time_range_fr = time_range*fr;
 
 frame = read(vidObj, 1);
 figure();
 imshow(frame);
 
-sy = [540,1050];
-s1x = [5, 640];
+sy = [419,1134];
+s1x = [679, 1958];
 s2x = [650, 1601];
 s3x = [1602, 2548];
 
@@ -51,7 +51,7 @@ for ii = 1:diff(time_range_fr)
 end
 
 warning('off', 'all');
-vid_out = VideoWriter(f_path + name + "_clip1", "MPEG-4"); % MPEG-4, Motion JPEG AVI, Archival, Uncompressed AVI
+vid_out = VideoWriter(f_path + name + "_clip13", "MPEG-4"); % MPEG-4, Motion JPEG AVI, Archival, Uncompressed AVI
 vid_out.FrameRate = vidObj.FrameRate;
 open(vid_out);
 writeVideo(vid_out,vid1_out);

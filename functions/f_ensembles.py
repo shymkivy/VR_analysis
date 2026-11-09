@@ -40,7 +40,7 @@ import time
 import numpy as np
 import pandas as pd
 
-from sklearn.decomposition import NMF, PCA, SparsePCA, MiniBatchSparsePCA
+from sklearn.decomposition import NMF, PCA, SparsePCA, MiniBatchSparsePCA, TruncatedSVD
 from sklearn.linear_model import Ridge
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import pdist, squareform
@@ -69,9 +69,12 @@ def f_NMF(X, num_comp, max_iter=500, random_state=None, tol=1e-4,
     start_time = time.perf_counter()
 
     min_val = np.min(X)
+    # nndsvda (SVD-based init) requires num_comp <= min(n_samples, n_features); fall back to
+    # 'random' for the over-complete case so it doesn't hard-error.
+    _init = 'nndsvda' if num_comp <= min(X.shape) else 'random'
     model = NMF(
         n_components=num_comp,
-        init='nndsvda',
+        init=_init,
         solver=solver,                  # cd (frobenius only), mu (KL / IS)
         beta_loss=beta_loss,            # frobenius, kullback-leibler, itakura-saito
         alpha_W=alpha_W,
@@ -189,6 +192,25 @@ def f_mini_batch_sparsePCA(X, num_comp, random_state=None, batch_size=3,
     }
 
 
+def f_SVD(X, num_comp, random_state=None, n_iter=7, tol=0.0):
+    """UNCENTERED truncated SVD wrapper (no mean subtraction) — same return-dict shape as f_PCA but
+    the low-rank reconstruction KEEPS the data mean (X ≈ scores @ components), unlike PCA which
+    centers per feature. Use for neural cleanup where per-timepoint/mean centering is unwanted.
+    TruncatedSVD has no `mean_`, so _get_factors yields mu=0 (correct uncentered LNO)."""
+    start_time = time.perf_counter()
+    model = TruncatedSVD(n_components=num_comp, random_state=random_state, n_iter=n_iter, tol=tol)
+    X_reduced = model.fit_transform(X)
+    return {
+        'algo':         'SVD',
+        'num_comp':     num_comp,
+        'components':   model.components_,
+        'scores':       X_reduced,
+        'model':        model,
+        'tol':          tol,
+        'duration':     time.perf_counter() - start_time,
+    }
+
+
 def f_dred_add_error(X, dred_data):
     """Mutates dred_data with frob/KL/exp_var reconstruction metrics."""
     min_val = dred_data.get('min_val', 0)
@@ -262,6 +284,61 @@ def f_component_stability(comps_list):
     return sim_per_seed
 
 
+def f_nmf_consensus(X, num_comp, n_runs=30, normalize='norm_mean_std', smooth_sigma_bins=0,
+                    dred_kwargs=None, random_state=42):
+    """Consensus NMF (cNMF; Brunet 2004 / Kotliar 2019) — which components are STABLE across runs.
+    Fit NMF `n_runs` times with different random inits on normalized(+smoothed) `X` (n_cells, T),
+    L2-normalize every component loading vector, POOL all of them (n_cells × k·n_runs), and cluster
+    (hierarchical, cosine/average) into `num_comp` groups. Each cluster's mean = a CONSENSUS
+    component; a STABLE component is a tight cluster reproduced by ~all runs, a run-to-run artifact
+    is a loose cluster from only a few runs. Returns dict:
+      consensus (n_cells, k)   mean loading per cluster (stability-sorted, desc)
+      stability (k,)           mean within-cluster |corr| (1 = identical across runs)
+      silhouette (k,)          mean cosine silhouette of the cluster
+      n_contrib (k,)           # distinct runs contributing (≈ n_runs ⇒ stable)
+      cophenetic (scalar)      clustering-quality / k-selection metric (higher = cleaner)
+      labels, all_coeffs, run_id"""
+    from scipy.cluster.hierarchy import cophenet
+    from sklearn.metrics import silhouette_samples
+    X = np.asarray(X, float)
+    Xsm = f_gauss_smooth(X, sigma_frames=smooth_sigma_bins) if smooth_sigma_bins else X
+    Xn = f_normalize_rows(Xsm, normalize)
+    dk = dict(dred_kwargs or {})
+    k = int(num_comp)
+    cols, run_id = [], []
+    for r in range(int(n_runs)):
+        W = f_NMF(Xn.T, k, random_state=random_state + r, **dk)['components'].T   # (n_cells, k)
+        nrm = np.linalg.norm(W, axis=0, keepdims=True); nrm[nrm == 0] = 1.0
+        cols.append(W / nrm); run_id += [r] * k
+    allC = np.concatenate(cols, axis=1)                       # (n_cells, k*n_runs)
+    run_id = np.asarray(run_id)
+    D = pdist(allC.T, metric='cosine')
+    Z = sp_linkage(D, method='average')
+    labels = fcluster(Z, t=k, criterion='maxclust')
+    coph = float(cophenet(Z, D)[0])
+    try:
+        sil = silhouette_samples(allC.T, labels, metric='cosine')
+    except Exception:
+        sil = np.full(allC.shape[1], np.nan)
+    uniq = np.unique(labels)
+    consensus = np.zeros((X.shape[0], len(uniq)))
+    stability = np.full(len(uniq), np.nan); n_contrib = np.zeros(len(uniq), int)
+    sil_c = np.full(len(uniq), np.nan)
+    for j, c in enumerate(uniq):
+        m = np.where(labels == c)[0]
+        cc = allC[:, m]
+        consensus[:, j] = cc.mean(1)
+        if m.size > 1:
+            C = np.abs(np.corrcoef(cc.T)); iu = np.triu_indices(m.size, 1)
+            stability[j] = float(np.nanmean(C[iu]))
+        n_contrib[j] = int(np.unique(run_id[m]).size)
+        sil_c[j] = float(np.nanmean(sil[m]))
+    order = np.argsort(-np.nan_to_num(stability, nan=-1.0))    # stability-sorted, desc
+    return {'consensus': consensus[:, order], 'stability': stability[order],
+            'silhouette': sil_c[order], 'n_contrib': n_contrib[order], 'n_runs': int(n_runs),
+            'cophenetic': coph, 'labels': labels, 'all_coeffs': allC, 'run_id': run_id}
+
+
 # =============================================================================
 # Shared helpers — port of MATLAB f_normalize, f_shuffle_data,
 # f_make_crossval_groups.
@@ -291,17 +368,21 @@ def f_normalize_rows(X, mode='norm_mean_std'):
     if mode == 'none' or mode is None:
         return X.copy()
 
+    # Guard per-cell denominators (constant / silent cells have std=rms=0 → replace with 1 so the
+    # row comes out 0 instead of NaN, and no divide-by-zero warning is raised).
     if mode == 'norm_mean_std':
         mu = X.mean(axis=1, keepdims=True)
         sd = X.std(axis=1, keepdims=True, ddof=0)
+        sd = np.where(sd == 0, 1.0, sd)
         Xn = (X - mu) / sd
     elif mode == 'norm_mean':
         Xn = X - X.mean(axis=1, keepdims=True)
     elif mode == 'norm_std':
-        Xn = X / X.std(axis=1, keepdims=True, ddof=0)
+        sd = X.std(axis=1, keepdims=True, ddof=0)
+        Xn = X / np.where(sd == 0, 1.0, sd)
     elif mode == 'norm_rms':
         rms = np.sqrt((X ** 2).mean(axis=1, keepdims=True))
-        Xn = X / rms
+        Xn = X / np.where(rms == 0, 1.0, rms)
     else:
         raise ValueError(f"Unknown normalize mode: {mode!r}")
 
@@ -363,10 +444,15 @@ def f_shuffle_chunked(X, chunk_size, random_state=None):
 
 
 def f_make_cv_groups(n_t, k_folds=5, chunked_shuffle=False,
-                     chunk_size=None, random_state=None):
+                     chunk_size=None, random_state=None,
+                     fold_scheme='contiguous', n_blocks=None):
     """
     Contiguous k-fold partition over n_t time bins. Port of MATLAB
     f_make_crossval_groups.
+
+    fold_scheme='interleaved' ("chop", same as the decoder): split time into `n_blocks` small
+    contiguous blocks round-robin'd to folds, so every fold's test set spans the whole session
+    (no fold lands on a single quiet/odd epoch). n_blocks default = k_folds*10.
 
     Parameters
     ----------
@@ -386,6 +472,16 @@ def f_make_cv_groups(n_t, k_folds=5, chunked_shuffle=False,
         'n_t'       : int
         'k_folds'   : int
     """
+    if fold_scheme == 'interleaved':                 # "chop" — round-robin small blocks to folds
+        nb = int(n_blocks or (k_folds * 10))
+        block_size = max(1, n_t // nb)
+        fold_of = np.minimum(np.arange(n_t) // block_size, nb - 1) % k_folds
+        train_idx = [np.where(fold_of != f)[0] for f in range(k_folds)]
+        test_idx = [np.where(fold_of == f)[0] for f in range(k_folds)]
+        return {'train_idx': train_idx, 'test_idx': test_idx, 'n_t': n_t, 'k_folds': k_folds}
+    elif fold_scheme != 'contiguous':
+        raise ValueError(f"fold_scheme must be 'contiguous' or 'interleaved', got {fold_scheme!r}")
+
     if chunked_shuffle:
         if chunk_size is None:
             chunk_size = int(np.ceil(n_t / (k_folds * 100)))
@@ -502,8 +598,8 @@ def f_cv_estimate_one(X, smooth_sigma_bins, num_comp, method='nmf',
     dred_kwargs = dict(dred_kwargs or {})
     dred_kwargs.setdefault('random_state', random_state)
 
-    fit_fn = {'nmf': f_NMF, 'pca': f_PCA, 'svd': f_PCA,
-              'spca': f_sparsePCA}.get(method.lower())
+    fit_fn = {'nmf': f_NMF, 'pca': f_PCA, 'svd': f_SVD, 'spca': f_sparsePCA,
+              'mspca': f_mini_batch_sparsePCA}.get(method.lower())
     if fit_fn is None:
         raise ValueError(f"Unknown method for CV: {method!r}")
 
@@ -587,6 +683,264 @@ def f_cv_estimate_grid(X, smooth_SDs_bins, num_comps, method='nmf',
                         print(f"  CV [{done}/{total}] smooth={s} k={k} "
                               f"rep={r} shuf={is_shuf} test_err={res['test_err']:.4f}")
     return pd.DataFrame(rows)
+
+
+# =============================================================================
+# Dim-red PARAMS struct + generic single-axis sweep (mirror of the encode/decode
+# f_default_*_params / f_*_sweep architecture). Optimizes the neural dim-red by a
+# leave-one-NEURON-out CV score; the axis can be an algo PARAM or the algo itself.
+# =============================================================================
+
+def f_dred_lno_r2(X, method='nmf', num_comp=20, smooth_sigma_bins=0,
+                  normalize='norm_mean_std', k_folds=5, chunked_shuffle=False,
+                  dred_kwargs=None, random_state=None, fold_scheme='contiguous', n_blocks=None,
+                  norm_scope='global', return_oof=False):
+    """Leave-one-NEURON-out CV reconstruction QUALITY, per cell. k-fold over time (contiguous, or
+    fold_scheme='interleaved' = chop into n_blocks small blocks round-robin'd to folds); per fold
+    fit the dim-red on the TRAIN bins, then LNO-predict each held-out cell on the TEST bins via
+    f_dred_test_lno. Pool OOF predictions across folds → per-cell OOF Pearson r + R². Model-free
+    noise ceiling: how well each neuron is predicted from the REST of the population.
+
+    norm_scope : smooth + per-neuron standardize the FULL matrix ONCE **before** chopping into folds
+        ('global', default — train & test share one per-cell scale, so the train-fit basis applies
+        to test consistently; matches the MATLAB) | 're-normalize each fold from its own stats
+        ('per_fold' — fully leak-free but train/test scales can drift, degrading the LNO recon).
+
+    Returns dict: r_per_cell, r2_per_cell (n_cells), test_err (aggregate Frobenius/n_cells over
+    folds), r_med, r2_med."""
+    X = np.asarray(X, float)
+    n_cells, n_t = X.shape
+    cv = f_make_cv_groups(n_t, k_folds=k_folds, chunked_shuffle=chunked_shuffle,
+                          random_state=random_state, fold_scheme=fold_scheme, n_blocks=n_blocks)
+    dred_kwargs = dict(dred_kwargs or {})
+    dred_kwargs.setdefault('random_state', random_state)
+    fit_fn = {'nmf': f_NMF, 'pca': f_PCA, 'svd': f_SVD, 'spca': f_sparsePCA,
+              'mspca': f_mini_batch_sparsePCA}.get(method.lower())
+    if fit_fn is None:
+        raise ValueError(f"Unknown method for CV: {method!r}")
+
+    # 'global': standardize (+smooth) the whole matrix ONCE, then chop — one consistent per-cell scale.
+    Xn_full = None
+    if norm_scope == 'global':
+        Xsm = f_gauss_smooth(X, sigma_frames=smooth_sigma_bins) if smooth_sigma_bins else X
+        Xn_full = f_normalize_rows(Xsm, normalize)
+    elif norm_scope != 'per_fold':
+        raise ValueError(f"norm_scope must be 'global' or 'per_fold', got {norm_scope!r}")
+
+    yt = np.full((n_cells, n_t), np.nan)          # OOF normalized test target
+    yh = np.full((n_cells, n_t), np.nan)          # OOF leave-neuron-out prediction
+    errs = []
+    for kk in range(k_folds):
+        tr, te = cv['train_idx'][kk], cv['test_idx'][kk]
+        if norm_scope == 'global':
+            Xtr_n, Xte_n = Xn_full[:, tr], Xn_full[:, te]
+        else:                                     # per_fold: normalize each split from its own stats
+            Xtr = f_gauss_smooth(X[:, tr], sigma_frames=smooth_sigma_bins) if smooth_sigma_bins else X[:, tr]
+            Xtr_n = f_normalize_rows(Xtr, normalize)
+            Xte_n = f_normalize_rows(X[:, te], normalize)
+        dred = fit_fn(Xtr_n.T, num_comp, **dred_kwargs)
+        Ycs = f_dred_test_lno(Xte_n, dred, method=method)
+        yt[:, te] = Xte_n
+        yh[:, te] = Ycs
+        errs.append(np.linalg.norm(Xte_n - Ycs) / n_cells)
+
+    r = np.full(n_cells, np.nan)
+    r2 = np.full(n_cells, np.nan)
+    ss_res_pool = 0.0; ss_tot_pool = 0.0                        # for the pooled (variance-explained) R²
+    for i in range(n_cells):
+        m = np.isfinite(yt[i]) & np.isfinite(yh[i])
+        if m.sum() > 2 and yt[i, m].std() > 0:
+            a, b = yt[i, m], yh[i, m]
+            r[i] = float(np.corrcoef(a, b)[0, 1])
+            ss_res = float(np.sum((a - b) ** 2)); ss_tot = float(np.sum((a - a.mean()) ** 2))
+            r2[i] = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+            ss_res_pool += ss_res; ss_tot_pool += ss_tot
+    # pooled R² = fraction of TOTAL member variance the LNO recon explains (variance-weighted over
+    # cells & OOF frames): 1 - Σ SS_res / Σ SS_tot. Unlike r2_med (median of per-cell R²) it is the
+    # normalized twin of test_err — high-variance cells count more, and it is scale/size-free.
+    r2_pool = (1.0 - ss_res_pool / ss_tot_pool) if ss_tot_pool > 0 else np.nan
+    out = {'r_per_cell': r, 'r2_per_cell': r2, 'test_err': float(np.mean(errs)),
+           'r_med': float(np.nanmedian(r)), 'r2_med': float(np.nanmedian(r2)),
+           'r2_pool': float(r2_pool)}
+    if return_oof:                     # OOF target + leave-neuron-out prediction (n_cells, n_t)
+        out['yt'], out['yh'] = yt, yh
+    return out
+
+
+def f_default_dimred_params(**overrides):
+    """PARAM-CREATION struct for the neural dim-red optimization (flat dict; mirrors
+    f_default_decoder_params / f_default_encoder_params). Consumed by f_run_dimred / f_dimred_sweep
+    / f_reduce_neural. Sweep any key as an algo PARAM, or `method` for different ALGOS.
+
+    Keys: method ('svd'|'pca'|'nmf'|'spca'|'mspca'), num_comp, smooth_ms (Gaussian, ms → bins via
+    fs), normalize (per-NEURON: 'none'|'norm_mean'|'norm_std'|'norm_mean_std'|'norm_rms'; for NMF
+    'norm_rms'/'none' [non-negative] fit better than centered 'norm_mean_std'), NMF l1_ratio /
+    beta_loss ('kullback-leibler' = more distinct parts) / alpha_W / alpha_H / max_iter / tol,
+    sparse-PCA alpha / ridge_alpha, k_folds, cv_frames
+    (subset # frames for the sweep; None=all), scores (subset of test_err / lno_r2_med / lno_r2_pool
+    [pooled variance-explained fraction] / lno_r_med / frac_reliable), r_reliable (LNO-R² keep
+    threshold for reliable_cells), seed."""
+    cfg = {
+        'method':      'svd',
+        'num_comp':    20,
+        'smooth_ms':   100,
+        'normalize':   'norm_mean_std',
+        'l1_ratio':    0.0,            # NMF: 0=L2/ridge, 1=L1/lasso, 0.5=elastic-net
+        'beta_loss':   'frobenius',    # NMF ('kullback-leibler' → solver mu; better for rate data,
+                                       #      gives more DISTINCT parts = less splitting)
+        'alpha_W':     0.0,            # NMF cell-loadings sparsity (L1 can over-prune — CV it)
+        'alpha_H':     'same',         # NMF temporal-scores sparsity ('same' mirrors alpha_W; a
+                                       #      number sets it independently — anti-splitting lever)
+        'max_iter':    500,            # NMF (bump to ~1500 if ConvergenceWarnings)
+        'tol':         1e-4,           # NMF convergence tol
+        'alpha':       1.0,            # sparse-PCA
+        'ridge_alpha': 0.01,           # sparse-PCA
+        'k_folds':     5,
+        'fold_scheme': 'contiguous',   # 'contiguous' | 'interleaved' (chop → round-robin)
+        'n_blocks':    None,           # interleaved: # small blocks (None → k_folds*10)
+        'norm_scope':  'global',       # 'global' = standardize FULL data before chopping into folds
+                                       # (train/test share one scale) | 'per_fold' (leak-free)
+        'cv_frames':   None,
+        'scores':      ['test_err', 'lno_r2_med'],
+        'r_reliable':  0.05,
+        'seed':        42,
+    }
+    cfg.update(overrides)
+    return cfg
+
+
+def _dimred_kwargs(config):
+    """Assemble the method-specific dred_kwargs for a dimred config (whitelist per method, so a
+    swept NMF param never reaches PCA etc.)."""
+    m = config['method'].lower()
+    if m == 'nmf':
+        bl = config.get('beta_loss', 'frobenius')
+        return {'l1_ratio': config.get('l1_ratio', 0.0), 'beta_loss': bl,
+                'alpha_W': config.get('alpha_W', 0.0), 'alpha_H': config.get('alpha_H', 'same'),
+                'max_iter': config.get('max_iter', 500), 'tol': config.get('tol', 1e-4),
+                'solver': ('mu' if bl != 'frobenius' else 'cd')}
+    if m in ('spca', 'mspca'):
+        return {'alpha': config.get('alpha', 1.0), 'ridge_alpha': config.get('ridge_alpha', 0.01)}
+    return {}
+
+
+def f_run_dimred(config, X_neu, fs=None, verbose=False):
+    """ONE CV-LNO evaluation of a dim-red `config` (see f_default_dimred_params) on neural
+    `X_neu` (n_cells, T): smooth_ms→bins (needs `fs`), assemble the method's kwargs, run
+    f_dred_lno_r2. Returns {scores:{…}, per_cell_r2, keep_mask}."""
+    X = np.asarray(X_neu, float)
+    cvf = config.get('cv_frames')
+    if cvf and X.shape[1] > int(cvf):
+        X = X[:, :int(cvf)]
+    smooth_bins = (max(0, int(round(config['smooth_ms'] * fs / 1000.0)))
+                   if config.get('smooth_ms') and fs else 0)
+    out = f_dred_lno_r2(X, method=config['method'], num_comp=int(config['num_comp']),
+                        smooth_sigma_bins=smooth_bins, normalize=config.get('normalize', 'norm_mean_std'),
+                        k_folds=config.get('k_folds', 5), dred_kwargs=_dimred_kwargs(config),
+                        random_state=config.get('seed', 42),
+                        fold_scheme=config.get('fold_scheme', 'contiguous'),
+                        n_blocks=config.get('n_blocks'),
+                        norm_scope=config.get('norm_scope', 'global'))
+    r2c = np.asarray(out['r2_per_cell'], float)
+    which = tuple(config.get('scores', ('test_err', 'lno_r2_med')))
+    scores = {}
+    if 'test_err' in which:      scores['test_err'] = out['test_err']
+    if 'lno_r2_med' in which:    scores['lno_r2_med'] = out['r2_med']
+    if 'lno_r2_pool' in which:   scores['lno_r2_pool'] = out['r2_pool']   # variance-explained fraction
+    if 'lno_r_med' in which:     scores['lno_r_med'] = out['r_med']
+    if 'frac_reliable' in which: scores['frac_reliable'] = float(np.nanmean(r2c > config.get('r_reliable', 0.05)))
+    if verbose:
+        print(f"  [{config['method']} k={config['num_comp']} {config.get('normalize')}]  "
+              + '  '.join(f'{k}={v:+.3f}' for k, v in scores.items()))
+    return {'scores': scores, 'per_cell_r2': r2c,
+            'keep_mask': r2c > config.get('r_reliable', 0.05)}
+
+
+def f_dimred_sweep(config, sweep_var, sweep_values, X_neu, fs=None, verbose=True):
+    """Vary ONE key of a dim-red `config` across `sweep_values` — an algo PARAM (num_comp /
+    smooth_ms / normalize / l1_ratio / beta_loss / alpha_W / alpha / ridge_alpha) OR the algorithm
+    itself (`sweep_var='method'`, values like ['pca','svd','nmf','spca','mspca']) — run f_run_dimred
+    at each, collect tidy rows [{'x': value, <score>: …}]. Combos where the swept param doesn't
+    apply to the config's method are skipped with a message. Twin of f_decoder_sweep; plot with
+    f_decoding.f_plot_decoder_sweep (recognizes the DIMRED config)."""
+    if sweep_var not in config and sweep_var != 'method':
+        raise ValueError(f"sweep_var {sweep_var!r} not a dimred-params key: {list(config)}")
+    _nmf_only = {'l1_ratio', 'beta_loss', 'alpha_W', 'alpha_H', 'max_iter', 'tol'}
+    _spca_only = {'alpha', 'ridge_alpha'}
+    rows = []
+    for v in sweep_values:
+        cfg = {**config, sweep_var: v}
+        m = cfg['method'].lower()
+        if sweep_var in _nmf_only and m != 'nmf':
+            print(f"  skip {sweep_var}={v!r}: applies only to method='nmf' (is {m!r})"); continue
+        if sweep_var in _spca_only and m not in ('spca', 'mspca'):
+            print(f"  skip {sweep_var}={v!r}: applies only to sparse-PCA (method is {m!r})"); continue
+        try:
+            out = f_run_dimred(cfg, X_neu, fs=fs)
+        except Exception as e:
+            print(f"  skip {sweep_var}={v!r}: {type(e).__name__}: {e}"); continue
+        rows.append({'x': v, **out['scores']})
+        if verbose:
+            print(f"  {sweep_var}={str(v):>14s}  "
+                  + '  '.join(f'{k}={rows[-1][k]:+.3f}' for k in out['scores']))
+    return rows
+
+
+def f_dimred_sweep2d(config, outer_var, outer_values, sweep_var, sweep_values,
+                     X_neu, fs=None, verbose=True):
+    """Run f_dimred_sweep ONCE per `outer_var` value → a dict {label: rows} for overlay plotting
+    with f_decoding.f_plot_sweep_curves. The outer axis picks the curves, the inner (`sweep_var`)
+    is the shared x. Classic use: outer_var='method', outer_values=['nmf','svd','pca'],
+    sweep_var='num_comp' → one #components curve per algorithm on the same axes. Any two dimred
+    keys work (e.g. outer normalize × inner num_comp). Empty inner sweeps (all combos skipped) are
+    dropped by the plotter."""
+    curves = {}
+    for ov in outer_values:
+        cfg = {**config, outer_var: ov}
+        if verbose:
+            print(f"[{outer_var}={ov}]")
+        curves[f'{outer_var}={ov}'] = f_dimred_sweep(cfg, sweep_var, sweep_values,
+                                                     X_neu, fs=fs, verbose=verbose)
+    return curves
+
+
+def f_reduce_neural(config, X_neu, mode='svd_recon', fs=None):
+    """Fit the config's dim-red ONCE on normalized(+smoothed) `X_neu` (n_cells, T) and return the
+    reduced/low-rank neural as a (T, d) matrix ready to be the encode/decode `Y_neu`:
+      'svd_recon'      → low-rank reconstruction (T, n_cells), denoised, per-cell (normalized space)
+      'components'     → the latent scores (T, k)
+      'reliable_cells' → the RAW cells whose LNO-R² > r_reliable (T, n_kept)
+    Returns dict {low_rank (T,d), kind, dred, keep_mask (reliable_cells only)}."""
+    X = np.asarray(X_neu, float)
+    n_cells = X.shape[0]
+    smooth_bins = (int(round(config['smooth_ms'] * fs / 1000.0))
+                   if config.get('smooth_ms') and fs else 0)
+    Xsm = f_gauss_smooth(X, sigma_frames=smooth_bins) if smooth_bins else X
+    Xn = f_normalize_rows(Xsm, config.get('normalize', 'norm_mean_std'))
+    fit_fn = {'nmf': f_NMF, 'pca': f_PCA, 'svd': f_SVD, 'spca': f_sparsePCA,
+              'mspca': f_mini_batch_sparsePCA}[config['method'].lower()]
+    dred = fit_fn(Xn.T, int(config['num_comp']), random_state=config.get('seed', 42),
+                  **_dimred_kwargs(config))
+    if mode == 'components':
+        return {'low_rank': np.asarray(dred['scores'], np.float32), 'kind': 'components', 'dred': dred}
+    if mode == 'reliable_cells':
+        lno = f_dred_lno_r2(X, method=config['method'], num_comp=int(config['num_comp']),
+                            smooth_sigma_bins=smooth_bins, normalize=config.get('normalize', 'norm_mean_std'),
+                            k_folds=config.get('k_folds', 5), dred_kwargs=_dimred_kwargs(config),
+                            random_state=config.get('seed', 42),
+                            fold_scheme=config.get('fold_scheme', 'contiguous'),
+                            n_blocks=config.get('n_blocks'),
+                            norm_scope=config.get('norm_scope', 'global'))
+        keep = np.asarray(lno['r2_per_cell'], float) > config.get('r_reliable', 0.05)
+        return {'low_rank': X.T[:, keep].astype(np.float32), 'kind': 'reliable_cells',
+                'keep_mask': keep, 'dred': dred}
+    # 'svd_recon' (default): low-rank reconstruction in the normalized fit space
+    recon = dred['scores'] @ dred['components']       # (T, n_cells)
+    if 'min_val' in dred:
+        recon = recon + dred['min_val']
+    elif hasattr(dred['model'], 'mean_') and dred['model'].mean_ is not None:
+        recon = recon + dred['model'].mean_
+    return {'low_rank': recon.astype(np.float32), 'kind': 'recon', 'dred': dred}
 
 
 # =============================================================================
@@ -1120,6 +1474,286 @@ def f_ensemble_extract(X, num_comp=None, smooth_sigma_bins=None,
     if return_intermediates and dim_info is not None:
         ens_out['dim_info'] = dim_info
     return ens_out
+
+
+# =============================================================================
+# Per-ensemble CV score + one-call ensemble extractor (list of ensembles →
+# member cells → CV score). Port of MATLAB f_evaluate_ens_cv.
+# =============================================================================
+
+def _ar1_teff(Xz):
+    """Effective sample size for autocorrelated rows via a mean AR(1) lag-1 coefficient:
+    T_eff = T·(1−ρ₁)/(1+ρ₁). `Xz` (k, T) row-standardized. Calcium is heavily autocorrelated, so
+    the raw T over-counts independent samples — this deflates it before any random-matrix test."""
+    k, T = Xz.shape
+    if T < 3:
+        return float(T)
+    num = np.sum(Xz[:, :-1] * Xz[:, 1:], axis=1)
+    den = np.sum(Xz[:, :-1] ** 2, axis=1)
+    r1 = float(np.nanmean(num / np.where(den == 0, np.nan, den)))
+    r1 = np.clip(r1 if np.isfinite(r1) else 0.0, 0.0, 0.999)
+    return float(np.clip(T * (1.0 - r1) / (1.0 + r1), k + 1, T))
+
+
+def f_mp_edge_test(Xm, smooth_sigma_bins=0, autocorr_correct=True):
+    """Marchenko–Pastur / random-matrix significance for ONE candidate ensemble (the standard
+    cell-assembly analytical test, cheap — one eigendecomposition). Row-standardize the member
+    submatrix `Xm` (k, T), take the leading eigenvalue λ₁ of its k×k correlation matrix, compare to
+    the MP upper edge λ₊ = (1+√q)², q = k/T_eff. `autocorr_correct` uses an AR(1) effective sample
+    size (calcium is autocorrelated → raw T inflates significance). Returns
+    {mp_lambda1, mp_edge, mp_ratio (λ₁/λ₊; >1 ⇒ real), T_eff, mp_sig}."""
+    Xm = np.asarray(Xm, float)
+    if smooth_sigma_bins:
+        Xm = f_gauss_smooth(Xm, sigma_frames=smooth_sigma_bins)
+    k, T = Xm.shape
+    Xz = Xm - Xm.mean(1, keepdims=True)
+    sd = Xz.std(1, keepdims=True)
+    Xz = Xz / np.where(sd == 0, 1.0, sd)
+    C = (Xz @ Xz.T) / T
+    lam1 = float(np.linalg.eigvalsh(C)[-1])
+    T_eff = _ar1_teff(Xz) if autocorr_correct else float(T)
+    q = k / T_eff
+    edge = float((1.0 + np.sqrt(q)) ** 2)
+    return {'mp_lambda1': lam1, 'mp_edge': edge, 'mp_ratio': lam1 / edge if edge > 0 else np.nan,
+            'T_eff': T_eff, 'mp_sig': bool(lam1 > edge)}
+
+
+def f_score_ensembles_cv(ens_out, X, cv_method='pca', cv_num_comp=1, normalize='norm_mean_std',
+                         smooth_sigma_bins=0, k_folds=5, fold_scheme='contiguous', n_blocks=None,
+                         norm_scope='global', min_members=2, random_state=42,
+                         sig_method='cv', sig_alpha=0.05, cv_sig_thresh=0.0,
+                         n_shuffle=50, shuffle_min_shift=0):
+    """Per-ensemble score + SIGNIFICANCE — extends MATLAB f_evaluate_ens_cv. For each ensemble in
+    `ens_out['cells']['ens_list']`, subset the raster to its MEMBER cells and run leave-one-NEURON-out
+    CV (f_dred_lno_r2, `cv_num_comp` comp(s), `cv_method`): do the members form a co-activation
+    pattern that reconstructs held-out time? `X` (n_cells, T) MUST be aligned to the extraction cell
+    space, i.e. `X[ens_out['active_cells_mask']]`. Ensembles < `min_members` cells score NaN.
+
+    ALWAYS computes the cheap scores: cv_r2 (MEDIAN per-member LNO R²; higher=better), cv_r2_pool
+    (POOLED / variance-explained fraction = 1 - ΣSS_res/ΣSS_tot over members & OOF frames; the
+    normalized twin of test_err, scale/size-free), cv_test_err (lower=better) + cv_test_err_pn
+    (× √n_members → member-count-independent), and the Marchenko–Pastur stats (mp_lambda1/mp_edge/
+    mp_ratio via f_mp_edge_test).
+
+    `sig_method` picks the significance verdict written to `sig`/`sig_p`/`sig_stat`/`sig_thresh`:
+      'cv'      → sig = cv_r2 > `cv_sig_thresh` (0 by default). FREE: cross-validation's built-in
+                  null — a spurious 1-D pattern gives OOF R² ≤ 0.  (sig_p = NaN)
+      'mp'      → sig = λ₁ > MP edge (analytical random-matrix test; autocorr-corrected). (sig_p=NaN)
+      'shuffle' → per-ensemble CIRCULAR-SHIFT null (`n_shuffle` reps; independently roll each member,
+                  destroying cross-cell synchrony) → cv_r2_null95 / cv_r2_z / cv_r2_p (frac null ≥
+                  real) + cv_test_err_null05 / cv_test_err_p; sig = cv_r2_p < `sig_alpha`. Expensive.
+
+    Returns a list (aligned to ens_list) of dicts with the keys above (unavailable ones NaN)."""
+    X = np.asarray(X, float)
+
+    def _score(Xsub, seed):
+        nc = int(min(cv_num_comp, max(1, Xsub.shape[0] - 1)))
+        return f_dred_lno_r2(Xsub, method=cv_method, num_comp=nc, smooth_sigma_bins=smooth_sigma_bins,
+                             normalize=normalize, k_folds=k_folds, fold_scheme=fold_scheme,
+                             n_blocks=n_blocks, norm_scope=norm_scope, random_state=seed)
+
+    out = []
+    for ie, members in enumerate(ens_out['cells']['ens_list']):
+        members = np.asarray(members, int)
+        rec = {'cv_test_err': np.nan, 'cv_r2': np.nan, 'cv_r2_pool': np.nan, 'cv_test_err_pn': np.nan,
+               'n_members': int(members.size),
+               'mp_lambda1': np.nan, 'mp_edge': np.nan, 'mp_ratio': np.nan,
+               'cv_r2_null95': np.nan, 'cv_r2_z': np.nan, 'cv_r2_p': np.nan,
+               'cv_test_err_null05': np.nan, 'cv_test_err_p': np.nan,
+               'sig': False, 'sig_p': np.nan, 'sig_stat': np.nan, 'sig_thresh': np.nan,
+               'sig_method': sig_method}
+        if members.size < min_members:
+            out.append(rec); continue
+        Xm = X[members]
+        r = _score(Xm, random_state)
+        rec['cv_test_err'], rec['cv_r2'] = r['test_err'], r['r2_med']
+        rec['cv_r2_pool'] = r['r2_pool']                                # variance-explained fraction
+        rec['cv_test_err_pn'] = r['test_err'] * np.sqrt(members.size)   # remove 1/√k size scaling
+        mp = f_mp_edge_test(Xm, smooth_sigma_bins=smooth_sigma_bins)    # cheap → always
+        rec.update({k_: mp[k_] for k_ in ('mp_lambda1', 'mp_edge', 'mp_ratio')})
+
+        if sig_method == 'shuffle' and n_shuffle > 0:
+            rng = np.random.default_rng((random_state or 0) + 1000 * (ie + 1))
+            null_r2, null_te = [], []
+            for _ in range(int(n_shuffle)):
+                Xs = f_shuffle_data(Xm, mode='circ_shift', random_state=rng, min_shift=shuffle_min_shift)
+                rs = _score(Xs, int(rng.integers(0, 2**31 - 1)))
+                null_r2.append(rs['r2_med']); null_te.append(rs['test_err'])
+            null_r2 = np.asarray(null_r2, float); null_te = np.asarray(null_te, float)
+            n = int(np.isfinite(null_r2).sum())
+            if n > 0:
+                mu, sd = np.nanmean(null_r2), np.nanstd(null_r2)
+                rec['cv_r2_null95'] = float(np.nanpercentile(null_r2, 95))
+                rec['cv_r2_z'] = float((rec['cv_r2'] - mu) / sd) if sd > 0 else np.nan
+                rec['cv_r2_p'] = float((1 + np.nansum(null_r2 >= rec['cv_r2'])) / (n + 1))
+                rec['cv_test_err_null05'] = float(np.nanpercentile(null_te, 5))
+                rec['cv_test_err_p'] = float((1 + np.nansum(null_te <= rec['cv_test_err'])) / (n + 1))
+            rec.update({'sig_stat': rec['cv_r2'], 'sig_thresh': rec['cv_r2_null95'],
+                        'sig_p': rec['cv_r2_p'],
+                        'sig': bool(np.isfinite(rec['cv_r2_p']) and rec['cv_r2_p'] < sig_alpha)})
+        elif sig_method == 'mp':
+            rec.update({'sig_stat': mp['mp_lambda1'], 'sig_thresh': mp['mp_edge'],
+                        'sig': mp['mp_sig']})
+        else:  # 'cv' — cross-validation's built-in null at cv_sig_thresh
+            rec.update({'sig_stat': rec['cv_r2'], 'sig_thresh': cv_sig_thresh,
+                        'sig': bool(np.isfinite(rec['cv_r2']) and rec['cv_r2'] > cv_sig_thresh)})
+        out.append(rec)
+    return out
+
+
+def f_cv_membership(X, dimred_params, ref_coeffs, signal_z_thresh=2.5, k_folds=5,
+                    fold_scheme='contiguous', n_blocks=None, consensus_frac=0.5,
+                    smooth_sigma_bins=0, random_state=42):
+    """NESTED (cross-validated) ensemble MEMBERSHIP — reduces the double-dipping of selecting members
+    on the SAME data used to score them. For each CV fold over time: refit the dim-red on the TRAIN
+    bins, MATCH its components back to the canonical full-fit components `ref_coeffs` (n_cells, k) by
+    loading correlation (Hungarian, so component identity is preserved without any re-ordering),
+    threshold the matched loadings, and record which cells were selected. A cell is a CONSENSUS member
+    of ensemble i if it is selected in ≥ `consensus_frac` of folds. `X` (n_cells, T) is the
+    extraction-space (active) matrix. Returns {ens_list (consensus members per component), sel_freq
+    (n_cells, k) per-cell selection frequency, consensus_frac}."""
+    from scipy.optimize import linear_sum_assignment
+    X = np.asarray(X, float)
+    n_cells, n_t = X.shape
+    k = np.asarray(ref_coeffs).shape[1]
+    fit_fn = {'nmf': f_NMF, 'pca': f_PCA, 'svd': f_SVD, 'spca': f_sparsePCA,
+              'mspca': f_mini_batch_sparsePCA}[dimred_params['method'].lower()]
+    dk = _dimred_kwargs(dimred_params)
+    norm = dimred_params.get('normalize', 'norm_mean_std')
+    cv = f_make_cv_groups(n_t, k_folds=k_folds, fold_scheme=fold_scheme, n_blocks=n_blocks,
+                          random_state=random_state)
+    Rc = np.asarray(ref_coeffs, float) - np.asarray(ref_coeffs, float).mean(0, keepdims=True)
+    sel = np.zeros((n_cells, k))
+    for kk in range(k_folds):
+        tr = cv['train_idx'][kk]
+        Xtr = f_gauss_smooth(X[:, tr], sigma_frames=smooth_sigma_bins) if smooth_sigma_bins else X[:, tr]
+        Xtr_n = f_normalize_rows(Xtr, norm)
+        Wf = fit_fn(Xtr_n.T, k, random_state=random_state, **dk)['components'].T   # (n_cells, k)
+        Wc = Wf - Wf.mean(0, keepdims=True)
+        C = np.abs(np.corrcoef(np.vstack([Rc.T, Wc.T]))[:k, k:])                   # |corr| ref × fold
+        C = np.nan_to_num(C, nan=0.0)
+        ri, cj = linear_sum_assignment(-C)
+        order = np.empty(k, int); order[ri] = cj                                  # ref i → fold col
+        for i in range(k):
+            col = Wf[:, order[i]]
+            thr = _signal_z_thresh(col, signal_z_thresh)
+            m = col > thr.max()
+            if thr.size == 2:
+                m = m | (col < thr.min())
+            sel[m, i] += 1
+    sel_freq = sel / k_folds
+    ens_list = [np.where(sel_freq[:, i] >= consensus_frac)[0] for i in range(k)]
+    return {'ens_list': ens_list, 'sel_freq': sel_freq, 'consensus_frac': consensus_frac}
+
+
+def f_extract_ensembles(X, dimred_params, thresh_mode='signal_z', signal_z_thresh=2.5,
+                        extraction='thresh', cv=True, cv_method='pca', cv_num_comp=1,
+                        cell_ids=None, sig_method='cv', sig_alpha=0.05, cv_sig_thresh=0.0,
+                        n_shuffle=50, membership='z_thresh', consensus_frac=0.5, membership_folds=None,
+                        fs=None, verbose=False):
+    """ONE call → (ens_table, ens_out): the list of ENSEMBLES (dim-red components), the CELLS in
+    each (thresholded coefficients), and a per-ensemble CV SCORE. Fits the dim-red per
+    `dimred_params` (method default 'nmf', `num_comp` = # ensembles, `smooth_ms`, `normalize`) via
+    f_ensemble_extract (membership = f_ens_get_thresh + f_apply_thresh), then f_score_ensembles_cv
+    (member-cell leave-one-neuron-out, mirroring MATLAB f_evaluate_ens_cv).
+
+    `X` = (n_cells, T) neural (whatever cell ORDER you extract in — the plot must use this same
+    matrix). `cell_ids` : optional length-`X.shape[0]` array mapping each ROW of `X` to a true
+    recording-neuron ID; when given, the table's `cells` column reports those IDs (else raw row
+    positions in `X`).
+
+    `sig_method` selects the per-ensemble significance verdict (`sig` column, see
+    f_score_ensembles_cv): 'cv' (free — cv_r2 > `cv_sig_thresh`) | 'mp' (analytical Marchenko–Pastur
+    edge) | 'shuffle' (circular-shift null, `n_shuffle` reps, `sig_alpha`). All cheap scores
+    (cv_r2, cv_test_err, cv_test_err_pn [size-normalized], mp_ratio) are ALWAYS in the table; the
+    circshift null columns (cv_r2_null95/z/p) appear only under 'shuffle'.
+
+    `membership`: 'z_thresh' (default — members = threshold of the full-fit coefficients, per
+    `thresh_mode`: median+z·std or shuffle) | 'cv_consensus' (aliases 'cv'/'cvr2': NESTED selection
+    via f_cv_membership — refit per train fold, match to the full-fit components, keep cells selected
+    in ≥ `consensus_frac` of `membership_folds` folds). 'cv_consensus' cuts the double-dipping (members
+    no longer chosen on the same data used to score) and adds a `memb_frac` column (mean per-member
+    selection frequency = membership stability); the full-fit coeffs/scores are kept for plotting.
+    Returns:
+      ens_table : pandas DataFrame, one row per ensemble — ensemble, n_cells, cells (true neuron IDs
+                  if cell_ids given, else X-row positions), cv_r2, cv_test_err, cv_test_err_pn,
+                  mp_ratio, frac_active, sig, sig_p (+ null columns under 'shuffle') — sorted by cv_r2
+                  desc (so head(N) = top-N by score).
+      ens_out   : full f_ensemble_extract dict (coeffs/scores/clust_ident/… for plots)."""
+    method = str(dimred_params.get('method', 'nmf')).lower()
+    if method not in ('nmf', 'pca', 'spca'):
+        if verbose:
+            print(f"  ensemble extraction: method {method!r} not supported (nmf/pca/spca) → nmf")
+        method = 'nmf'
+    smooth_bins = (int(round(dimred_params.get('smooth_ms', 0) * fs / 1000.0))
+                   if dimred_params.get('smooth_ms') and fs else 0)
+    ens_out = f_ensemble_extract(
+        np.asarray(X, float), num_comp=int(dimred_params['num_comp']),
+        smooth_sigma_bins=smooth_bins, dred_method=method, extraction=extraction,
+        normalize=dimred_params.get('normalize', 'norm_mean_std'), thresh_mode=thresh_mode,
+        signal_z_thresh=signal_z_thresh, dred_kwargs=_dimred_kwargs({**dimred_params, 'method': method}),
+        random_state=dimred_params.get('seed', 42), verbose=verbose)
+
+    _active_idx = np.flatnonzero(ens_out['active_cells_mask'])   # extraction-active → X-row index
+    # X-row → true neuron ID (identity = X-row position if no map given)
+    _ids = np.arange(np.asarray(X).shape[0]) if cell_ids is None else np.asarray(cell_ids)
+    if _ids.shape[0] != np.asarray(X).shape[0]:
+        raise ValueError(f"cell_ids length {_ids.shape[0]} != X rows {np.asarray(X).shape[0]}")
+    _X_act = np.asarray(X, float)[ens_out['active_cells_mask']]
+    n_t = ens_out['scores'].shape[1]
+
+    # NESTED membership: reselect members by CV consensus (train-fold selection) to cut double-dipping
+    memb_frac = None
+    if str(membership).lower() in ('cv_consensus', 'cvr2', 'cv', 'consensus'):
+        cvm = f_cv_membership(
+            _X_act, {**dimred_params, 'method': method}, ens_out['coeffs'],
+            signal_z_thresh=signal_z_thresh, k_folds=(membership_folds or dimred_params.get('k_folds', 5)),
+            fold_scheme=dimred_params.get('fold_scheme', 'contiguous'), n_blocks=dimred_params.get('n_blocks'),
+            consensus_frac=consensus_frac, smooth_sigma_bins=smooth_bins,
+            random_state=dimred_params.get('seed', 42))
+        ens_out['cells']['ens_list'] = cvm['ens_list']       # consensus members replace full-fit members
+        ens_out['sel_freq'] = cvm['sel_freq']
+        _ident = np.zeros(ens_out['coeffs'].shape[0], int)   # rebuild clust_ident / non_ens_list
+        for i, ci in enumerate(cvm['ens_list']):
+            _ident[np.asarray(ci, int)] = i + 1
+        ens_out['cells']['clust_ident'] = _ident
+        ens_out['cells']['non_ens_list'] = np.where(_ident == 0)[0]
+        memb_frac = [float(cvm['sel_freq'][np.asarray(ci, int), i].mean()) if len(ci) else np.nan
+                     for i, ci in enumerate(cvm['ens_list'])]   # mean selection freq of the members
+    if cv:
+        cv_rows = f_score_ensembles_cv(
+            ens_out, _X_act, cv_method=cv_method, cv_num_comp=cv_num_comp,
+            normalize=dimred_params.get('normalize', 'norm_mean_std'), smooth_sigma_bins=smooth_bins,
+            k_folds=dimred_params.get('k_folds', 5), fold_scheme=dimred_params.get('fold_scheme', 'contiguous'),
+            n_blocks=dimred_params.get('n_blocks'), norm_scope=dimred_params.get('norm_scope', 'global'),
+            random_state=dimred_params.get('seed', 42), sig_method=sig_method, sig_alpha=sig_alpha,
+            cv_sig_thresh=cv_sig_thresh, n_shuffle=n_shuffle)
+    else:
+        cv_rows = [{'cv_test_err': np.nan, 'cv_r2': np.nan, 'n_members': len(m)}
+                   for m in ens_out['cells']['ens_list']]
+
+    # always-present cheap scores + significance; circshift-null columns only under 'shuffle'
+    _base_keys = ('cv_r2', 'cv_r2_pool', 'cv_test_err', 'cv_test_err_pn', 'mp_ratio', 'sig', 'sig_p', 'sig_method')
+    _null_keys = ('cv_r2_null95', 'cv_r2_z', 'cv_r2_p', 'cv_test_err_null05', 'cv_test_err_p')
+    rows = []
+    for i, members in enumerate(ens_out['cells']['ens_list']):
+        members = np.asarray(members, int)
+        frac_active = (len(ens_out['trials']['ens_list'][i]) / n_t
+                       if i < len(ens_out['trials']['ens_list']) else np.nan)
+        row = {'ensemble': i, 'n_cells': int(members.size),
+               'cells': _ids[_active_idx[members]].tolist()}   # true neuron IDs (or X-row pos)
+        for kk in _base_keys:
+            row[kk] = cv_rows[i].get(kk, np.nan)
+        row['frac_active'] = float(frac_active)
+        if memb_frac is not None:                              # CV-membership consensus strength
+            row['memb_frac'] = memb_frac[i]
+        if sig_method == 'shuffle' and n_shuffle > 0:
+            for kk in _null_keys:
+                row[kk] = cv_rows[i].get(kk, np.nan)
+        rows.append(row)
+    ens_table = pd.DataFrame(rows).sort_values('cv_r2', ascending=False,
+                                               na_position='last').reset_index(drop=True)
+    return ens_table, ens_out
 
 
 # =============================================================================

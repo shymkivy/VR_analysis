@@ -30,8 +30,8 @@ import re
 
 import numpy as np
 
-from f_visual_features import (f_grid_bounds, _gabor_pair,
-                               _spatial_fftconv_chunked)
+from f_visual_features import (f_grid_bounds, _gabor_pair, _gauss_env, _temporal_quad,
+                               _spatial_fftconv_chunked, f_gabor_bank, _sample_idx)
 from f_feature_helpers import f_resample_to_imaging
 
 _CELL_RE = re.compile(r'r(\d+)c(\d+)$')   # trailing grid-cell id in any channel name
@@ -145,6 +145,20 @@ def _render_cells(raw_side, base_names, grid, mon_hw, channel):
     return frame
 
 
+def _grid_from_names(names):
+    """Infer the (ny, nx) sampling lattice from `..._r{iy}c{ix}` channel names = (max iy+1,
+    max ix+1). Works for grid-pooled AND point-sampled blocks; returns None if no name matches."""
+    import re
+    pat = re.compile(r'_r(\d+)c(\d+)$')
+    iy = ix = -1
+    for nm in names:
+        m = pat.search(nm)
+        if m:
+            iy = max(iy, int(m.group(1)))
+            ix = max(ix, int(m.group(2)))
+    return (iy + 1, ix + 1) if iy >= 0 else None
+
+
 def f_reconstruct_feature_movie(block, block_name, mon_hw, side_tags,
                                 n_pcs=None, channel='auto', normalize='auto',
                                 frame_idx=None):
@@ -196,7 +210,9 @@ def f_reconstruct_feature_movie(block, block_name, mon_hw, side_tags,
     if raw_names is None:
         raise ValueError(f"block {block_name!r} has no 'raw_names'; rebuild it "
                          "with the current build_visual_blocks to enable recon.")
-    grid = block.get('params', {}).get('grid', (6, 6))
+    # Prefer the (iy,ix) lattice inferred from the r{iy}c{ix} names — correct for BOTH grid-pooled
+    # and point-SAMPLED blocks (where params['grid'] is the ignored default). Fall back to params.
+    grid = _grid_from_names(raw_names) or block.get('params', {}).get('grid', (6, 6))
     if channel == 'auto':
         if block_name == 'grid':
             channel = 'mean'
@@ -717,3 +733,296 @@ def f_pick_motion_frames(built_blocks, n=6, mode='spread', block='pix', frame_ra
             if len(picked) >= n:
                 break
     return sorted(picked)
+
+
+def f_plot_conv_hist(samples, df=None, bins=80, logy=True, max_panels=16, suptitle=''):
+    """Per-filter value HISTOGRAMS from f_conv_repo.f_conv_repo_scan (`samples` = {name: 1-D values}).
+    One panel per filter (up to `max_panels`), log-y by default so heavy outlier tails are visible;
+    median-|value| (green) and 99.9th-|value| (red) marked. If `df` (the scan table) is given, the
+    panel title shows the tail ratio (absmax / p50_abs). Returns None (Spyder-safe)."""
+    import matplotlib.pyplot as plt
+    names = list(samples)[:max_panels]
+    if not names:
+        print('f_plot_conv_hist: no samples'); return None
+    tail = {r['name']: r.get('tail') for _, r in df.iterrows()} if df is not None else {}
+    n = len(names); ncol = min(4, n); nrow = int(np.ceil(n / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(3.3 * ncol, 2.6 * nrow), squeeze=False)
+    for j, nm in enumerate(names):
+        ax = axes[j // ncol][j % ncol]
+        v = np.asarray(samples[nm], float)
+        ax.hist(v, bins=bins, color='steelblue')
+        if logy:
+            ax.set_yscale('log')
+        av = np.abs(v)
+        ax.axvline(np.median(av), color='seagreen', lw=0.8)       # median |value|
+        ax.axvline(np.percentile(av, 99.9), color='C3', lw=0.8, ls='--')   # 99.9th |value|
+        ax.axvline(-np.percentile(av, 99.9), color='C3', lw=0.8, ls='--')
+        _t = f'{nm}' + (f'  tail={tail[nm]:.0f}' if tail.get(nm) is not None else '')
+        ax.set_title(_t, fontsize=6.5)
+        ax.tick_params(labelsize=6)
+    for j in range(n, nrow * ncol):
+        axes[j // ncol][j % ncol].axis('off')
+    fig.suptitle(suptitle or 'conv_repo per-filter value histograms (log-y; green=median|·|, red=99.9%)')
+    fig.tight_layout()
+    return None
+
+
+def f_plot_conv_activity(df, ts, by='tfreq', kind=None, reduce_label='|response|',
+                         suptitle='', max_points=2000):
+    """Diagnostic plot of conv_repo feature ACTIVITY (from f_conv_repo.f_conv_activity): a 2-panel
+    figure grouped by `by` ('odeg' | 'wavelength' | 'tfreq'), aggregating (mean) over all other
+    axes incl. sides — (L) mean response-magnitude trace over time per group; (R) one overall
+    number (time × space mean) per group. `kind` filters to 'gabor'|'meng' (use kind='meng',
+    by='tfreq' to pick temporal freqs). Rows with a NaN `by` (e.g. tfreq on gabor) are dropped.
+    Returns None (Spyder-safe)."""
+    import matplotlib.pyplot as plt
+    d = df.reset_index(drop=True)
+    keep = np.ones(len(d), bool)
+    if kind is not None:
+        keep &= (d['kind'] == kind).to_numpy()
+    keep &= d[by].notna().to_numpy()
+    d = d[keep].reset_index(drop=True)
+    tsk = np.asarray(ts)[keep]
+    if len(d) == 0:
+        print(f'f_plot_conv_activity: no rows for by={by!r} kind={kind!r}')
+        return None
+    groups = sorted(d[by].unique())
+    by_vals = d[by].to_numpy()
+    scal = d['scalar'].to_numpy()
+    T = tsk.shape[1]
+    step = max(1, T // max_points)
+    xt = np.arange(0, T, step)
+    fig, ax = plt.subplots(1, 2, figsize=(13, 4.2))
+    cmap = plt.cm.viridis(np.linspace(0, 0.9, max(1, len(groups))))
+    bar_h = []
+    for g, c in zip(groups, cmap):
+        m = by_vals == g
+        ax[0].plot(xt, tsk[m].mean(axis=0)[::step], color=c, lw=1.0, label=f'{by}={g}')
+        bar_h.append(float(scal[m].mean()))
+    ax[0].set_xlabel('frame'); ax[0].set_ylabel(f'mean {reduce_label} over space')
+    ax[0].set_title('response magnitude over time'); ax[0].legend(fontsize=7)
+    ax[1].bar([str(g) for g in groups], bar_h, color=cmap)
+    ax[1].set_xlabel(by); ax[1].set_ylabel(f'mean {reduce_label} (time × space)')
+    ax[1].set_title(f'overall activity per {by}')
+    # context: which OTHER axes' values this panel averaged over (odeg / wavelength / tfreq).
+    _ctx = []
+    for _pair in [('odeg',), ('wavelength', 'isf'), ('tfreq', 'itf')]:
+        if by in _pair:
+            continue
+        _col = next((c for c in _pair if c in d.columns and d[c].notna().any()), None)
+        if _col is not None:
+            _ctx.append(f'{_col} {sorted(d[_col].dropna().unique())}')
+    _ctx = ('  (avg over ' + '; '.join(_ctx) + ')') if _ctx else ''
+    fig.suptitle((suptitle or f'conv activity by {by}' + (f' ({kind})' if kind else '')) + _ctx)
+    fig.tight_layout()
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Driver helpers — original-frame lookup + movie-pair save (used by VR_feature_viz_cache.py)
+# Parameterized (no module-global state) so the driver script stays thin.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def f_orig_for_side(arr, side_tags):
+    """Crop an L|R original-frame array to the recon's side(s) so widths match. `arr` (T,H,W|2W);
+    returns it unchanged for two-sided (L,R) recon, else the matching half."""
+    if arr is None or len(side_tags) == 2:
+        return arr
+    _h = arr.shape[2] // 2
+    return arr[:, :, :_h] if side_tags[0] == 'L' else arr[:, :, _h:]
+
+
+def f_orig_frames(pidx, orig_mov, side_tags, example_frames=None, example_frame_idx=None):
+    """Original frames at imaging-frame indices `pidx`, cropped to side: from the cheap saved
+    `example_frames` when pidx == example_frame_idx, else from the full `orig_mov`, else None."""
+    if pidx is None:
+        return None
+    if example_frames is not None and list(pidx) == list(example_frame_idx):
+        return f_orig_for_side(np.asarray(example_frames), side_tags)
+    if orig_mov is not None:
+        return f_orig_for_side(np.asarray(orig_mov)[list(pidx)], side_tags)
+    return None
+
+
+def f_frame_indices(n_total, want, n, example_frames=None, example_frame_idx=None):
+    """Indices to display/save: `want` (explicit list) → as-is; else the saved example_frame_idx;
+    else `n` evenly-spaced over n_total."""
+    if want is not None:
+        return [int(i) for i in want]
+    if example_frames is not None:
+        return list(example_frame_idx)
+    return list(np.unique(np.linspace(0, n_total - 1, min(n, n_total)).round().astype(int)))
+
+
+def f_save_movie_pair(feat_mov, stem, out_dir, ds, mov_tag='', orig_mov=None, side_tags=None,
+                      save_idx=None, save_orig=False, pair=True):
+    """Save an already-frame-subset feature movie as <out_dir>/<stem>_<ds><_tag>.tif, and (when
+    save_orig and pair) the matching ORIGINAL as <...>_ORIG.tif at the SAME frames. `save_idx` =
+    the imaging-frame indices `feat_mov` was built at (for the original). Prints what it wrote."""
+    from f_functions import f_save_mon_movie
+    _mt = f'_{mov_tag}' if mov_tag else ''
+    f_save_mon_movie(feat_mov, f'{out_dir}/{stem}_{ds}{_mt}.tif', gap_px=0)
+    msg = f'saved {stem} → {out_dir}/{stem}_{ds}{_mt}.tif'
+    if pair and save_orig:
+        if orig_mov is None or save_idx is None:
+            msg += '  (save_orig set but no original movie — run the Original-movie cell)'
+        else:
+            _o = f_orig_for_side(np.asarray(orig_mov)[list(save_idx)], side_tags)
+            f_save_mon_movie(_o, f'{out_dir}/{stem}_{ds}{_mt}_ORIG.tif', gap_px=0)
+            msg += '  (+_ORIG)'
+    print(msg)
+
+
+def f_block_activity(built_blocks, block_names=None, reduce='absmean', repo_dir=None):
+    """Approximate feature ACTIVITY from ALREADY-LOADED sampled blocks — NO disk re-read (reuses the
+    data f_load_conv_blocks already pulled in, so it also honours whatever load filters were applied).
+    Frame-mean over each filter's SAMPLED cells (a subsample of monitor space ≈ the full-space mean).
+    For each conv sampled block (gaborS_ds*/mengS_ds*): inverse-PCA → raw per-cell values, group
+    channels by (stat, odeg, isf, itf) over sides+cells, reduce per frame → trace, mean over time →
+    scalar. Returns (df, ts) keyed by odeg / isf / itf (SF & TF INDICES). Pass `repo_dir` to also map
+    isf→wavelength and itf→tfreq (from the manifest) → `wavelength`/`tfreq` columns with the ACTUAL
+    px/cyc VALUES, so meng can be plotted by real temporal freq (not just the index). Plot with
+    f_plot_conv_activity(..., by='odeg' | 'isf' | 'itf' | 'wavelength' | 'tfreq')."""
+    import pandas as pd
+    _pat = re.compile(r'^(?P<stat>.+?)_o(?P<odeg>\d+)sf(?P<isf>\d+)(?:tf(?P<itf>\d+))?$')
+    if block_names is None:
+        block_names = [b for b, blk in built_blocks.items()
+                       if blk.get('params', {}).get('pool') == 'sample']
+    _wl, _tf = {}, {}                                       # (kind,isf)→wavelength, (kind,itf)→tfreq
+    if repo_dir is not None:
+        from f_conv_repo import f_list_conv_filters
+        for e in f_list_conv_filters(repo_dir):
+            _wl[(e['kind'], e['isf'])] = e['wavelength']
+            if e.get('itf') is not None:
+                _tf[(e['kind'], e['itf'])] = e.get('tfreq')
+    rows, traces = [], []
+    for bn in block_names:
+        blk = built_blocks[bn]
+        kind = blk.get('kind')
+        raw = _recon_raw(blk, None)                        # (T, raw_dim) per-cell values
+        groups = {}                                        # channel prefix (no side/cell) → col idxs
+        for j, nm in enumerate(blk['raw_names']):
+            groups.setdefault(_cell_prefix(nm.split('_', 1)[1]), []).append(j)
+        for pfx, cols in groups.items():
+            m = _pat.match(pfx or '')
+            if not m:
+                continue
+            x = raw[:, cols]                               # (T, n over sides+cells)
+            if reduce == 'mean':
+                tr = x.mean(axis=1)
+            elif reduce == 'rms':
+                tr = np.sqrt((x * x).mean(axis=1))
+            else:
+                tr = np.abs(x).mean(axis=1)
+            isf = int(m['isf'])
+            itf = int(m['itf']) if m['itf'] is not None else None
+            rows.append({'block': bn, 'kind': kind, 'stat': m['stat'], 'odeg': int(m['odeg']),
+                         'isf': isf, 'itf': itf,
+                         'wavelength': _wl.get((kind, isf)),
+                         'tfreq': (None if itf is None else _tf.get((kind, itf))),
+                         'scalar': float(tr.mean())})
+            traces.append(tr.astype(np.float32))
+    return pd.DataFrame(rows), (np.vstack(traces) if traces else np.zeros((0, 0), np.float32))
+
+
+# ── feature-KERNEL overlay (verify gabor/meng size + sampling vs the monitor) ─────────────────────
+def f_kernel_geom(inp, cam_params, lat_samp, vert_samp, sigma_scale=0.5):
+    """Physical geometry of ONE normalized feature spec `inp` (from f_feature_source._normalize_spec) on a
+    (vert_samp × lat_samp) monitor. Uses the SAME conversions as extraction (f_deg_per_px / f_ds_from_wl):
+    sf_cyc_deg → wavelength px → σ px → kernel support; ds (Nyquist or literal) → sample lattice. Returns a
+    readout dict (no plotting) for the size/sampling troubleshooting table."""
+    from f_conv_repo import f_deg_per_px, f_ds_from_wl
+    dpp = f_deg_per_px(cam_params, lat_samp, vert_samp)          # deg/px (same as extraction)
+    sf = float(np.atleast_1d(inp['sf_cyc_deg'])[0])
+    wl_px = 1.0 / (sf * dpp)
+    sigma = sigma_scale * wl_px
+    support = 2 * int(np.ceil(3 * sigma)) + 1
+    if inp.get('ds') == 'nyquist' or inp.get('ds_factor') is not None:
+        ds = f_ds_from_wl(wl_px, factor=float(inp.get('ds_factor', 0.5)))
+    else:
+        ds = int(np.atleast_1d(inp.get('ds', 1))[0])
+    ny, nx = len(_sample_idx(vert_samp, ds)), len(_sample_idx(lat_samp, ds))   # CENTERED lattice
+    return {'source': inp.get('source'), 'sf_cyc_deg': sf, 'wl_px': wl_px, 'sigma_px': sigma,
+            'support_px': support, 'ds': ds, 'n_samples': (ny, nx), 'n_tiles': ny * nx,
+            'tf_hz': (float(np.atleast_1d(inp['tf_hz'])[0]) if inp.get('tf_hz') is not None else None)}
+
+
+def f_plot_filter_kernel(frame, inp, cam_params, lat_samp, vert_samp, *, draw='even', io=0,
+                         sigma_scale=0.5, gamma=1.0, sigma_extent=3.0, show_points=True,
+                         show_grid=False, bg=None, ax=None, title=None):
+    """Show ONE filter on a monitor `frame` (H×W, one monitor): mark ALL sample locations (where the filter
+    is sampled from) as points, and draw the actual gabor TO SCALE at the sample nearest screen center. The
+    kernel is built by the SHARED builders (change them → this changes): draw='even'/'odd' → _gabor_pair
+    (θ = odegs[io]° or io·180/n_orient); 'env' → _gauss_env (luminance). Drawn out to ±`sigma_extent`·σ
+    (2σ = bulk of the weighting). Sample lattice from ds (Nyquist or literal). `bg` = plain background
+    instead of the frame: a matplotlib color ('black'/'white'/'gray') or a 0-255 gray scalar; None = show
+    the movie `frame` (which may then be None). Returns f_kernel_geom's readout. For verifying gabor SIZE +
+    SAMPLING density."""
+    import matplotlib.pyplot as plt
+    g = f_kernel_geom(inp, cam_params, lat_samp, vert_samp, sigma_scale)
+    H, W = (frame.shape[:2] if frame is not None else (vert_samp, lat_samp))
+    odegs = inp.get('odegs'); n_orient = inp.get('n_orient') or 1
+    theta_deg = float(np.atleast_1d(odegs)[io]) if odegs is not None else io * 180.0 / n_orient
+    theta = np.deg2rad(theta_deg)
+    g['theta_deg'] = theta_deg
+    if draw == 'env':                                           # luminance-only wavelet (Gaussian env)
+        kern = _gauss_env(g['sigma_px'], gamma)
+    else:                                                       # full gabor pair; pick even (cos) / odd (sin)
+        ev, od = _gabor_pair(theta, g['wl_px'], g['sigma_px'], gamma)
+        kern = ev if draw == 'even' else od
+    m = max(1, int(round(sigma_extent * g['sigma_px'])))        # crop to ±sigma_extent·σ (drawn extent)
+    c0 = kern.shape[0] // 2
+    kern = kern[max(0, c0 - m):c0 + m + 1, max(0, c0 - m):c0 + m + 1]
+    kh, kw = kern.shape
+    ds = g['ds']
+    rows = list(_sample_idx(H, ds)); cols = list(_sample_idx(W, ds))   # CENTERED on screen middle
+    if ax is None:
+        _, ax = plt.subplots(figsize=(6.5, 6.5 * H / W + 0.4))
+    if bg is not None:                                          # plain background (choose color) — no frame
+        ax.set_facecolor((float(bg) / 255,) * 3 if isinstance(bg, (int, float)) else bg)
+        ax.set_aspect('equal')
+    else:                                                       # overlay on the real monitor frame
+        ax.imshow(frame, cmap='gray', vmin=0, vmax=255, origin='upper', aspect='equal')
+    if show_grid:
+        for r in rows:
+            ax.axhline(r, color='cyan', lw=0.3, alpha=0.4)
+        for cc in cols:
+            ax.axvline(cc, color='cyan', lw=0.3, alpha=0.4)
+    if show_points:                                             # ALL sample locations this filter reads from
+        Xg, Yg = np.meshgrid(cols, rows)
+        ax.scatter(Xg.ravel(), Yg.ravel(), s=6, c='yellow', edgecolors='k', linewidths=0.2, zorder=2)
+    cy = rows[int(np.argmin([abs(r - H / 2) for r in rows]))]   # sample nearest screen center
+    cx = cols[int(np.argmin([abs(cc - W / 2) for cc in cols]))]
+    amax = float(np.abs(kern).max()) or 1.0                     # ONE gabor to scale at that sample.
+    rgba = plt.get_cmap('bwr')(np.clip(kern / amax * 0.5 + 0.5, 0, 1))   # explicit RGBA (per-pixel alpha
+    rgba[..., 3] = np.clip(np.abs(kern) / amax, 0, 1)           # works on ALL mpl; 2D `alpha=` needs ≥3.4)
+    ax.imshow(rgba, zorder=3, origin='upper',
+              extent=[cx - kw / 2, cx + kw / 2, cy + kh / 2, cy - kh / 2])
+    ax.scatter([cx], [cy], marker='+', c='lime', s=80, linewidths=1.2, zorder=4)
+    ax.set_xlim(-0.5, W - 0.5); ax.set_ylim(H - 0.5, -0.5)
+    ax.set_xticks([]); ax.set_yticks([])
+    _tf = '' if g['tf_hz'] is None else f"  tf={g['tf_hz']:g}Hz"
+    ax.set_title(title or (f"{g['source']} θ={theta_deg:g}°  sf={g['sf_cyc_deg']:g}cyc/deg{_tf}\n"
+                           f"λ={g['wl_px']:.1f}px  σ={g['sigma_px']:.1f}px  ±{sigma_extent:g}σ={kh}px  "
+                           f"ds={ds}px  n={g['n_samples'][0]}×{g['n_samples'][1]}"), fontsize=8)
+    return g
+
+
+def f_kernel_gallery(n_orient=4, wavelengths=(6, 12), sigma_scale=0.5, gamma=1.0, which='even',
+                     suptitle='Gabor bank kernels'):
+    """Gallery of the raw bank kernels (orientation × SF) via f_gabor_bank — the 'here are the filters'
+    panel. `which` = 'even' | 'odd'. wavelengths in PIXELS (convert cyc/deg → px first for a physical bank)."""
+    import matplotlib.pyplot as plt
+    bank = f_gabor_bank(n_orient=n_orient, wavelengths=wavelengths, sigma_scale=sigma_scale, gamma=gamma)
+    n_sf = len(np.atleast_1d(wavelengths))
+    fig, axes = plt.subplots(n_orient, n_sf, figsize=(2.2 * n_sf, 2.2 * n_orient), squeeze=False)
+    for k in bank:
+        ax = axes[k['io']][k['isf']]
+        ker = k['even'] if which == 'even' else k['odd']
+        v = float(np.abs(ker).max()) or 1.0
+        ax.imshow(ker, cmap='bwr', vmin=-v, vmax=v)
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_title(f"θ={np.degrees(k['theta']):.0f}°  λ={k['wavelength']:.0f}px ({ker.shape[0]}px)",
+                     fontsize=8)
+    fig.suptitle(suptitle); fig.tight_layout()
+    return bank

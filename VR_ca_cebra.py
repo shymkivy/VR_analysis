@@ -1,5 +1,11 @@
 # -*- coding: utf-8 -*-
 """
+VR_ca_cebra.py
+
+PURPOSE: Runs the reverse direction, decoding stimulus and behavior features from the neural
+population, as an independent check that the same features are represented.
+PIPELINE: step 3 of 3 — VR_feature_search → VR_ca_encoding → VR_ca_cebra. See SCRIPTS.md.
+
 Created on Mon Mar  9 12:01:39 2026
 
 @author: ys2605
@@ -23,26 +29,22 @@ import matplotlib.pyplot as plt
 from sklearnex import patch_sklearn
 patch_sklearn()
 
-from f_utils import f_load_caim_data, f_gauss_smooth
-from f_analysis import f_hclust_firing_rates, f_circshift_rates
-from f_functions import f_load_bh_data_all, f_proc_movement, f_proc_lick_rew, f_comp_FOV_adj, f_add_phase, f_get_monitor_coords, f_angles_to_movie, f_angles_to_movie_v2, f_save_mon_movie, f_add_terrain_to_monitor #, f_plot_session
-from f_pipeline import f_load_session, f_acquire_features, f_build_features
-from f_feature_helpers import f_resample_to_imaging, build_feature_blocks, f_detrend_col, f_resolve_detrend_sigma
-from f_visual_features import build_visual_blocks
-from f_cebra_helpers import make_cebra_supervision, f_run_cebra, f_blocked_cv_r2
-from f_decoding import (f_imaging_fs, make_decoder, f_resolve_n_components,
-                        f_shuffle_neural, f_lags_from_ms,
-                        f_pca_prefix, f_apply_block_detrend, f_insample_predict,
-                        build_target_columns, build_target_matrix,
-                        legacy_target_blocks,
-                        f_run_decode_sweep, f_run_decode_null,
-                        f_plot_pred_scatter, f_plot_pred_traces, f_plot_decode_bars,
-                        f_plot_feature_heatmap, f_plot_decode_sweep_summary,
-                        f_plot_decode_real_vs_null, f_plot_sweep_lines,
-                        f_plot_oof_trace_scatter, f_plot_perfeature_null_grid,
-                        f_plot_grid_delta_heatmap, f_plot_grid_focus_lines,
-                        f_plot_real_vs_shuffle_line, f_plot_input_raster,
-                        f_plot_block_traces)
+import f_utils as util
+import f_analysis as ana
+import f_functions as ff              # rendering/loaders (mostly used indirectly via f_pipeline)
+import f_pipeline as pipe
+import f_feature_source as fsrc
+import f_feature_helpers as fh
+import f_visual_features as vf
+import f_cebra_helpers as ceb
+import f_decoding as dec
+import f_ensembles as ens
+import f_ensemble_plots as ensp
+import f_ensemble_pipeline as enspipe
+import f_encoding as enc
+import f_encoding_plots as encp
+import f_tuning as tun
+import f_conv_repo as cr
 
 from sklearn.decomposition import PCA
 
@@ -53,44 +55,42 @@ import time
 # SECTION 1 · SETUP — config, load data, pick dataset, smooth + hclust-sort
 # ==========================================================================
 mouse_id = 'L'
-n_dset   = 4        # dataset index into the do_proc==1 rows (selects est1 below)
+n_dset   = 5        # dataset index into the do_proc==1 rows (selects est1 below)
 
 data_dir     = 'F:/VR/data_proc/' + mouse_id    # edit this
 data_dir_bh  = 'F:/VR/Bh_data/mice_gcamp/'
-vr_data_xlsx = 'F:/VR/data_proc/VR_data.xlsx'   # dataset table (f_load_session reads it)
+vr_data_xlsx = 'F:/VR/data_proc/VR_data.xlsx'   # dataset table (pipe.f_load_session reads it)
 
 lick_col = 'red'
 lick_col2 = 'lightcoral'
 rew_col = 'green'
 rew_col2 = 'limegreen'
 
+# Colormap used by ALL raster plots (encoding raster + neural-cleanup raster). Choose one:
+raster_cmap = 'viridis'      # 'viridis' — sequential (S_smn / non-negative scale; ca_analysis default)
+                             # 'RdBu_r'  — diverging, 0-centered (for z-scored / centered data)
+# Any matplotlib cmap works; diverging names (RdBu_r/coolwarm/bwr/seismic) auto-use a symmetric scale.
+_RASTER_DIVERGING = ('rdbu_r', 'rdbu', 'coolwarm', 'bwr', 'seismic', 'piyg', 'prgn')
+
 obj_size = {'x':        5,
             'y':        20, # for cylinder 20, for cube 10
             'z':        5,
             'height':   2}
 
-# cylinders radius 5, half height 10.. coordinate at center.. height is y + height
+src = fsrc.f_default_source(mouse_id=mouse_id)   # feature source: where-from + save (defaults inside)
 
-# --- Feature source: BUILD (render + extract) or LOAD a cached features file ---
-# Master switch for the slow render + build_*_blocks below. The cheap behavior
-# vectorization (mov_data / vec_data) always runs so downstream filters and
-# behavior-coloring work either way. See f_feature_cache.py.
-load_cached_features = True     # True = load a cache instead of render + build
-features_dir = 'F:/VR/features/' + mouse_id
-# load knobs (priority: file > tag > index):
-feature_file = None     # exact/substring cache filename; None → fall through
-feature_tag  = 'test_6_26_26'     # filename containing this unique tag string; None → index
-feature_idx  = 0        # position in the dataset's sorted file list
-# save knobs (build mode only):
-save_features = True    # write the built features to a cache
-save_movie    = False    # also store raw two_mon_frames (large; for recon/flow viz)
-save_tag      = 'test_6_26_26'     # unique tag baked into the saved filename
+# Raster color scale for the CEBRA-latent ensemble plots. ens_fix_scale=True uses fixed ens_vmin/ens_vmax (nicer,
+# comparable across figures, e.g. 0..0.5 for peak-normed S); False = per-figure percentile (ens_vmax_pct).
+ens_fix_scale = True
+ens_vmin      = 0.0
+ens_vmax      = 0.5
+ens_vmax_pct  = 99   # percentile brightness clip when ens_fix_scale=False (lower = brighter)
 
 #%% Loading data + cheap behavior/monitor vectorization (f_load_session)
 # One call loads calcium + behavior, picks est1, and runs the cheap vectorization
 # (mov_data / lr_data / vec_data_l/r). Shared with the other scripts via f_pipeline.
 # NOT included: neural smoothing/sort (below) and the render (build cell).
-session = f_load_session(mouse_id, n_dset, data_dir, data_dir_bh, vr_data_xlsx)
+session = pipe.f_load_session(mouse_id, n_dset, data_dir, data_dir_bh, vr_data_xlsx)
 data_ca      = session['data_ca']
 bh_data      = session['bh_data']
 est1         = session['est1']
@@ -108,20 +108,42 @@ beh_t        = session['beh_t']
 frame_t      = session['frame_t']
 T_img        = session['T_img']
 
-#%% Preprocessing
-num_comp = 50
+#%% Preprocessing — NEURAL only (drop silent → smooth → hclust-sort → Y_neu)
+# Self-contained neural loading: builds the neural matrix Y_neu / Y_neu_raw from est1 WITHOUT any
+# feature build, so you can run dim-red / ensembles / tuning on cells alone. The feature cell only
+# re-narrows these when near_dist_thresh is set (it couples features + neural on one frame mask).
 n_jobs = 5
 
-est1 = data_ca[n_dset]
+est1 = session['est1']          # the selected dataset (data_ca holds only it unless load_all)
 # Short tag used in every figure title: mouse + dset index + session name.
 dset_tag = f"{mouse_id} dset{n_dset}  {est1['dset_name']}"
-     
-S_sm = f_gauss_smooth(est1['S'], sigma_frames=6)
+
+# Cleanup: drop SILENT cells (sum of activity == 0 across the session) — they carry no signal for
+# dim-red / decode / encode and can't be peak-normalized (max=0 → NaN). `active_cells` (bool over
+# est1['S'] rows) keeps every downstream neural array in one consistent cell order.
+_S_raw = np.asarray(est1['S'], dtype=float)
+active_cells = _S_raw.sum(axis=1) > 0
+_n_drop = int((~active_cells).sum())
+if _n_drop:
+    print(f'dropping {_n_drop} silent cells (sum activity = 0); {int(active_cells.sum())}/'
+          f'{active_cells.size} remain')
+S_active = _S_raw[active_cells]        # (n_active, T) — the neural matrix used from here on
+
+S_sm = util.f_gauss_smooth(S_active, sigma_frames=6)
 S_smn = S_sm/np.max(S_sm, axis=1)[:,None]
 
-hclust_data = f_hclust_firing_rates(S_smn, standardize=True, metric='kl', method='average', similarity_transform='auto')   # cosine, jsd, kl  # average for jsd kl
+hclust_data = ana.f_hclust_firing_rates(S_smn, standardize=True, metric='kl', method='average', similarity_transform='auto')   # cosine, jsd, kl  # average for jsd kl
 
 S_smn2 = S_smn[hclust_data['res_order'],:]
+
+# Neural matrix (T_img × N), hclust-sorted — the canonical neural, available without features.
+# The feature cell re-derives these under near_mask_img when near_dist_thresh is set; here (no
+# filter) they span the full session so dim-red / ensembles / tuning can run on cells alone.
+Y_neu        = S_smn2.T.astype(np.float32)
+Y_neu_raw    = Y_neu                        # canonical raw (neural-cleanup cell restores from this)
+near_mask_img = np.ones(T_img, dtype=bool)  # no frame filter yet (feature cell may narrow it)
+S_raster     = S_smn2                       # filtered plotting views (match Y_neu length)
+t_img_plot   = frame_t
 
 if 0:
     plt.close('all')
@@ -148,223 +170,225 @@ if 0:
     plt.imshow(S_smn2s, aspect='auto', interpolation='none')
     
 
-#%% Render params for the selected dataset
+#%% Neural cleanup + ensembles — PARAMS (the shared ensemble config)
 # =============================================================================
-# SECTION 2 · BEHAVIOR FEATURES — render params, feature-block registry
+# SECTION 2.5 · NEURAL CLEANUP + ENSEMBLES — one config for both (f_ensemble_pipeline). Every parameter
+# and its options: _ens_defaults() at the top of functions/f_ensemble_pipeline.py. Sweeps, LNO ECDF,
+# NMF consensus and all ensemble plots: VR_ensembles.py.
+# Override by name (num_comp=12, alpha_W=1e-3, membership='cv_consensus') or by section
+# (dimred={...}, stats={...}). Unknown keys raise.
+ens_cfg = enspipe.f_default_ens_config(
+    # num_comp   = 15,
+    # alpha_W    = 1e-4,
+    # membership = 'z_thresh',        # 'z_thresh' | 'cv_consensus'
+    # sig_method = 'cv',              # 'cv' | 'mp' | 'shuffle'
+)
+dimred_params = ens_cfg['dimred']     # cleanup modes in ASSIGN + the encode/tuning selectors use it
+print(f'ensemble config {enspipe.f_ens_config_tag(ens_cfg)} | dimred params:', dimred_params)
+
+
+#%% Ensembles — from the SHARED config (ens_cfg): load from ens_cache, else fit + stats + save
+# Tune and inspect ensembles in VR_ensembles.py (same config → the same cached result loads here).
+# Gives ens_out / ens_table (ASSIGN, encode-over-inputs, LNO scatter, tuning) + ens_targets
+# {'ens_all', 'ens_sig'} → (Y (T, n), labels). NMF fit only on a cache miss or ens_force=True.
+if 1:
+    ens_force = False                # True = refit + overwrite even if this config is cached
+    _fs = dec.f_imaging_fs(frame_t)
+    _cell_ids_ens = np.flatnonzero(active_cells)[hclust_data['res_order']]
+    ens_res = enspipe.f_ensembles_cached(est1, ens_cfg, src['features_dir'], mouse_id, est1['dset_name'],
+                                         fs=_fs, force=ens_force, dset_tag=dset_tag)
+    ens_out, ens_table = ens_res['ens_out'], ens_res['ens_table']
+    ens_targets = enspipe.f_ens_targets(ens_res)
+    # downstream cells index Y_neu_raw with ens_out's cell order — must be the same cells/order
+    if not np.array_equal(ens_res['cell_ids'], _cell_ids_ens):
+        print("WARNING: ens_cfg['neural'] gives different cells/order than this script's Y_neu_raw — "
+              "ens_cells / LNO / tuning would misalign. Keep ens_cfg neural at the defaults here.")
+    print(f'{int(ens_table["sig"].sum())}/{len(ens_table)} significant ensembles  '
+          f'(config {ens_res["tag"]}; targets {[(k, v[0].shape) for k, v in ens_targets.items()]})')
+
+
+#%% Neural cleanup — ASSIGN Y_neu from the chosen source → feeds encode/decode/CEBRA
+# Runs AFTER the ensembles cell so ensemble-based sources are available. neural_source:
+#   'raw'            no-op / restore the raw neural
+#   'svd_recon'      low-rank reconstruction (denoised, per-cell)
+#   'components'     k×T latent scores (ALL components) → operate on components, not cells
+#   'reliable_cells' raw cells with LNO-R² > r_reliable
+#   'ens_components' score traces of ensembles (n_ens × T)  [needs ensembles cell]
+#   'ens_cells'      raw cells that are MEMBERS of ensembles (union) [needs ensembles cell]
+# ens_src_which selects WHICH ensembles feed ens_components/ens_cells: 'sig' (significant only) | 'all'.
+# Reassigns Y_neu (keeps Y_neu_raw; 'raw' restores). Runs BEFORE CEBRA so it also cleans CEBRA input.
+if 1:
+    neural_source = 'ens_components'   # raw|svd_recon|components|reliable_cells|ens_components|ens_cells
+    ens_src_which = 'sig'              # ens_*: 'sig' (significant only) | 'all' (every ensemble)
+    _fs = dec.f_imaging_fs(frame_t)
+    if 'Y_neu_raw' not in dir():
+        Y_neu_raw = Y_neu                                   # fallback if the load cell wasn't rerun
+    Y_neu, _info = enspipe.f_neural_source(neural_source, Y_neu_raw, dimred_params,
+                                           ens_out=ens_out if 'ens_out' in dir() else None,
+                                           ens_table=ens_table if 'ens_table' in dir() else None,
+                                           which=ens_src_which, fs=_fs)
+    print(_info)
+
+
+#%% Neural cleanup — RASTER: original raw neural vs the SELECTED input (Y_neu)
+# f_plot_source_raster: plots Y_neu_raw (top) vs the assigned Y_neu (bottom) — WHATEVER neural_source
+# produced (svd_recon / components / reliable_cells / ens_components / ens_cells / raw). No refit; just
+# renders the data that feeds encode/decode/CEBRA. cmap = raster_cmap; norm_orig=False → raw original.
+if 1:
+    raster_norm_orig = False          # False → ORIGINAL in RAW non-negative scale (own scaling)
+    raster_norm_sel  = False          # False → SELECTED input in RAW non-negative scale (own scaling)
+    raster_colorbar  = False         # True → color scale as a SEPARATE small figure
+    _ft = frame_t if len(frame_t) == Y_neu_raw.shape[0] else None   # matched clock only if unfiltered
+    ensp.f_plot_source_raster(Y_neu_raw, Y_neu, source_label=neural_source,
+                         normalize=dimred_params.get('normalize', 'norm_mean_std'),
+                         fs=dec.f_imaging_fs(frame_t), smooth_ms=dimred_params.get('smooth_ms', 0),
+                         frame_t=_ft, cmap=raster_cmap, norm_orig=raster_norm_orig,
+                         norm_sel=raster_norm_sel, colorbar=raster_colorbar, dset_tag=dset_tag)
+
+
+#%% Feature plan — pick which features + params (all params live in f_feature_source.py)
 # =============================================================================
-# The actual render (f_angles_to_movie_v2 [+ terrain]) now lives in
-# f_pipeline.f_build_features, called from the build/load junction below. These
-# knobs feed it via cfg; num_samp also stays top-level for the recon/viz cells.
+# SECTION 2 · FEATURES — feature plan (source + params); build/load in the next cell
+# =============================================================================
+# feature_list = which blocks to load. side / near_dist_thresh = run knobs. Change a feature param
+# by editing the f_default_* defaults or passing kwargs below. The render knobs below feed the render
+# for any origin='build' block; the render itself (f_angles_to_movie_v2 [+terrain]) runs inside
+# f_resolve_features → f_build_features.
+# NON-VISUAL / legacy blocks — selected by NAME here. All resolve in the SAME f_resolve_features call
+# as the visual banks below (one render shared; cheap blocks need none), so mix freely.
+feature_list     = [
+                    'agg',                   # cheap, no render
+                    'pix',                     # needs the RENDER (movie PCA) — enable if wanted
+                    # 'motion', 'pix_mot',      # per-monitor object motion (cols suffixed _L / _R)
+                    #'pix_mot',
+                    'self_mot', 'beh',         # mouse locomotion (speed+yaw / fwd-lat-yaw) + behavior
+                    #'grid', 'flow',
+                    # 'gabor', 'meng',              # grid-averaged visual (proc block)
+                    # 'gaborG', 'mengG',            # OLD inline grid banks (superseded by vis_sets below)
+                    # 'gaborS', 'mengS', 'gaborS+mengS',   # OLD sampled/derived blocks (pre-grid design)
+                    ]
 
-num_samp = 101
-# max_frames: cap on the time axis for both monitor + terrain renderers.
-# Set to None to render the full session; small integer (e.g., 200, 1000) for
-# fast debugging. Threaded through f_angles_to_movie_v2 and f_render_terrain.
-max_frames = None
-render_verbose = False        # progress prints from f_angles_to_movie_v2 +
-                              # f_render_terrain. Useful first run to gauge
-                              # timing; turn off once stable.
-#left_mon_frames  = f_angles_to_movie(vec_data_l, mov_data['time'], cam_params, obj_size, lat_samp=num_samp, vert_samp=num_samp)
-#right_mon_frames = f_angles_to_movie(vec_data_r, mov_data['time'], cam_params, obj_size, lat_samp=num_samp, vert_samp=num_samp)
-# Optional terrain layer behind the objects. When True, renders the heightmap
-# for each monitor and Z-buffer-composites it with the object render (terrain
-# in front of an object → terrain wins; object in front of terrain → object
-# wins). Adds ground-plane structure to the pix-PCA input. See
-# f_add_terrain_to_monitor in f_functions.py; defaults match this rig
-# (chunk_pitch=122, flip_z=True, eye_height=0 since mouse_xyz is eye-shifted).
-render_terrain = False
-terrain_clip_len   = None     # None = use cam_params['clip_len']; override for
-                              # closer/farther terrain than objects (e.g. 120).
-terrain_stride     = 2      # int ≥ 1 keeps every Nth cell; float < 1 bilinear-
-                              # oversamples. Memory ~ (1/stride)² when below 1.
-terrain_point_size = 1        # half-size of pixel patch painted per sample.
-# (render happens in f_build_features below, in the build/load junction cell.)
-
-#%% Approach 4 — CEBRA: behavior-supervised joint embedding
-# Fits CEBRA twice with the same neural input but different behavior
-# supervision signals:
-#   (a) aggregated per-monitor scalars (8 dims): presence + nearest-obj
-#       lat/vert/dist per side. Small, interpretable, fast.
-#   (b) PCA-compressed pixel movie (~20 dims): top PCs of two_mon_frames
-#       flattened. Captures spatial layout the aggregates miss.
-#
-# Same neural target lets us A/B which behavior parameterization the neural
-# manifold "agrees with" better, via:
-#   - visual: 2D/3D embedding scatter, colored by behavior variables.
-#   - quantitative: KNN-regression decoding of behavior from embedding, with
-#     time-blocked CV. The supervision signal that's better-decoded from a
-#     CEBRA model trained on it is the one the neural population actually
-#     represents most strongly.
-#
-# Time alignment: f_proc_movement samples behavior directly onto the imaging
-# frames, pulse-corrected, so mov_data['time'] == est1['frame_times'] (the
-# imaging clock) and mov_data['delay_corrected'] is True. Downstream resampling
-# uses pulse_delay=0 (already aligned).
-#
-# Prereqs (all built earlier in this script):
-#   bh_data[n_dset]  (with 'bh_pulse_delay', from f_load_bh_data_all)
-#   mov_data         (from f_proc_movement, monitor-vectorization cell)
-#   vec_data_l, vec_data_r  (from f_get_monitor_coords for each monitor)
-#   two_mon_frames   (from f_angles_to_movie, concatenated L+R)
-#   est1, S_smn2, n_dset, cam_params, obj_size
-
-#%% Build behavior features aligned to imaging frame times
-# Two feature sets ready to feed CEBRA. Sanity-check shapes and value ranges
-# before training.
-#
-# Two gating knobs for distance handling (rationale: in the raw pix-PCA
-# representation, far objects naturally occupy almost no pixels so the model
-# discounts them automatically; the agg features need to be told this
-# explicitly):
-#   agg_mode         — controls how the per-side distance channel is encoded.
-#                      'raw'              → [pres, lat, vert, dist]      (8 total)
-#                      'angular'          → dist replaced by 2·arctan2(obj_size_x, dist)
-#                                           — visual angular size, same nonlinearity
-#                                           pix-PCA encodes implicitly      (8 total)
-#                      'salience'         → adds salience = max(0, 1 − dist/clip_len)
-#                                           alongside raw dist               (10 total)
-#                      'angular_salience' → both                              (10 total)
-#   near_dist_thresh — optional hard frame cut. None / 0 keeps all frames.
-#                      Otherwise drops frames where no object on EITHER monitor
-#                      is within near_dist_thresh. Caveat: hard cuts break
-#                      temporal contiguity, which CEBRA's contrastive sampling
-#                      depends on — use only if (A)/(B) don't help.
-
-agg_mode         = 'angular'     # 'raw' | 'angular' | 'salience' | 'angular_salience'
+# VISUAL BANKS — the SAME self-contained dict form as VR_feature_search.py's `feat_sets`, so a config
+# that wins the search PASTES HERE UNCHANGED. Both sides read it through the one canonical reader
+# (f_feature_source.f_resolve_feat_sets), so a dict cannot mean two different things: same reserved
+# '_common' defaults, same per-entry overrides, same `kind` validation, same cell names (f_num_tag).
+# f_vis_sets_to_plan is the plan-side twin of fsearch.f_feature_configs.
+#   '_common'   the knobs EVERY set inherits; an entry repeating a knob OVERRIDES it (that is all a
+#               variant needs — e.g. layer2_proc=[] next to a pca default is the raw twin).
+#   kind        'gabor' | 'fft' | 'meng' | 'fftglobal' | 'wavelet' | 'pix'   (VALIDATED — an unknown
+#               kind, or a knob the kind ignores like tf_hz on gabor / stats on meng, RAISES instead
+#               of being silently dropped). 'fftglobal' = whole-frame rfft2, no patch lattice (position
+#               lives in the phase). 'wavelet' = separable DWT/SWT; its 3 detail subbands ARE the
+#               orientations, so odegs must be None or length 3 (family / decimate are its knobs).
+#   cyc_fov     cycles per FOV → a PYRAMID (one level per SF; patch/support scale with λ). A single
+#               scalar sf_cyc_deg instead → one bank.
+#   stats       gabor/fft: ('magnitude',) | ('quadrature',) = SIGNED even/odd re,ro (#74 — keeps mag AND
+#               phase, no division, strict superset) | ('phase',) | ('luminance',). meng uses `output`.
+#   marginalize axes to POOL ⊆ {'ori','sf'/'wl','tf'}: () → one block per FILTER, ('ori',) → per SF
+#               level, 'all' → one block. Each entry expands to `<name>:<cell>` blocks.
+#   layer1_proc per-filter f_proc step-list | layer2_proc per-cell (same ops as cell 1's procs).
+#               kind='pix' has no filter axis, so it takes ONLY these two (run back-to-back on the raw
+#               movie) and ignores the axis knobs — same as f_pix_config on the search side.
+# Downstream (encode cell / decode sweep) address a bank by NAME — it expands to all its cells.
+# ONE entry per feature type at IDENTICAL params, so the only thing differing is the REPRESENTATION.
+# marginalize='all' pools ori+sf(+tf) → each bank is ONE block '<name>:all' at 50 dims, head-to-head.
+# CAVEAT on raw width (equal AFTER the pca-50, unequal before it): gabor/fft magnitude = 1 channel per
+# filter, quadrature = 2 (Qe+Qo), meng = 1 per (filter × tf) so its tf axis multiplies the bank.
+vis_sets = {
+    '_common': dict(cyc_fov=(1, 2, 4, 8, 16), odegs=(0, 45, 90), marginalize='all',
+                    layer1_proc=None, layer2_proc=[('pca', 50)]),
+    'gabmag':  dict(kind='gabor', stats=('magnitude',)),    # == the search's gabmag
+    'gabquad': dict(kind='gabor', stats=('quadrature',)),   # signed re,ro (#74)
+    'fftmag':  dict(kind='fft', stats=('magnitude',)),      # sector-mean |F| (#73)
+    'fftquad': dict(kind='fft', stats=('quadrature',)),     # Re/Im at nearest coefficient
+    'mengopp': dict(kind='meng', tf_hz=(0.25, 0.5, 1.0, 2), output='opponent',
+                    transform='signed_sqrt'),               # motion energy (no `stats`)
+    # 'pix100': dict(kind='pix'),                           # raw-movie baseline via the same dict
+}
+side             = 'both'       # 'L' | 'R' | 'both'
 near_dist_thresh = None      # e.g. 30 to keep only near frames; None to keep all
-side             = 'R'       # 'L' | 'R' | 'both' — start simple with right monitor only
-nan_absent       = True      # mask continuous agg channels to NaN when presence==0
-                             # (otherwise they collapse to 0, which is ambiguous with
-                             # "object at center" — see notes 2026-05-19 / task #12)
-obj_collapse     = 'salience_mean'   # 'nearest' | 'salience_mean'
-                             # 'nearest':       pick single nearest in-FOV obj (causes
-                             #                  step discontinuities at object swaps)
-                             # 'salience_mean': angular-size-weighted mean across all
-                             #                  in-FOV objs (smooth, visual center of
-                             #                  mass). See task #17.
-build_per_obj    = False     # if True, also build X_per_obj (per-object scalar features,
-                             # one slot per ORIGINAL object id, channels shared across
-                             # monitors). Adds identity + multi-object info that X_agg
-                             # collapses away. ~total_n_obj * 4 (or 5) * n_sides dims.
-                             # Doesn't replace X_agg — separate optional feature set.
-# --- Two distinct kinds of motion (see also f_motion_features /
-#     f_self_motion_features in f_feature_helpers.py) ---
-#   'motion'   = VISUAL/RETINAL motion of the OBJECTS on each monitor — how
-#                fast/which way an object sweeps across the screen. Object-
-#                relative, per monitor side, NaN when no object in FOV. Biology:
-#                looming / optic-flow / motion-direction cells.
-#   'self_mot' = EGOMOTION of the MOUSE itself in world coords — running speed +
-#                yaw rate, from mov_data. Independent of objects, single (not
-#                per side), always defined (no NaN). Biology: vestibular /
-#                head-direction / locomotion.
-#   They overlap (turning/running also moves objects on screen) but aren't
-#   redundant: 'self_mot' isolates pure locomotion regardless of objects;
-#   'motion' also carries the object's OWN world motion + looming/presence.
-build_motion     = True      # if True, build 'motion' — per-side OBJECT screen
-                             # velocity: d_lat, d_vert, d_dist [+d_ang_size in
-                             # angular modes (looming correlate)], plus motion_mag
-                             # and motion_dir_sin/cos. 6 ch/side (raw/salience) or
-                             # 7 (angular). Companion to X_agg; concat downstream
-                             # for "position + velocity" decoding (task #22).
-motion_smooth_sigma = 2.0    # Gaussian σ (behavior samples) applied to position
-                             # before differentiation. 0 disables. At 10 Hz behavior
-                             # clock, σ=2 ≈ 200 ms — light low-pass.
-build_self_motion = True     # if True, build 'self_mot' — MOUSE egomotion from
-                             # mov_data: linear running speed (self_d_dist) + yaw
-                             # rate (self_d_phi), world frame. Captures vestibular /
-                             # head-direction-style signals the object-motion
-                             # channels miss. 2 channels, no NaN-masking (defined
-                             # everywhere). Task #23.
-self_motion_smooth_sigma = 2.0   # σ for position smoothing before differentiation.
-build_pix_motion = True      # if True, build 'pix_mot' block: d/dt of each
-                             # pix-PC trace. Captures "rate of change of each
-                             # static-scene variance mode" — pixel-side parallel
-                             # to the (object-space) 'motion' block. n_pix_pca
-                             # channels, no NaN-masking. Task #29.
-pix_motion_smooth_sigma = 2.0    # σ for pix-PC smoothing before differentiation.
-build_lick_reward = True     # if True, build 'beh' block from lr_data:
-                             # 2 channels (lick, rew) per behavior frame.
-                             # Sparse event counts by default. Task #35.
-lick_reward_smooth_sigma = 0.0   # 0 = raw 0/1 events. Positive → Gaussian
-                                 # smooth, e.g. 5 ≈ 500 ms at 10 Hz behavior
-                                 # clock for a "lick rate" signal. Use raw
-                                 # for sharp event decoding; smooth for
-                                 # Ridge-style continuous-rate decoding.
 
-# Visual-cortex-style monitor feature blocks (location/edge/direction-selective),
-# built from the rendered monitor movie via f_visual_features.build_visual_blocks
-# and merged into built_blocks. See PLAN_monitor_features.md / TODO #47.
-build_visual    = True       # if True, also build the visual blocks below.
-visual_specs    = {          # which visual feature types + params to build:
-    # 'stats' selects which feature types to include (any subset, order kept):
-    #   grid: {'occupancy','mean','edge'}   flow: {'speed','dir','div'}
-    #   omit 'stats' → registry default (all). e.g. ('mean','edge') drops occupancy.
-    # 'n_pca' = PCA dim on the raw cell-features (None/omit → no PCA, raw block).
-    'grid': {'grid': (12, 12), 'n_pca': 100,    # Tier 1 — retinotopic pooling
-             'stats': ('occupancy', 'mean', 'edge')},  # (per-cell; edit to subset).
-    'flow': {'grid': (12, 12), 'n_pca': 100,    # Tier 2 — optical flow on the grid
-             'method': 'lucas_kanade',       # (speed/dir/divergence per cell).
-             'stats': ('speed', 'dir', 'div')},  # method 'lucas_kanade' = numpy-only
-                                             # (no deps); 'farneback' needs cv2
-                                             # (not in the rnn kernel env).
-    # Tier 3 — Gabor bank: magnitude √(even²+odd²) + phase (cos/sin φ → velocity).
-    # n_pca DICT = SEPARATE PCA per group so phase ([-1,1]) isn't washed out by
-    # magnitude: 'gabM'=magnitude, 'gabP'=phase. Value = int #comps OR float(0,1)
-    # = variance fraction. A/B vs 'agg'/'pix'/'grid' in the sweep.
-    'gabor': {'grid': (12, 12), 'n_orient': 4, 'wavelengths': (6, 12),
-              'stats': ('magnitude', 'phase'),
-              'n_pca': {'gabM': 50, 'gabP': 50}},
-    # Tier 4a — Adelson–Bergen motion energy (direction+speed). opponent energy
-    # per orient × SF × temporal-freq; the principled per-area velocity rep.
-    'meng': {'grid': (12, 12), 'n_orient': 4, 'wavelengths': (8,),
-             'temporal_freqs': (0.15,), 'output': 'opponent', 'n_pca': 100},
-}
+# Render knobs — used only for origin='build' blocks; lat/vert also feed the recon/viz cells.
+# monitor render resolution: lat_samp (WIDTH) / vert_samp (HEIGHT). lat:vert = hFOV:vFOV ≈ 1.49 →
+# angularly-square pixels (~0.66 deg/px both axes at 150×101; the angle→pixel map is linear).
+render_lat_samp    = 150     # WIDTH  (columns)
+render_vert_samp   = 101     # HEIGHT (rows)
+num_samp           = render_lat_samp   # legacy square fallback (kept for downstream refs)
+max_frames         = None    # cap render length for debugging; None = full session
+render_verbose     = False   # per-frame progress prints from the renderers
+render_terrain     = False   # add heightmap ground plane behind objects (Z-composited)
+terrain_clip_len   = None    # None = cam_params['clip_len']; else override terrain draw distance
+terrain_stride     = 0.5     # int ≥1 keeps every Nth cell; float <1 bilinear-oversamples
+terrain_point_size = 1       # half-size of pixel patch painted per terrain sample
+terrain_mode       = 'surface'  # 'points' scatter (gappy) | 'surface' watertight fill → occlusion
+terrain_shade      = 'none'  # 'none' invisible occluder (occlude only) | 'gray' | 'depth' visible
+terrain_gray_level = 128     # intensity when terrain_shade='gray'
+terrain_close_iter = 2       # 'surface' horizontal-close passes (smooth horizon + 1px slivers)
+conv_backend       = 'gpu'   # gabor/meng build convolutions: 'gpu' (torch, fast) | 'cpu' (scipy)
+conv_device        = 'cuda'  # torch device for conv_backend='gpu'
+feat_whiten        = False   # whiten loaded PCA feature blocks (÷√eigenvalue → unit-variance PCs)
+feat_pca_variant   = None    # None | 'pcacomb' | 'pcasep' | 'pcaraw' — load a pca_feat GEN cache
+                             # variant (points cache_tag at <tag>_<variant>; gaborS/mengS in feature_list
+                             # then load from it via origin='auto'/'cache'). Blocks not in the cache
+                             # (agg/pix/self_mot) still build. Prints the cache's stored pca_specs to verify.
 
-# pulse_delay / beh_t / frame_t / T_img come from f_load_session (clock setup).
-n_pix_pca = 50    # kept top-level so plot cells can reference it (load mode too)
+# plan = what + feature params | build_cfg = render/neural params. (src = where-from is in cell 1.)
+# NEW feature-building design: each block's processing is an ordered f_proc step-list (applied
+# GLOBALLY at build, before any CV) — block `proc` (== grid layer2) + optional per-input `input_proc`
+# (== layer1). Ops: ('norm', zscore|standardize|total_var|first_sv) | ('pca', n|frac|(frac,cap)) |
+# ('whiten', True); run in list order; [] = no proc. Override a block inline, e.g.
+#   feature_plan['gaborS']['proc'] = [('norm','zscore'), ('pca', 300)]      # norm THEN pca
+#   feature_plan['gaborS+mengS']['proc'] = [('pca', 500)]
+# NB cache-loaded gaborS/mengS carry gen-time PCA — a 'pca' step in their proc is skipped on load.
+feature_plan = fsrc.f_proc_feature_plan()
+# feature_plan = fsrc.f_default_feature_plan()   # OLD design (n_pca/input_norm/zscore_joint per block)
+# Merge the vis_sets banks into the plan and select them. Names collide-safe: a vis_sets key overrides
+# a same-named plan block. Comment out to fall back to the inline gaborG/mengG entries in feature_list.
+# The plan keys are the source of truth for the names — '_common' is a defaults entry, not a block, so
+# reading them back off the plan (not off vis_sets) keeps it out of feature_list.
+_vis_plan = fsrc.f_vis_sets_to_plan(vis_sets)
+feature_plan.update(_vis_plan)
+feature_list = feature_list + [n for n in _vis_plan if n not in feature_list]
+# Pyramid / spec-list block (add 'pyr' to feature_list to use). f_pyramid_specs = param generator;
+# f_specs_block = build a plan block from a list of feature dicts + level-2 marginalize/layer2_proc:
+# feature_plan['pyr'] = fsrc.f_specs_block(fsrc.f_pyramid_specs('gabor', cyc_fov=(1, 2, 4, 8, 16)),
+#                          marginalize=('ori',), layer1_proc=[('norm', 'zscore')], layer2_proc=[('pca', 50)])
+build_cfg    = fsrc.f_default_build_cfg(side=side, num_samp=num_samp,
+                                   lat_samp=render_lat_samp, vert_samp=render_vert_samp,
+                                   max_frames=max_frames,
+                                   render_terrain=render_terrain, terrain_clip_len=terrain_clip_len,
+                                   terrain_stride=terrain_stride, terrain_point_size=terrain_point_size,
+                                   terrain_mode=terrain_mode, terrain_shade=terrain_shade,
+                                   terrain_gray_level=terrain_gray_level, terrain_close_iter=terrain_close_iter,
+                                   conv_backend=conv_backend, conv_device=conv_device)
+n_pix_pca = build_cfg['n_pix_pca']          # kept top-level for downstream plot cells
+# SSD reuse of the CONVOLVED+POOLED gabor/meng/fft blocks. Cached PRE-PCA/proc, keyed on the resolved
+# extractor params, in the ONE place every build path funnels through (build_visual_blocks) — so a bank
+# already convolved by VR_feature_search reloads here instead of re-convolving. Root defaults to the
+# source features_dir; conv_autosave_tag namespaces the store (bump for a fresh one).
+build_cfg['conv_autosave']     = True
+build_cfg['conv_autosave_tag'] = 'auto1'
+# Drop point-samples keeping less than this fraction of their filter window on screen (the rest is
+# zero pad). Geometry only. None = off. MUST MATCH VR_feature_search.py — it changes the columns a
+# bank emits AND is part of the autosave key, so a mismatch silently rebuilds instead of reloading.
+build_cfg['edge_min_frac'] = 0.45
 
-# Side selection — vec_data_use + side_tags come from the cheap vectorization, so
-# they're available in load mode too (downstream multi-obj stats / near-dist filter
-# need them). pix_frames needs the render → set in the build branch only. In load
-# mode side_tags is overwritten from the cache below.
-if side == 'L':
-    vec_data_use, side_tags = [vec_data_l], ['L']
-elif side == 'R':
-    vec_data_use, side_tags = [vec_data_r], ['R']
-elif side == 'both':
-    vec_data_use, side_tags = [vec_data_l, vec_data_r], ['L', 'R']
-else:
+#%% Build / load features + assign aliases
+# f_resolve_features groups blocks by origin and runs each shared op once (one render for build
+# blocks, one cache load, one repo open); only feature_list is loaded. Then legacy aliases + the
+# optional near-dist frame filter + sanity prints.
+# Side selection for the near-dist filter + multi-obj stats (vec_data from f_load_session).
+_sel_side = {'L': ([vec_data_l], ['L']), 'R': ([vec_data_r], ['R']),
+             'both': ([vec_data_l, vec_data_r], ['L', 'R'])}
+if side not in _sel_side:
     raise ValueError(f'unknown side: {side!r}')
+vec_data_use, side_tags = _sel_side[side]
 
-# cfg = the full render+build config (the gen_config provenance AND f_build_features
-# input). Collected from the loose param vars above so they stay cell-editable.
-cfg = {
-    'side': side, 'agg_mode': agg_mode, 'obj_collapse': obj_collapse,
-    'nan_absent': nan_absent, 'n_pix_pca': n_pix_pca,
-    'build_motion': build_motion, 'motion_smooth_sigma': motion_smooth_sigma,
-    'build_self_motion': build_self_motion,
-    'self_motion_smooth_sigma': self_motion_smooth_sigma,
-    'build_pix_motion': build_pix_motion, 'pix_motion_smooth_sigma': pix_motion_smooth_sigma,
-    'build_lick_reward': build_lick_reward, 'lick_reward_smooth_sigma': lick_reward_smooth_sigma,
-    'build_per_obj': build_per_obj, 'build_visual': build_visual,
-    'visual_specs': visual_specs, 'cam_params': cam_params,
-    'obj_size': obj_size, 'num_samp': num_samp, 'max_frames': max_frames,
-    'render_terrain': render_terrain, 'terrain_clip_len': terrain_clip_len,
-    'terrain_stride': terrain_stride, 'terrain_point_size': terrain_point_size,
-}
-_meta = {'n_dset': n_dset, 'dset_name': est1['dset_name'],
-         'n_cells': S_smn2.shape[0], 'n_frames': int(T_img)}
-
-# The junction: build (render+extract via f_build_features, +optional save) OR load a
-# cache by file/tag/index. mov_data / vec_data from the cells above stay live in load
-# mode (near-dist filter + coloring). vec_data_use/side_tags above are for downstream.
-built_blocks, frame_t, side_tags, _movie = f_acquire_features(
-    'cache' if load_cached_features else 'build', est1['dset_name'],
-    build_fn=lambda: f_build_features(session, cfg, render_verbose=render_verbose),
-    features_dir=features_dir, mouse_id=mouse_id,
-    cache_name=feature_file, cache_tag=feature_tag, cache_idx=feature_idx,
-    save=save_features, save_tag=save_tag, save_movie=save_movie,
-    gen_config=cfg, meta=_meta)
+# point the cache resolver at the pca_feat variant when requested (<tag>_<variant> file)
+_src = ({**src, 'cache_tag': f"{src['cache_tag']}_{feat_pca_variant}"} if feat_pca_variant else src)
+built_blocks, frame_t, side_tags, _movie = fsrc.f_resolve_features(
+    session, feature_plan, build_cfg, dset_name=est1['dset_name'], only=feature_list,
+    render_verbose=render_verbose, whiten=feat_whiten, **_src)
 if _movie is not None:        # restore movies for recon/flow viz
     two_mon_frames = _movie
     _W = two_mon_frames.shape[2] // 2
@@ -374,50 +398,60 @@ if _movie is not None:        # restore movies for recon/flow viz
 # supervision, etc.) reference these names. Keep them in sync with the
 # registry; the registry cell below is now redundant for the agg/pix blocks
 # but still wraps things for combine_blocks consumers.
-X_agg              = built_blocks['agg']['X']
-X_pix              = built_blocks['pix']['X']
+# agg/pix are optional now (a plan may omit them) — .get() so the load doesn't crash; downstream
+# agg/pix-specific cells guard on `X_agg is not None` / `'pix' in built_blocks`.
+X_agg              = built_blocks.get('agg', {}).get('X')
+X_pix              = built_blocks.get('pix', {}).get('X')
 X_mot              = built_blocks.get('motion',  {}).get('X')
 X_per_obj          = built_blocks.get('per_obj', {}).get('X')
-agg_feat_names     = built_blocks['agg']['names']
+agg_feat_names     = built_blocks.get('agg', {}).get('names')
 mot_feat_names     = built_blocks.get('motion',  {}).get('names')
 per_obj_feat_names = built_blocks.get('per_obj', {}).get('names')
-n_per_side         = built_blocks['agg']['n_per_side']
-pres_cols          = built_blocks['agg']['pres_cols']
-side_feat_names_single = built_blocks['agg']['side_feat_names_single']
-pca_pix            = built_blocks['pix']['pca_pix']
+n_per_side         = built_blocks.get('agg', {}).get('n_per_side')
+pres_cols          = built_blocks.get('agg', {}).get('pres_cols')
+side_feat_names_single = built_blocks.get('agg', {}).get('side_feat_names_single')
+pca_pix            = built_blocks.get('pix', {}).get('pca_pix')
 n_sides            = len(side_tags)
 
-# Neural: same orientation as the dim-red sweep (T_img × N).
-Y_neu = S_smn2.T.astype(np.float32)
-
-# Optional near-distance frame filter (Option C). Build the "any near"
-# mask on the behavior clock, resample to imaging clock, then apply to
-# every feature block + Y_neu so they stay aligned.
+# Optional near-distance frame filter (Option C). Build the "any near" mask on the behavior clock,
+# resample to imaging clock, then apply to every feature block + the neural (Y_neu) so they stay
+# aligned. The neural base (Y_neu/Y_neu_raw/S_raster) is set in the Preprocessing cell; here we
+# RE-DERIVE it from the source (S_smn2) under the current mask so re-running is idempotent.
 if near_dist_thresh:
     near_per_side = [(v['obj_mon_idx'] & (v['obj_dist'] < near_dist_thresh)).any(axis=1)
                      for v in vec_data_use]
     near_beh = np.any(near_per_side, axis=0).astype(np.float32)
-    near_mask_img = f_resample_to_imaging(beh_t, near_beh[:, None], frame_t, pulse_delay,
+    near_mask_img = fh.f_resample_to_imaging(beh_t, near_beh[:, None], frame_t, pulse_delay,
                                           kind='nearest').ravel() > 0.5
     kept = int(near_mask_img.sum())
     print(f'near-distance filter (d<{near_dist_thresh}): keeping {kept}/{T_img} frames'
           f' ({100*kept/T_img:.1f}%) — NB: hard cuts break temporal contiguity')
     for _bname in built_blocks:
         built_blocks[_bname]['X'] = built_blocks[_bname]['X'][near_mask_img]
-    Y_neu = Y_neu[near_mask_img]
     # Refresh legacy aliases to point at the filtered arrays.
-    X_agg = built_blocks['agg']['X']
-    X_pix = built_blocks['pix']['X']
+    X_agg = built_blocks.get('agg', {}).get('X')
+    X_pix = built_blocks.get('pix', {}).get('X')
     X_mot     = built_blocks.get('motion',  {}).get('X')
     X_per_obj = built_blocks.get('per_obj', {}).get('X')
 else:
     near_mask_img = np.ones(T_img, dtype=bool)
 
-# Filtered plotting views — match the feature blocks / Y_neu length. Plot cells
-# use these (NOT S_smn2 / est1['frame_times'] directly) so they stay aligned
-# under near_dist_thresh. frame_t stays full so f_imaging_fs sees true spacing.
-S_raster   = S_smn2[:, near_mask_img]
-t_img_plot = frame_t[near_mask_img]
+# Neural views. This cell now runs AFTER the ASSIGN cell (which sets Y_neu to the chosen cleaned /
+# ensemble source), so with NO near filter we must NOT touch Y_neu / Y_neu_raw — only refresh the
+# full-length plotting views. Under a near filter (Option C), re-derive the neural under the mask so
+# features + neural stay aligned; NB ASSIGN + ensembles were built on the FULL neural, so re-run the
+# ensemble + ASSIGN cells afterwards to re-align (frame_t stays full so f_imaging_fs sees true spacing).
+if near_dist_thresh:
+    if 'ens_out' in dir() and ens_out['scores'].shape[1] != int(near_mask_img.sum()):
+        print('  WARNING: near filter changed T; ens_out/Y_neu were built on full neural — '
+              're-run the ensemble + ASSIGN cells.')
+    Y_neu_raw  = S_smn2.T.astype(np.float32)[near_mask_img]
+    Y_neu      = Y_neu_raw
+    S_raster   = S_smn2[:, near_mask_img]
+    t_img_plot = frame_t[near_mask_img]
+else:
+    S_raster   = S_smn2
+    t_img_plot = frame_t
 
 # Standardize each feature column for CEBRA (it does NOT internally normalize).
 # CEBRA can't handle NaN — fill them with 0 in the z-scored version only.
@@ -434,17 +468,19 @@ t_img_plot = frame_t[near_mask_img]
 #     X_per_obj_for_cebra = np.where(np.isnan(X_per_obj), 0.0, X_per_obj)
 #     X_per_obj_z = f_zscore(X_per_obj_for_cebra)
 
-# Quick shape / range check before training.
-agg_nan_frac = float(np.isnan(X_agg).mean())
-print(f'side={side!r}  agg_mode={agg_mode!r}  obj_collapse={obj_collapse!r}  '
-      f'n_per_side={n_per_side}  agg width={X_agg.shape[1]}  NaN frac={agg_nan_frac:.2%}')
+# Quick shape / range check before training (agg/pix printed only when present).
+print(f'side={side!r}  agg_mode={build_cfg["agg_mode"]!r}  obj_collapse={build_cfg["obj_collapse"]!r}')
 print('Y_neu     :', Y_neu.shape,   'min/max:', Y_neu.min(),  Y_neu.max())
-print('X_agg     :', X_agg.shape,   'min/max:', np.nanmin(X_agg), np.nanmax(X_agg))
-print('X_pix     :', X_pix.shape,   'min/max:', X_pix.min(),  X_pix.max())
-_pix_n_used = pca_pix.n_components_                          # PCs kept (= n_pix_pca)
-_pix_n_max  = min(pca_pix.n_samples_, pca_pix.n_features_in_)  # full pixel rank ceiling
-print(f'pix PCA exp_var (cum): {np.cumsum(pca_pix.explained_variance_ratio_)[-1]:.3f}'
-      f'  ({_pix_n_used}/{_pix_n_max} PCs used — {_pix_n_used} of {_pix_n_max} possible)')
+if X_agg is not None:
+    agg_nan_frac = float(np.isnan(X_agg).mean())
+    print(f'X_agg     : {X_agg.shape}  n_per_side={n_per_side}  NaN frac={agg_nan_frac:.2%}  '
+          f'min/max: {np.nanmin(X_agg):.3g} {np.nanmax(X_agg):.3g}')
+if X_pix is not None:
+    _pix_n_used = pca_pix.n_components_                      # PCs kept (= n_pix_pca)
+    _pix_n_max  = min(pca_pix.n_samples_, pca_pix.n_features_in_)  # full pixel rank ceiling
+    print(f'X_pix     : {X_pix.shape}  min/max: {X_pix.min():.3g} {X_pix.max():.3g}  '
+          f'PCA exp_var(cum) {np.cumsum(pca_pix.explained_variance_ratio_)[-1]:.3f} '
+          f'({_pix_n_used}/{_pix_n_max} PCs)')
 
 # Multi-object stats per side — tells us how often the collapse matters.
 for v, tag in zip(vec_data_use, side_tags):
@@ -455,284 +491,35 @@ for v, tag in zip(vec_data_use, side_tags):
     print(f'  side {tag}: any-obj-in-FOV {any_obj:.1%}, multi-obj (≥2) {multi:.1%}, '
           f'max simultaneous {max_sim}')
 
-
-#%% Feature registry — helpers around the built_blocks dict
-# built_blocks is built by build_feature_blocks() in the build cell above;
-# this cell just adds convenience helpers (combine_blocks, make_cebra_supervision)
-# and the summary printout.
+# Feature registry summary (per-block dimensionality / NaN frac / PCA variance retained). To
+# concatenate blocks use build_target_matrix / build_target_columns (f_decoding) or
+# make_cebra_supervision (f_cebra_helpers).
+def _block_pca_var(b):
+    """Fraction of total (raw) variance the block's kept PCs capture: a float, a dict {group:frac}
+    for grouped-PCA blocks (grid gabor), or None for raw (un-PCA'd) blocks."""
+    p = b.get('pca_pix', b.get('pca'))
+    if p is None:
+        return None
+    if isinstance(p, dict):
+        return {g: float(pp.explained_variance_ratio_.sum())
+                for g, pp in p.items() if pp is not None}
+    return float(p.explained_variance_ratio_.sum()) if hasattr(p, 'explained_variance_ratio_') else None
 
 print(f'\n{dset_tag} — feature registry (built_blocks):')
+_tot_dim = 0
 for name, b in built_blocks.items():
     n_nan_frac = float(np.isnan(b['X']).mean())
-    print(f'  {name:10s}  {b["X"].shape}  ({len(b["names"])} cols)  NaN frac={n_nan_frac:.2%}')
-
-
-def combine_blocks(group_names, blocks=None):
-    """Concatenate selected feature blocks horizontally.
-
-    Parameters
-    ----------
-    group_names : str | list of str
-        Block name(s) from the registry, e.g. ['agg', 'motion'] or 'agg'.
-    blocks : dict, optional
-        Registry to read from; defaults to module-global `built_blocks`.
-
-    Returns
-    -------
-    X : ndarray, (T, sum_d)
-        Concatenated feature matrix (same T as each block).
-    names : list of str
-        Column names in concatenation order.
-
-    Raises
-    ------
-    ValueError if a requested block isn't in the registry (didn't get built —
-    check the corresponding build_* knob in the build cell above).
-    """
-    if blocks is None:
-        blocks = built_blocks
-    if isinstance(group_names, str):
-        group_names = [group_names]
-    missing = [g for g in group_names if g not in blocks]
-    if missing:
-        avail = list(blocks.keys())
-        raise ValueError(f'block(s) {missing!r} not built; available: {avail}')
-    Xs = [blocks[g]['X'] for g in group_names]
-    ns = []
-    for g in group_names:
-        ns.extend(blocks[g]['names'])
-    return np.concatenate(Xs, axis=1), ns
-
-
-# Usage examples (uncomment to try):
-# X_test, names_test = combine_blocks(['agg'])              # just agg, equivalent to X_agg
-# X_test, names_test = combine_blocks(['agg', 'motion'])    # position + velocity
-# X_test, names_test = combine_blocks(['agg', 'motion', 'pix'])   # all three
-
-
-# make_cebra_supervision moved to f_cebra_helpers.py on 2026-05-21.
-# Now takes built_blocks as an explicit argument (no module-global lookup):
-#     sup, names = make_cebra_supervision(['agg'], built_blocks)
-
-
-#%% Reconstruct a monitor movie from a feature block (visualize what it keeps)
-# NOTE: the feature-viz / movie cells (this + the 3 below) now live in
-# VR_feature_viz.py, which loads a feature cache and renders the same movies
-# independent of this decoding script. Kept here (if 0) as reference.
-# Rank-k reconstruction of a feature representation back to image space — to SEE
-# what each method encodes and how it degrades with fewer PCs. Saves a multi-page
-# TIFF (open in ImageJ / Fiji to play). See f_feature_viz.py.
-#
-# recon_block — which block to reconstruct. Must be a key currently in
-# built_blocks AND image-space (the cell raises otherwise). Available now:
-#   'pix'   — true pixel reconstruction (inverse-PCA of the pix block).
-#   'grid'  — paint each retinotopic cell by a stat (occ/mean/edge): blocky view.
-#   'flow'  — paint each cell by a flow stat (speed/div): motion-energy field.
-#   'gabor' — paint each cell by one orientation×SF energy channel.
-#   'meng'  — paint each cell by one direction×SF×temporal-freq motion-energy channel.
-#   (Check what's built: list(built_blocks).)
-#   NOT reconstructable: agg / motion / self_mot / pix_mot / beh / per_obj —
-#   these have no monitor-image layout, so there's nothing to paint back. Use the
-#   generic feature-trace viewer cell (f_plot_block_traces) to inspect those.
-#
-# recon_channel — which stat to paint (ignored for 'pix'):
-#   grid:  'occ' | 'mean' | 'edge'                  ('auto' → 'mean')
-#   flow:  'speed' | 'div'                          ('auto' → 'speed')
-#   gabor: 'gabM_o{io}sf{isf}' (or gabPc/gabPs/gabEv)('auto' → first channel)
-#   meng:  'meng{opp|d0|d1}_o{io}sf{isf}tf{itf}'    ('auto' → first channel)
-#
-# recon_stack_orig — if True, the REAL monitor movie is concatenated below the
-#   reconstruction (top=recon, bottom=original) into one TIFF for a synced visual
-#   comparison. The original (behavior clock) is resampled to the imaging clock to
-#   match the recon frames. Works for any block — bottom is always the real scene,
-#   so you can see what grid/flow drop vs. the pixels.
-#
-# Movies are on the imaging clock (the block's clock); cap recon_frame_range for
-# long sessions. (Sweep recon_n_pcs to watch detail come back as PCs are added;
-# print reports used/total PCs — None hits the block's PCA ceiling, e.g. 20/20.)
-if 0:   # moved to VR_feature_viz.py
-    from f_feature_viz import (f_reconstruct_feature_movie,
-                               f_stack_recon_over_original,
-                               f_resolve_recon_n_pcs)
-
-    recon_block       = 'grid'      # 'pix' | 'grid' | 'flow' (built now); see header
-    recon_n_pcs       = None         # int=#PCs | float in (0,1)=variance frac (0.9)
-                                     #   | None=all. e.g. 0.9 → enough PCs for 90% var
-    recon_channel     = 'edge'     # grid:'occ'|'mean'|'edge'; flow:'speed'|'div'; 'auto'
-    recon_frame_range = (0, 3000)  # (start, stop) imaging frames to save (None = all)
-    recon_save        = True
-    recon_stack_orig  = True       # stack the ORIGINAL monitor movie below the recon
-    recon_gap_px      = 4          # black separator rows between the two panels
-    _stack_tag        = '_vsorig' if recon_stack_orig else ''
-
-    if recon_block not in built_blocks:
-        raise ValueError(f'{recon_block!r} not in built_blocks: {list(built_blocks)}')
-    # resolve PCs (int / variance-fraction / None) BEFORE naming + recon so the
-    # filename carries the actual PC count, not '0.9pc'.
-    _rb = built_blocks[recon_block]
-    _pca = _rb.get('pca_pix') if recon_block == 'pix' else _rb.get('pca')
-    if isinstance(_pca, dict):       # grouped PCA (e.g. gabor mag+phase) — use the
-        _n_total = _n_used = _rb['X'].shape[1]    # dedicated gabor cell for the 2 movies
-        _pca = None
+    _dim = b['X'].shape[1]; _tot_dim += _dim
+    _raw = b.get('raw_dim')
+    _v = _block_pca_var(b)
+    if _v is None:
+        _vstr = 'raw (no PCA)'
+    elif isinstance(_v, dict):
+        _vstr = 'PCA var kept ' + ', '.join(f'{g}:{f:.1%}' for g, f in _v.items())
     else:
-        _n_total = _pca.n_components_ if _pca is not None else _rb['X'].shape[1]
-        _n_used = (_n_total if recon_n_pcs is None
-                   else f_resolve_recon_n_pcs(recon_n_pcs, _pca))
-    recon_out = (f'F:/test_mov/recon_{recon_block}_{recon_channel}_'
-                 f'{_n_used}pc{_stack_tag}_{est1["dset_name"]}.tif')
-
-    mov_recon = f_reconstruct_feature_movie(
-        built_blocks[recon_block], recon_block, (num_samp, num_samp), side_tags,
-        n_pcs=recon_n_pcs, channel=recon_channel)
-    # report used/total PCs + the variance the used PCs capture. _evr_block =
-    # fraction of the block's RETAINED variance (1.0 = all kept PCs); _evr_orig =
-    # fraction of the ORIGINAL feature-space variance the block keeps in total.
-    if _pca is not None:
-        _evr = _pca.explained_variance_ratio_
-        _evr_block = float(np.sum(_evr[:_n_used]) / np.sum(_evr))
-        _evr_orig  = float(np.sum(_evr))
-        _var_msg = (f', {_evr_block:.1%} of block variance '
-                    f'(block keeps {_evr_orig:.1%} of original in {_n_total} PCs)')
-    else:
-        _var_msg = ' (raw block, no PCA)'
-    print(f'reconstructed {recon_block!r} movie: {mov_recon.shape} '
-          f'({_n_used}/{_n_total} PCs used{_var_msg}, channel={recon_channel})')
-
-    # Stack the original (real monitor movie) below the reconstruction for a
-    # synced top=recon / bottom=original comparison. Original is on the behavior
-    # clock; the helper resamples it to the imaging clock to match mov_recon.
-    mov_out = mov_recon
-    _orig_var = {'L': 'left_mon_frames', 'R': 'right_mon_frames',
-                 'both': 'two_mon_frames'}[side]
-    if recon_stack_orig and _orig_var not in globals():
-        print(f'original movie {_orig_var!r} not in memory (load mode without '
-              f'save_movie) — saving recon only. Rebuild or load a cache written '
-              f'with save_movie=True to stack against the original.')
-        recon_stack_orig = False
-    if recon_stack_orig:
-        _orig_src = globals()[_orig_var]
-        mov_out = f_stack_recon_over_original(
-            mov_recon, _orig_src, beh_t, frame_t, pulse_delay,
-            gap_px=recon_gap_px)
-        print(f'stacked recon over original: {mov_out.shape} '
-              f'(top=recon {recon_block!r}, bottom=original monitor)')
-
-    if recon_save:
-        f_save_mon_movie(mov_out, recon_out, frame_range=recon_frame_range, gap_px=0)
-
-
-#%% Gabor feature movies — magnitude (grayscale) + phase (color) for one orient×SF
-# Two TIFFs for the chosen orientation gb_io × SF gb_isf:
-#   magnitude — grayscale energy field (where oriented edges are).
-#   phase     — HSV color: hue=φ (edge position within the carrier), brightness=
-#               magnitude (empty cells black). Hue cycles as an edge drifts, so you
-#               SEE direction/speed. Needs gabor built with stats=('magnitude','phase').
-if 0:   # moved to VR_feature_viz.py
-    from f_feature_viz import (f_reconstruct_feature_movie,
-                               f_reconstruct_gabor_phase_movie)
-    from f_functions import f_save_mon_movie
-
-    gb_io, gb_isf  = 0, 0            # orientation / SF index to render
-    gb_n_pcs       = None           # inverse-PCA rank (per group); None = all
-    gb_frame_range = (0, 3000)      # imaging frames to save (None = all)
-    gb_phase_cmap  = 'gray'         # 'hsv' (cyclic color) | 'gray' | 'twilight' (cyclic) | ...
-    gb_save        = True
-    _ds = est1['dset_name']
-
-    mag_mov = f_reconstruct_feature_movie(
-        built_blocks['gabor'], 'gabor', (num_samp, num_samp), side_tags,
-        n_pcs=gb_n_pcs, channel=f'gabM_o{gb_io}sf{gb_isf}')
-    pha_mov = f_reconstruct_gabor_phase_movie(
-        built_blocks['gabor'], (num_samp, num_samp), side_tags,
-        io=gb_io, isf=gb_isf, n_pcs=gb_n_pcs, cmap=gb_phase_cmap)
-    print(f'gabor o{gb_io}sf{gb_isf}: magnitude {mag_mov.shape}  phase(RGB) {pha_mov.shape}')
-
-    if gb_save:
-        f_save_mon_movie(mag_mov, f'F:/test_mov/gabor_mag_o{gb_io}sf{gb_isf}_{_ds}.tif',
-                         frame_range=gb_frame_range)
-        f_save_mon_movie(pha_mov, f'F:/test_mov/gabor_phase_{gb_phase_cmap}_o{gb_io}sf{gb_isf}_{_ds}.tif',
-                         frame_range=gb_frame_range)
-
-
-#%% Gabor DECODED-MOTION movie — FULL-RES phase optic flow (all orientations)
-# Recomputes Gabor responses at every PIXEL from the monitor movie (not the coarse
-# grid/PCA block), so it's high-res + low-noise. Per pixel: dφ/dt across orientations
-# → a 2-D motion vector (mag-weighted LS resolves the aperture problem), temporally +
-# spatially smoothed. Two render modes:
-#   'color' — smooth optical-flow color field: hue=direction, brightness=speed.
-#   'quiver'— arrows every fl_arrow_step px over the magnitude background.
-# Compute = the gabor conv over the chosen frames × n_orient; slice the range to keep
-# it cheap. Independent of how 'gabor' was built (uses the raw movie).
-if 0:   # moved to VR_feature_viz.py
-    from f_feature_viz import (f_gabor_flow_dense, f_render_flow_color,
-                               f_render_flow_quiver_dense)
-    from f_functions import f_save_mon_movie
-
-    fl_mode        = 'color'    # 'color' (smooth, recommended) | 'quiver'
-    fl_wave        = 6.0        # Gabor wavelength (px/cycle); SF to track
-    fl_n_orient    = 4
-    fl_sign        = -1.0       # flip (±1) if motion direction looks inverted
-    fl_smooth_t    = 2.0        # temporal smoothing of dφ/dt (frames) — tames noise
-    fl_smooth_xy   = 1.0        # spatial smoothing of the flow (px)
-    fl_frame_range = (0, 2000)  # imaging frames to compute/render
-    fl_speed_pct   = 98.0       # color: speed percentile mapped to full brightness
-    fl_arrow_step  = 6          # quiver: arrow spacing (px); fl_stride subsamples time
-    fl_stride      = 2
-    fl_scale       = None
-    fl_save        = True
-
-    if 'left_mon_frames' not in globals():
-        raise RuntimeError('raw monitor movie not in memory — this flow-viz cell '
-                           'needs the rendered frames. Run in build mode, or load a '
-                           'cache written with save_movie=True.')
-    _movs = {'L': left_mon_frames, 'R': right_mon_frames}
-    _fr = fl_frame_range or (0, left_mon_frames.shape[0])
-    _sides = []                                  # explicit loops (Spyder comp-scope safe)
-    for t in side_tags:
-        _flow = f_gabor_flow_dense(_movs[t][_fr[0]:_fr[1]], n_orient=fl_n_orient,
-                                   wavelength=fl_wave, smooth_t=fl_smooth_t,
-                                   smooth_xy=fl_smooth_xy, sign=fl_sign)
-        if fl_mode == 'color':
-            _sides.append(f_render_flow_color(_flow, speed_pct=fl_speed_pct))
-        else:
-            _sides.append(f_render_flow_quiver_dense(
-                _flow, arrow_step=fl_arrow_step, stride=fl_stride, scale=fl_scale))
-    fl_mov = np.concatenate(_sides, axis=2)
-    print(f'decoded-motion {fl_mode} movie: {fl_mov.shape}')
-    if fl_save:
-        f_save_mon_movie(fl_mov, f'F:/test_mov/gabor_flow_{fl_mode}_w{fl_wave:.0f}_'
-                         f'{est1["dset_name"]}.tif', gap_px=0)
-
-
-#%% Gabor per-PATCH phase-quiver movie — one arrow per grid cell FROM the feature
-# Decodes a 2-D motion vector per grid cell straight from built_blocks['gabor']
-# phase dynamics (f_gabor_flow_field), then draws one arrow per patch over a faint
-# magnitude background (f_render_flow_quiver_movie): direction = motion, length/
-# color = speed. Reads the FEATURE block (not the raw movie), so it runs in load
-# mode too. Needs gabor built with stats=('magnitude','phase') and ≥2 orientations.
-if 0:   # moved to VR_feature_viz.py
-    from f_feature_viz import f_gabor_flow_field, f_render_flow_quiver_movie
-    from f_functions import f_save_mon_movie
-
-    qv_isf         = 0          # SF index (into gabor 'wavelengths') to track
-    qv_n_pcs       = None       # inverse-PCA rank; None = all
-    qv_sign        = -1.0       # flip (±1) if arrows point the wrong way
-    qv_frame_range = (0, 2000)  # imaging frames to render (None = all)
-    qv_stride      = 2          # temporal subsample of the rendered frames
-    qv_scale       = None       # quiver autoscale; set a number for fixed arrow length
-    qv_min_speed   = 0.0        # hide arrows below this speed (px/frame)
-    qv_save        = True
-
-    qv_flow = f_gabor_flow_field(built_blocks['gabor'], side_tags,
-                                 isf=qv_isf, n_pcs=qv_n_pcs, sign=qv_sign)
-    qv_mov = f_render_flow_quiver_movie(qv_flow, (num_samp, num_samp), side_tags,
-                                        stride=qv_stride, frame_range=qv_frame_range,
-                                        scale=qv_scale, min_speed=qv_min_speed)
-    print(f'per-patch phase-quiver movie: {qv_mov.shape} '
-          f'(grid {qv_flow["grid"]}, λ={qv_flow["wavelength"]:.0f}px)')
-    if qv_save:
-        f_save_mon_movie(qv_mov, f'F:/test_mov/gabor_quiver_sf{qv_isf}_'
-                         f'{est1["dset_name"]}.tif', gap_px=0)
+        _vstr = f'PCA var kept {_v:.1%}' + (f' (of {_raw} raw dims)' if _raw else '')
+    print(f'  {name:10s}  dim={_dim:>4}  {b["X"].shape}  NaN frac={n_nan_frac:5.2%}   {_vstr}')
+print(f'  {"TOTAL":10s}  dim={_tot_dim:>4}  across {len(built_blocks)} blocks')
 
 
 #%% Fit CEBRA — agg and pix supervision, same neural input
@@ -789,7 +576,12 @@ cebra_supervisions = {
     'flow': ['flow'],   # visual optical-flow grid (Tier 2) — needs build_visual=True
     'gabor': ['gabor'], # Gabor oriented-edge energy (Tier 3) — needs build_visual=True
     'meng': ['meng'],   # motion energy, dir+speed (Tier 4a) — needs build_visual=True
+    'gaborS': ['gaborS'],
+    'mengS': ['mengS'],
 }
+# Keep only models whose supervision blocks were actually loaded (feature_list can be a subset).
+cebra_supervisions = {k: v for k, v in cebra_supervisions.items()
+                      if all(b in built_blocks for b in v)}
 
 # Old hardcoded calls kept commented:
 # cebra_agg = f_run_cebra(Y_neu, X_agg_z, out_dim=3, max_iter=5000)
@@ -797,8 +589,8 @@ cebra_supervisions = {
 
 cebra_models = {}
 for _cname, _blocks in cebra_supervisions.items():
-    _sup, _sup_names = make_cebra_supervision(_blocks, built_blocks)
-    cebra_models[_cname] = f_run_cebra(Y_neu, _sup, out_dim=3, max_iter=5000)
+    _sup, _sup_names = ceb.make_cebra_supervision(_blocks, built_blocks)
+    cebra_models[_cname] = ceb.f_run_cebra(Y_neu, _sup, out_dim=3, max_iter=5000)
     cebra_models[_cname]['supervision_blocks'] = list(_blocks)
     cebra_models[_cname]['supervision_names']  = _sup_names
     cebra_models[_cname]['supervision_z']      = _sup
@@ -826,7 +618,7 @@ if 0:
     ax.set_title(f'{dset_tag}\nCEBRA training loss')
     ax.legend(fontsize=8)
     
-    plt.close('all')
+    #plt.close('all')
 
 
 #%% CEBRA embedding scatter — colored by behavior
@@ -890,67 +682,637 @@ for _vb in visual_color_blocks:
     visual_color_specs[_vb] = [(_vn[i], _vx[:, i], 'viridis') for i in range(_k)]
 
 
-def _plot_emb_scatter(model, color_specs, n_rows, suptitle):
-    # Grid scatter: one CEBRA model, n_rows × n_cols panels (one per coloring).
-    # n_cols is derived from len(color_specs) so the grid fits.
-    # Uses 2D (top 2 dims) or 3D (top 3 dims) scatter per `plot_2d` knob above.
-    n_panels = len(color_specs)
-    n_cols = (n_panels + n_rows - 1) // n_rows
-    # constrained layout handles the per-panel colorbars + equal-aspect/3D axes
-    # without the "margins cannot be made large enough" tight_layout warning.
-    fig = plt.figure(figsize=(4.0*n_cols, 3.2*n_rows), layout='constrained')
-    emb = model['embedding']
-    stride = max(1, emb.shape[0] // 10000)   # 60 Hz scatter is too dense raw
-    for i, (cname, cvals, cmap) in enumerate(color_specs):
-        if plot_2d:
-            ax = fig.add_subplot(n_rows, n_cols, i + 1)
-            sc = ax.scatter(emb[::stride, 0], emb[::stride, 1],
-                            c=cvals[::stride], cmap=cmap, s=2, alpha=0.5)
-            ax.set_xticklabels([]); ax.set_yticklabels([])
-            ax.set_aspect('equal', adjustable='datalim')
-        else:
-            ax = fig.add_subplot(n_rows, n_cols, i + 1, projection='3d')
-            sc = ax.scatter(emb[::stride, 0], emb[::stride, 1], emb[::stride, 2],
-                            c=cvals[::stride], cmap=cmap, s=2, alpha=0.5)
-            ax.set_xticklabels([]); ax.set_yticklabels([]); ax.set_zticklabels([])
-        ax.set_title(f'color: {cname}', fontsize=9)
-        fig.colorbar(sc, ax=ax, fraction=0.04, pad=0.02)
-    fig.suptitle(f'{dset_tag}\n{suptitle}', fontsize=11)
-
-
-# Iterate over cebra_models — for each, plot one figure per coloring scheme
-# matching that model's supervision (agg-supervised → agg-channel coloring;
-# pix-supervised → pix-PC coloring; models supervised by both get both
-# figures). Replaces the hardcoded two-call setup.
-#
-# Old hardcoded calls kept commented:
-# _plot_emb_scatter(cebra_agg, agg_color_specs, agg_rows,
-#                   f'CEBRA-agg embedding  |  color: agg inputs  (side={color_tag!r})')
-# _plot_emb_scatter(cebra_pix, pix_color_specs, pix_rows,
-#                   f'CEBRA-pix embedding  |  color: top {n_pix_plot} pix-PCs')
-
+# Iterate over cebra_models — for each, plot one figure per coloring scheme matching that model's
+# supervision (agg-supervised → agg-channel coloring; pix → pix-PC; visual blocks → their comps).
+# f_plot_emb_scatter lives in f_decoding.py; pass dset_tag + plot_2d explicitly.
 for _cname, _m in cebra_models.items():
     _blocks = _m.get('supervision_blocks', [])
     if 'agg' in _blocks:
-        _plot_emb_scatter(_m, agg_color_specs, agg_rows,
-                          f'CEBRA-{_cname} embedding  |  color: agg inputs  '
-                          f'(supervised by {"+".join(_blocks)}, side={color_tag!r})')
+        dec.f_plot_emb_scatter(_m, agg_color_specs, agg_rows,
+                           f'CEBRA-{_cname} embedding  |  color: agg inputs  '
+                           f'(supervised by {"+".join(_blocks)}, side={color_tag!r})',
+                           dset_tag=dset_tag, plot_2d=plot_2d)
     if 'pix' in _blocks:
-        _plot_emb_scatter(_m, pix_color_specs, pix_rows,
-                          f'CEBRA-{_cname} embedding  |  color: top {n_pix_plot} pix-PCs  '
-                          f'(supervised by {"+".join(_blocks)})')
+        dec.f_plot_emb_scatter(_m, pix_color_specs, pix_rows,
+                           f'CEBRA-{_cname} embedding  |  color: top {n_pix_plot} pix-PCs  '
+                           f'(supervised by {"+".join(_blocks)})',
+                           dset_tag=dset_tag, plot_2d=plot_2d)
     for _vb in visual_color_blocks:
         if _vb in _blocks and visual_color_specs[_vb]:
-            _plot_emb_scatter(_m, visual_color_specs[_vb], grid_rows,
-                              f'CEBRA-{_cname} embedding  |  color: top '
-                              f'{len(visual_color_specs[_vb])} {_vb} comps  '
-                              f'(supervised by {"+".join(_blocks)})')
+            dec.f_plot_emb_scatter(_m, visual_color_specs[_vb], grid_rows,
+                               f'CEBRA-{_cname} embedding  |  color: top '
+                               f'{len(visual_color_specs[_vb])} {_vb} comps  '
+                               f'(supervised by {"+".join(_blocks)})',
+                               dset_tag=dset_tag, plot_2d=plot_2d)
+
+
+#%% Decoder params — shared struct (single source of truth; future 'best params' home)
+# =============================================================================
+# SECTION 3.5 · DECODER PARAMS + GENERIC SWEEP (input × target × #PCs × score)
+# =============================================================================
+# f_default_decoder_params → a plain dict of every decode/CV/score setting. Edit here; the sweep
+# cell below overrides ONE key at a time. Options per knob:
+#   input_source   'neural' | 'cebra:<name>'    <name> = any key in cebra_models (e.g. agg, pix)
+#   n_input_pcs    int                          neural PCs to decode from (ignored for cebra input)
+#   neural_pca     'global' | 'within_fold'     within_fold = per-fold PCA (leak-free; disables lags)
+#   target_block   'pix' | 'gaborS' | 'mengS' | 'meng'   single-PCA blocks (grid 'gabor' is skipped)
+#   n_target_pcs   None | int                   None = all target cols; int = top-k target PCs
+#   decoder        'ridge' | 'ridgecv' | 'knn' | 'pls' | 'cca'
+#   ridge_alpha    float                        penalty (decoder ridge/ridgecv)
+#   k_nn           int                          neighbors (decoder knn)
+#   n_components   int                          latent rank (decoder pls/cca)
+#   ridgecv_alphas None | array                 α grid (decoder ridgecv); None → logspace(-2,4,13)
+#   n_folds        int                          blocked-CV folds
+#   fold_scheme    'contiguous' | 'interleaved' interleaved = chop T into n_blocks small blocks
+#                                               round-robin'd to folds (no fold = one quiet epoch)
+#   n_blocks       None | int                   interleaved only; None → n_folds*10
+#   embargo_sec    float                        purge gap (s) each side of the test block
+#   lags_ms        list of ms                   decoder FIR window; [0] = instantaneous
+#   standardize    bool                         z-score input cols (train-fold stats)
+#   scores         subset of ['r2','r2_vw','rv','procrustes','rsa']
+#                    r2 = per-dim mean | r2_vw = variance-weighted | rv = multivariate r² |"
+#                    procrustes = shape (rotation/scale-free) | rsa = timepoint-RDM correlation
+#   rsa_subsample  int                          timepoints sampled for the RSA RDM
+#   seed           int                          RNG seed (RSA subsample)
+dec_params = dec.f_default_decoder_params(
+    input_source  = 'neural',    # 'neural' | 'cebra:<name>'
+    n_input_pcs   = 100,          # neural PCs (input); ignored for cebra input
+    neural_pca    = 'global',    # 'global' | 'within_fold' (leak-free; no lags)
+    target_block  = 'gaborS',       # pix | gaborS | mengS | meng
+    n_target_pcs  = None,        # None = all cols | int = top-k
+    decoder       = 'cca',     # ridge | ridgecv | knn | pls | cca
+    standardize   = True,
+    embargo_sec   = 0.0,
+    lags_ms       = list(range(-400, 101, 100)),   # [0] = instantaneous
+    n_folds       = 5,
+    fold_scheme   = 'interleaved',   # 'contiguous' | 'interleaved' (chop → round-robin)
+    n_blocks      = None,           # interleaved: # small blocks (None → n_folds*10)
+    scores        = ['r2', 'r2_vw', 'rv', 'procrustes', 'rsa'],
+    rsa_subsample = 2000,
+)
+print('decoder params:', dec_params)
+
+
+#%% Decode sweep — vary ONE param across a list, watch how the scores change
+# Pick any key of dec_params as the axis + a list of values. f_decoder_sweep re-runs the decoder
+# for each value; f_plot_decoder_sweep draws one panel per score (numeric axis → line vs x;
+# categorical axis (block/decoder/input names) → bars). Uncomment the experiment you want:
+#   sweep_var, sweep_values = 'n_target_pcs', [1, 2, 3, 5, 8, 12, 16, 24, 32, 50]  # #feature-PCs
+#   sweep_var, sweep_values = 'target_block', ['pix', 'gaborS', 'mengS']           # per-feature
+#   sweep_var, sweep_values = 'n_input_pcs',  [1, 3, 8, 16, 32, 50]                # #neural-PCs
+#   sweep_var, sweep_values = 'input_source', ['neural', 'cebra:agg', 'cebra:pix'] # neural vs CEBRA
+#   sweep_var, sweep_values = 'decoder',      ['ridge', 'knn', 'pls']              # decoder A/B
+#   sweep_var, sweep_values = 'fold_scheme',  ['contiguous', 'interleaved']        # CV scheme A/B
+#   sweep_var, sweep_values = 'lag_ms', list(range(-500, 501, 100))                # single-lag tuning
+#     ('lag_ms' = virtual axis: decode at ONE lag; +τ uses PAST neural, i.e. neural leads feature)
+if 1:
+    
+    sweep_var    = 'n_target_pcs'           # n_target_pcs, lag_ms
+    sweep_values = [1, 2, 3, 5, 8, 12, 16, 24, 32, 50]
+    #sweep_values =  list(range(-2000, 501, 100))
+
+    # CPU cap — leave a core free (same reason as the sweep/null cells).
+    from threadpoolctl import threadpool_limits
+    _n_threads = max(1, (os.cpu_count() or 2) - 1)
+    t0 = time.perf_counter()
+    with threadpool_limits(limits=_n_threads):
+        dec_rows = dec.f_decoder_sweep(dec_params, sweep_var, sweep_values,
+                                   built_blocks, Y_neu, cebra_models, frame_t)
+    print(f'decode sweep over {sweep_var!r} ({len(sweep_values)} pts, '
+          f'≤{_n_threads}/{os.cpu_count()} threads): {time.perf_counter()-t0:.1f}s')
+    dec.f_plot_decoder_sweep(dec_rows, sweep_var, dec_params['scores'], dset_tag=dset_tag,
+                         config=dec_params)
+
+    # --- CEBRA-at-matched-dims (deferred) ---------------------------------------
+    # To compare CEBRA vs PCA at EQUAL dims, retrain a CEBRA per dim and feed it as the input
+    # under sweep_var='n_input_pcs' logic. Not wired yet (one f_run_cebra fit per dim = minutes);
+    # decide retrain-per-dim vs truncate-one-embedding when we get there. For now, sweeping
+    # input_source over the existing 3-D cebra_models works.
+
+
+#%% (optional) COMBINED gabor+meng conv block → single joint PCA from RAW ('convS')
+# gabor magnitude ≈ motion-energy at temporal-freq ≈ 0, so they share spatial structure. This samples
+# BOTH kinds' RAW responses from the conv_repo and fits ONE PCA over the concatenation → a single
+# 'convS' block. Unlike feature_block=['gaborS','mengS'] + feature_pca='joint' (which re-PCAs the
+# already-separately-PCA'd 200+200), this does the feature PCA in a SINGLE step from raw, so no
+# per-kind low-variance tail is dropped first. Then set enc_params feature_block='convS',
+# n_feature_pcs=None (this IS the only feature PCA). Re-reads the repo (sampling) — run once.
+if 0:
+    convS_ds        = 8                        # spatial sample stride (match gaborS/mengS)
+    convS_n_pca     = 200                      # joint components to keep from RAW gabor+meng
+    convS_waves     = None                     # None = all wavelengths in repo | e.g. (12, 15, 18)
+    convS_odegs     = None
+    convS_tfreqs    = None                     # meng temporal freqs; None = all
+    _repo = cr.f_conv_repo_dir(src['features_dir'], est1['dset_name'], src.get('conv_tag'))
+    _cb, _ = cr.f_load_conv_combined(_repo, convS_ds, n_pca=convS_n_pca, kinds=('gabor', 'meng'),
+                                  wavelengths=convS_waves, odegs=convS_odegs, tfreqs=convS_tfreqs,
+                                  label='convS', verbose=False)
+    built_blocks.update(_cb)
+    # align to the current feature/neural clock: the repo is FULL-length, but the other blocks / Y_neu
+    # may be shorter (near_dist_thresh time filter, or max_frames). Match them so the encoder aligns.
+    _T = Y_neu_raw.shape[0] if 'Y_neu_raw' in dir() else built_blocks['agg']['X'].shape[0]
+    _cx = built_blocks['convS']['X']
+    if _cx.shape[0] != _T:
+        if 'near_mask_img' in dir() and near_mask_img.size == _cx.shape[0] and int(near_mask_img.sum()) == _T:
+            built_blocks['convS']['X'] = _cx[near_mask_img]          # near-distance frame filter
+        else:
+            built_blocks['convS']['X'] = _cx[:_T]                    # max_frames truncation
+        print(f'  convS: aligned {_cx.shape[0]} → {built_blocks["convS"]["X"].shape[0]} frames')
+    _cs = built_blocks['convS']
+    print(f"convS: {_cs['raw_dim']} raw gabor+meng cols -> {_cs['X'].shape[1]} joint PCs"
+          + (f"  ({np.cumsum(_cs['pca'].explained_variance_ratio_)[-1]:.3f} var kept)"
+             if _cs['pca'] is not None else ''))
+
+
+#%% Encoder params — shared struct (feature → neural; mirror of the decoder struct)
+# =============================================================================
+# SECTION 3.6 · ENCODING SCAN (feature → neural) — same sweep, reverse direction
+# =============================================================================
+# f_default_encoder_params → a plain dict of the encoding settings. Options per knob:
+#   feature_block     'pix' | 'gaborS' | 'mengS' | 'meng'   the block under test (single-PCA)
+#   n_feature_pcs     None | int                            None = all cols | top-k feature PCs
+#   n_neural_pcs      None | int                            None = per-neuron target | reduce neural
+#                                                           target to top-k PCs (predict → inverse-
+#                                                           transform → per-neuron r kept; denoised)
+#   covariate_blocks  list                                  always-in predictors, e.g. ['self_mot']
+#                                                           to regress in locomotion ([] = pure)
+#   decoder           'ridge' | 'ridgecv' | 'elasticnet' | 'lasso' | 'huber' | 'lad' | 'knn' | 'pls' | 'cca'
+#                       L1-LOSS (min |y-ŷ|, robust to outlier frames): 'lad' (pure abs-error, SLOW) |
+#                       'huber' (abs-error in tails, faster). L1-PENALTY (sparse weights): 'lasso'|'elasticnet'.
+#   ridge_alpha       float                                 penalty α (elasticnet/lasso strength; L2 for
+#                                                            huber; L1-penalty for lad — 0 = pure LAD)
+#   l1_ratio          float                                 elasticnet only: 0=L2(ridge)…1=L1(lasso)
+#   n_folds / fold_scheme / n_blocks / embargo_sec          CV knobs (interleaved = chop → round-robin)
+#   lags_ms           list of ms                            CAUSAL (stimulus precedes response)
+#   scores            per-neuron r_med / frac_sig / r2_med  +  population r2_vw / rv / procrustes / rsa
+#   r_sig             float                                 frac_sig = fraction of cells with r > r_sig
+enc_params = enc.f_default_encoder_params(
+    feature_block    = ['gabmag'],  # a vis_sets BANK name → expands to ALL its `<bank>:<cell>` blocks
+                                    #   (concatenated). An explicit cell scores ONE level, e.g.
+                                    #   ['gabmag:sf0.01016']. Legacy names still work verbatim
+                                    #   (pix | gaborS | mengS | meng | gaborS+mengS), and a LIST mixes
+                                    #   them, e.g. ['gabmag', 'self_mot'].
+    n_feature_pcs    = 150,       # None = all cols | int = top-k
+    feature_pca      = 'joint',# 'per_block' = top-k of EACH block, then lags | 'joint' = concat
+                                   #   blocks → ONE PCA(k) → then lags | 'joint_postlag' = concat →
+                                   #   lag-embed → PCA(k) (caps the feature×lag dimensionality)
+    n_neural_pcs     = None,       # None = per-neuron | int = reduce neural target to top-k PCs
+    target_smooth_ms = 0,          # Gaussian σ (ms) on the neural TARGET; 0 = OFF (raw trace, matches
+                                   #   how the dim-red was done). >0 → predict the smoothed rate
+                                   #   (bias-for-variance; NOT ridge — raises r, hold fixed to compare)
+    roughness_lambda = 0,          # temporal OUTPUT-roughness penalty λ·‖D(Xw)‖²; 0 = OFF (plain ridge)
+                                   #   >0 penalizes SPIKY predictions (forces contiguous folds)
+    roughness_order  = 2,          # 1 = penalize jumps | 2 = penalize spikes / curvature
+    covariate_blocks = [],         # e.g. ['self_mot'] to regress in locomotion
+    decoder          = 'ridge',    # 'ridge' (fixed λ=ridge_alpha) | 'ridgecv' (auto-λ per fold) |
+                                   #   'elasticnet' (L2+L1 penalty, mix via l1_ratio) | 'lasso' (L1 pen) |
+                                   #   'huber' (L1-error/robust loss) | 'lad' (pure abs-error, SLOW) |
+                                   #   'knn' | 'pls' | 'cca'
+    ridge_alpha      = 1e3,        # ridge λ / penalty strength — LARGER = smoother, more shrinkage.
+    # for ridge 1e3                #   Sweep it ([0.1,1,10,100,1000]); on lots of data λ=1 is ~OLS.
+                                   #   (also elasticnet/lasso strength — but sklearn scales it
+                                   #   differently, so RE-TUNE much smaller, e.g. [1e-3,1e-2,0.1,1];
+                                   #   also the ε in the roughness solver.)
+    l1_ratio         = 1e-4,        # decoder='elasticnet': 0 = pure L2 (ridge) … 1 = pure L1 (lasso)
+    ridgecv_alphas   = None,       # decoder='ridgecv': α grid to search (None → logspace(-2,4,13))
+    standardize      = True,      # z-score the FEATURE design (global + per-fold). False = keep raw
+                                   #   PC-score variance (eigenvalue weighting) so ridge favors the top
+                                   #   PCs. NB CCA/PLS ignore this (scale=True internally).
+    embargo_sec      = 0.0,
+    lags_ms          = [0, 100, 200, 300, 400, 500], # [0],   # causal , 100, 200, 300
+    n_folds          = 5,
+    fold_scheme      = 'interleaved',   # 'contiguous' | 'interleaved'
+    n_blocks         = None,
+    scores           = ['r_med', 'r2_med', 'frac_sig', 'r2_vw', 'rv', 'procrustes', 'rsa'],
+    rsa_subsample    = 2000,
+)
+print('encoder params:', enc_params)
+
+# end params:
+    # ridge; alpha 1e-3; 150pcfeat; gamor+meng
+    # elasticnet; l1 rat - 1e-4; alpha = 10; 300pcfeat
+
+
+# plt.close('all')
+#%% Encoding frame filter — restrict feature→neural encoding to MOVEMENT / OBJECT-ON-SCREEN frames
+# Built HERE (not at load) so the ensemble / dim-red neuron→neuron part keeps FULL traces. Applied
+# AFTER lag embedding inside the encoder (lags reference true adjacent frames), to BOTH train & test.
+# Static gabor frames during stationary / empty-screen epochs add redundant samples that can distort
+# the encoding CV — drop them for the ENCODING only. Both None = use all frames.
+if 1:
+    from f_feature_helpers import f_self_motion_features
+    enc_move_thresh = None      # keep frames with mouse speed > this (world units/s); None = off
+    enc_near_thresh = None      # keep frames with any object closer than this on screen; None = off
+    _emasks = []
+    if enc_move_thresh is not None:
+        _spd = f_self_motion_features(mov_data, beh_t=frame_t)[:, 0]        # (T_img,) linear speed
+        _emasks.append(np.asarray(_spd, float) > float(enc_move_thresh))
+        print(f'  speed: median={np.median(_spd):.3f} p90={np.percentile(_spd,90):.3f} '
+              f'>{enc_move_thresh} → {100*np.mean(_spd>enc_move_thresh):.1f}% of frames')
+    if enc_near_thresh is not None:
+        _npers = [(v['obj_mon_idx'] & (v['obj_dist'] < enc_near_thresh)).any(axis=1) for v in vec_data_use]
+        _nbeh = np.any(_npers, axis=0).astype(np.float32)
+        _emasks.append(fh.f_resample_to_imaging(beh_t, _nbeh[:, None], frame_t, pulse_delay,
+                                             kind='nearest').ravel() > 0.5)
+    if _emasks:
+        _efull = np.logical_and.reduce(_emasks)          # (T_img,)
+        enc_frame_mask = _efull[near_mask_img]           # align to current Y_neu rows (load filter)
+        print(f'encoding frame filter: keeping {int(enc_frame_mask.sum())}/{enc_frame_mask.size} '
+              f'frames ({100*enc_frame_mask.mean():.1f}%) — NB: hard cuts break temporal contiguity')
+    else:
+        enc_frame_mask = None
+        print('encoding frame filter: OFF (all frames)')
+
+
+# (diagnostic) PCA variance of the feature block in enc_params — how many components to keep.
+# Runs PCA on the SAME block matrix the encoder consumes (built_blocks[feature_block]['X'], i.e.
+# the pipeline's PCA scores) and plots per-component + cumulative explained variance, so you can
+# read where the block's variance saturates and set n_feature_pcs. The orange curve (if the block
+# kept its fitted PCA) is cumulative variance vs the RAW stimulus = the representation ceiling
+# (<1 because only n_pca components were kept at build). Grouped-PCA blocks (grid 'gabor') skip.
+if 0:
+    from sklearn.decomposition import PCA as _PCA
+    _fb = enc_params['feature_block']
+    _fb = _fb[0] if isinstance(_fb, (list, tuple)) else _fb   # combined blocks → show the first
+    _b  = built_blocks[_fb]
+    if isinstance(_b.get('pca'), dict) or _b.get('pca_groups'):
+        print(f'{_fb!r} uses grouped PCA — single-spectrum plot skipped')
+    else:
+        _X  = np.asarray(_b['X'], float)
+        _Xc = _X[np.isfinite(_X).all(axis=1)]             # drop NaN rows (like the encoder)
+        _pc = _PCA(n_components=min(_Xc.shape)).fit(_Xc)   # run PCA on the block matrix
+        _evr, _cum = _pc.explained_variance_ratio_, np.cumsum(_pc.explained_variance_ratio_)
+        _k  = int(enc_params.get('n_feature_pcs') or _X.shape[1])
+        _ks = np.arange(1, _evr.size + 1)
+
+        fig, ax = plt.subplots(1, 2, figsize=(11, 4))
+        ax[0].plot(_ks, _evr, '-o', ms=3)
+        ax[0].set_xlabel('component'); ax[0].set_ylabel('explained variance ratio')
+        ax[0].set_title(f'{_fb}: per-component variance')
+        ax[1].plot(_ks, _cum, '-o', ms=3, color='C0', label='vs block variance')
+        _pca_obj = _b.get('pca') if _b.get('pca') is not None else _b.get('pca_pix')
+        if _pca_obj is not None and hasattr(_pca_obj, 'explained_variance_ratio_'):
+            _rawcum = np.cumsum(_pca_obj.explained_variance_ratio_)
+            ax[1].plot(np.arange(1, _rawcum.size + 1), _rawcum, '-s', ms=3, color='C1',
+                       label='vs raw stimulus (ceiling)')
+        ax[1].axvline(_k, color='C3', ls='--', lw=0.8, label=f'n_feature_pcs={_k}')
+        ax[1].set_xlabel('# components'); ax[1].set_ylabel('cumulative explained variance')
+        ax[1].set_ylim(0, 1.02); ax[1].legend(fontsize=8, loc='lower right')
+        ax[1].set_title(f'cumulative (k={_k} → {_cum[min(_k, _cum.size) - 1]:.2f} of block var)')
+        fig.suptitle(f'{dset_tag} — feature PCA variance: {_fb!r}  '
+                     f'({_X.shape[1]} block PCs, raw dim {_b.get("raw_dim", "?")})')
+        fig.tight_layout()
+
+
+#%% Encoding sweep — vary ONE param, watch how the encoding scores change (feature → neural)
+# Shared sweep wrapper (f_encode_sweep): re-runs the per-neuron encoder for each value × target;
+# f_plot_encode_sweep draws metric vs value (one line per target / 2nd-axis value). r_med/frac_sig/r2_med = per-neuron encoding
+# fidelity; r2_vw/rv/procrustes/rsa = how well the feature rebuilds the whole population state.
+#   sweep_var, sweep_values = 'n_feature_pcs', [1, 2, 3, 5, 8, 12, 16, 24, 32, 50]  # #feature-PCs
+#   sweep_var, sweep_values = 'feature_block', ['pix', 'gaborS', 'mengS', ['gaborS','mengS']] # combos
+#   sweep_var, sweep_values = 'feature_block', ['gabmag','gabquad','fftmag','fftquad','mengopp']
+#                                              # vis_sets BANKS head-to-head (each expands to its cells)
+#   sweep_var, sweep_values = 'lag_ms', list(range(0, 501, 100))                    # SINGLE-lag tuning
+#   sweep_var, sweep_values = 'lags_ms', [[0],[0,100],[0,100,200],[0,100,200,300]]  # COMBINED lag SETS
+#   sweep_var, sweep_values = 'feature_pca', ['per_block','joint','joint_postlag']  # PCA scoping
+#   sweep_var, sweep_values = 'ridge_alpha', [0.1, 1, 10, 100, 1000]                # ridge λ (numeric)
+#   sweep_var, sweep_values = 'decoder',      ['ridge', 'knn', 'pls']               # decoder A/B
+#   sweep_var, sweep_values = 'fold_scheme',  ['contiguous', 'interleaved']         # CV scheme A/B
+if 1:
+    # 'lag_ms' = SINGLE-lag tuning (each value → lags_ms=[v]); 'lags_ms' = COMBINED lag SETS (each
+    # value is a LIST, used verbatim). For combined sets use 'lags_ms' and make every value a list.
+    sweep_var    = 'decoder'     #   n_feature_pcs, n_neural_pcs, lag_ms, lags_ms, roughness_lambda, decoder
+    #sweep_values = [10, 25, 50, 75, 100, 150, 200, 250, 300, 350, 400, 450, 500]   # (single-lag: use sweep_var='lag_ms')
+    #sweep_values =  list(range(-1000, 1001, 100))
+    #sweep_values = [[100, 200, 300, 400], [0, 100, 200, 300, 400], [0, 100, 200, 300, 400, 500], [100, 200, 300, 400, 500]]
+    #sweep_values = ['agg', 'pix', 'self_mot', 'beh', 'gaborS', 'mengS', 'gaborS+mengS']   
+    sweep_values = ['ridge', 'knn', 'pls', 'cca']
+    #sweep_values = [1e-5, 1e-3, 1e-1, 1, 10, 1e2, 1e3, 1e4, 1e5, 1e6]
+    #sweep_values = [1e-9, 1e-7, 1e-5, 1e-3, 1e-1]
+
+    # targets: 'cells' = Y_neu | 'ens_all' / 'ens_sig' = ensemble traces (ensembles cell above)
+    enc_sweep_targets = ['cells']    # e.g. ['cells', 'ens_sig']
+    enc_line_axis     = None         # optional 2nd axis → one line per value, e.g. ('ridge_alpha', [10, 1e3])
+    enc_plot_metrics  = ['r_med', 'r2_vw']   # one line plot per metric (any score in enc_params['scores'])
+    enc_panels        = True         # also the old one-panel-per-score view (1 axis, 'cells' only)
+
+    from threadpoolctl import threadpool_limits
+    try:    _efm = enc_frame_mask
+    except NameError:  _efm = None
+    _tg = {'cells': Y_neu}
+    for _k in enc_sweep_targets:
+        if _k == 'cells':
+            continue
+        _ets = ens_targets if 'ens_targets' in dir() else {}
+        if _k in _ets and _ets[_k][0].shape[0] == Y_neu.shape[0]:
+            _tg[_k] = _ets[_k]
+        else:
+            print(f'  target {_k!r} unavailable (run the ensembles cell; T must match Y_neu) — skipped')
+    _tg = {k: v for k, v in _tg.items() if k in enc_sweep_targets}
+    _axes = {sweep_var: sweep_values}
+    if enc_line_axis:
+        _axes[enc_line_axis[0]] = enc_line_axis[1]
+    _n_threads = max(1, (os.cpu_count() or 2) - 1)
+    t0 = time.perf_counter()
+    with threadpool_limits(limits=_n_threads):
+        enc_sweep_df, enc_sweep_units = enc.f_encode_sweep(enc_params, _axes, _tg, built_blocks, frame_t,
+                                                           frame_mask=_efm, keep_units=True)
+    print(f'encoding sweep over {list(_axes)} × {list(_tg)} ({len(enc_sweep_df)} fits, '
+          f'≤{_n_threads}/{os.cpu_count()} threads): {time.perf_counter()-t0:.1f}s')
+    for _m in enc_plot_metrics:
+        encp.f_plot_encode_sweep(enc_sweep_df, metric=_m, title=f'{dset_tag} — encoding: {_m} vs {sweep_var}')
+    if enc_panels and not enc_line_axis and 'cells' in _tg:
+        _rows = (enc_sweep_df[enc_sweep_df['target'] == 'cells']
+                 .rename(columns={sweep_var: 'x'}).to_dict('records'))
+        dec.f_plot_decoder_sweep(_rows, sweep_var, enc_params['scores'], dset_tag=dset_tag,
+                                 config=enc_params, logx='auto')
+
+
+#%% Encoding over INPUT SETS — run the encoder on cells / responsive / ensembles → JOINT r/r² ECDF
+# Sweep the neural TARGET (what's encoded), not a config key: build each target set with the same
+# selector the tuning/ASSIGN cells use (f_select_tuning_units), run f_run_encoder on each (same
+# enc_params + feature side), and overlay their per-unit score ECDFs. Compare how well features
+# encode single cells vs responsive cells vs ensemble score traces.
+#   sources: 'cells' (all active) | 'reliable_cells' (LNO-R²>r_reliable) | 'ensembles' (score traces)
+#            | 'ens_cells' (member cells of selected ensembles).  ens sets need the ensembles cells run.
+if 1:
+    enc_input_sources = ['cells', 'ensembles']   # target sets to compare  ens_cells
+    enc_input_which   = 'sig'          # ensembles/ens_cells: 'sig' (significant) | 'all'
+    enc_ecdf_metric   = 'r2'           # 'r2' | 'r' (joint ECDF metric; a 2nd plot draws the other)
+    enc_input_recompute = False        # True → rebuild target sets even if cached this session
+    _fsimg = dec.f_imaging_fs(frame_t)
+    _eo = ens_out if 'ens_out' in dir() else None
+    _et = ens_table if 'ens_table' in dir() else None
+    # session cache: reliable_cells re-runs the LNO dim-red (slow); reuse across re-runs. Keyed by
+    # (source, which, n_frames) so it invalidates if the neural changes; clear via enc_input_recompute.
+    if enc_input_recompute or '_enc_target_cache' not in dir():
+        _enc_target_cache = {}
+    _targets = {}
+    for _src in enc_input_sources:
+        _key = (_src, enc_input_which, int(Y_neu_raw.shape[0]))
+        if _key in _enc_target_cache:
+            _targets[_src] = _enc_target_cache[_key]
+            print(f'  input {_src!r}: reusing cached target {_targets[_src].shape}')
+            continue
+        try:
+            _Yt, _lab, _ = tun.f_select_tuning_units(_src, Y_neu_raw, ens_out=_eo, ens_table=_et,
+                                                 dimred_params=dimred_params,
+                                                 ens_src_which=enc_input_which, fs=_fsimg)
+            _targets[_src] = _enc_target_cache[_key] = _Yt
+        except Exception as _e:
+            print(f'  skip input {_src!r}: {type(_e).__name__}: {_e}')
+    try:    _efm = enc_frame_mask
+    except NameError:  _efm = None
+    from threadpoolctl import threadpool_limits
+    with threadpool_limits(limits=max(1, (os.cpu_count() or 2) - 1)):
+        enc_inputs_out = enc.f_encode_over_inputs(enc_params, built_blocks, _targets,
+                                              frame_t, frame_mask=_efm)
+    enc.f_plot_encode_ecdf_joint(enc_inputs_out, metric=enc_ecdf_metric, dset_tag=dset_tag)
+    enc.f_plot_encode_ecdf_joint(enc_inputs_out, metric=('r' if enc_ecdf_metric == 'r2' else 'r2'),
+                             dset_tag=dset_tag)
+
+
+#%% Encoding — LNO R² vs encoding score SCATTER, overlaid across groups (cells / ensembles / …)
+# One point per unit: x = LNO R² (reliability — cells: population leave-one-neuron-out; ensembles:
+# within-ensemble member LNO = ens_table cv_r2), y = encoding score (feature→unit). Overlays the
+# chosen groups so you see reliability vs encodability together. Same selector as the ECDF cell.
+if 1:
+    lnoenc_groups  = ['cells', 'ensembles']   # + 'reliable_cells' | 'ens_cells'
+    lnoenc_metric  = 'r2'                      # y-axis (encoding): 'r2' | 'r'
+    lnoenc_which   = 'sig'                     # ensembles: 'sig' (significant) | 'all'
+    lnoenc_ens_lno = 'cv_r2'                   # ensemble LNO on x: 'cv_r2' | 'cv_r2_pool'
+    try:    _efm = enc_frame_mask
+    except NameError:  _efm = None
+    _eo = ens_out if 'ens_out' in dir() else None
+    _et = ens_table if 'ens_table' in dir() else None
+    from threadpoolctl import threadpool_limits
+    with threadpool_limits(limits=max(1, (os.cpu_count() or 2) - 1)):
+        lnoenc = enc.f_lno_vs_encode_groups(lnoenc_groups, enc_params, built_blocks, Y_neu_raw,
+                    frame_t, frame_mask=_efm, ens_out=_eo, ens_table=_et,
+                    dimred_params=dimred_params, fs=dec.f_imaging_fs(frame_t),
+                    ens_lno_metric=lnoenc_ens_lno, which=lnoenc_which)
+    enc.f_plot_lno_vs_encode(lnoenc, metric=lnoenc_metric, dset_tag=dset_tag)
+
+
+#%% Encoding raster — run ONE encoder (enc_params) → true vs feature-reconstructed neural raster
+# Fits ONE encoder with the current enc_params (feature → neural), collects OOF predictions, and
+# shows the TRUE neural raster next to the raster ENCODED from features. Cells sorted by per-cell
+# encoding r (best on top); each row z-scored by its true stats so both panels share a color scale.
+# With enc_params['n_neural_pcs'] set, TRUE is the rank-k projection (what the encoder can reach).
+if 1:
+    enc_trace_nshow = 25             # # units in the stacked true-vs-encoded trace overlay (top by r)
+    from threadpoolctl import threadpool_limits
+    try:    _efm = enc_frame_mask
+    except NameError:  _efm = None
+    with threadpool_limits(limits=max(1, (os.cpu_count() or 2) - 1)):
+        enc_one = enc.f_run_encoder(enc_params, built_blocks, Y_neu, frame_t, frame_mask=_efm)
+    print(f"encoded {enc_params['feature_block']!r} → neural:  "
+          f"median r={np.nanmedian(enc_one['r_per_cell']):+.3f}  "
+          f"median R²={np.nanmedian(enc_one['r2_per_cell']):+.3f}  "
+          f"({enc_one['n_valid']} OOF frames, {enc_one['oof_true_cells'].shape[1]} cells)")
+    _erd = raster_cmap.lower() in _RASTER_DIVERGING   # symmetric scale for a diverging cmap
+    # model tag for titles: decoder (or roughness) + feature block + lags
+    _mdl = ('rough' if enc_params.get('roughness_lambda') else enc_params.get('decoder', 'ridge'))
+    _etag = f"{dset_tag} [{_mdl}, {enc_params['feature_block']}, {len(enc_params.get('lags_ms',[0]))} lag]"
+    # under a frame_mask the OOF frames are a subset → absolute-frame placement is invalid; show the
+    # OOF matrices directly (Y_neu=None) instead of the continuous raster.
+    _Yn = None if _efm is not None else Y_neu
+    _ft = None if _efm is not None else frame_t
+    enc.f_plot_encode_rasters(enc_one, Y_neu=_Yn, frame_t=_ft, dset_tag=_etag,
+                          vmin=(-0.5 if _erd else 0.0), vmax=0.5, cmap=raster_cmap, sort=None)
+    # stacked TRUE vs ENCODED per-unit traces overlaid (best-r on top, offset going down)
+    enc.f_plot_encode_traces(enc_one, n_show=enc_trace_nshow, frame_t=_ft, dset_tag=_etag)
+    # per-neuron R² (and r) distribution across the population — separate ECDF figure
+    enc.f_plot_encode_ecdf(enc_one, dset_tag=_etag, metrics=('r2', 'r'))
+    # per-cell score TABLE (r / R² / Spearman / nRMSE) + r-vs-R² scatter — different metrics rank
+    # cells differently (a cell can encode with high r but negative R² = right shape, wrong scale)
+    enc_cell_scores = enc.f_encode_cell_scores(enc_one)
+    with pd.option_context('display.max_rows', 25, 'display.width', 160):
+        print(f'{_etag} — per-cell encoding scores (top 25 by R²):')
+        print(enc_cell_scores.head(25).to_string(index=False))
+    enc.f_plot_encode_score_scatter(enc_one, dset_tag=_etag)
+
+
+#%% ============================================================================
+# SECTION — FEATURE TUNING (reverse-correlation of activity vs conv Gabor/meng filters)
+# =============================================================================
+# For each unit (cell / ensemble / …), reverse-correlate its CONTINUOUS activity (no spike detection)
+# against the dense per-filter conv responses (whole-monitor magnitude per orientation × wavelength
+# [× temporal-freq]) → preferred tuning. Regressors from the conv_repo (f_conv_activity), on the same
+# imaging clock as the neural data. Both STA (literal response-weighted avg) and ridge (whitened,
+# sharper for correlated filters) are computed. Uses Y_neu_raw / ens_out (run the ensembles cell first
+# for ensemble sources). Compute in f_tuning.py; plots in f_encoding_plots.py.
+
+if 1:
+    tuning_source   = 'ensembles'    # 'cells' | 'ensembles' | 'ens_cells' | 'reliable_cells'
+    tuning_kind     = 'meng'        # 'gabor' | 'meng' (meng adds the temporal-freq axis)
+    tuning_conv_tag = src.get('conv_tag')   # conv_repo GEN_TAG (folder <dset>_<tag>)
+    tuning_wavelengths = None         # None = all in repo | e.g. (12, 15, 18)
+    tuning_odegs       = None         # None = all | e.g. (0, 45, 90, 135)
+    tuning_tfreqs      = None         # meng only; None = all
+    tuning_lags_ms     = [0, 100, 200, 300, 400]   # causal; peak lag picked per unit (calcium delay)
+    tuning_methods     = ['sta']          # compare literal STA vs whitened ridge  , 'ridge'
+    tuning_transform   = 'sqrt' if tuning_kind == 'meng' else None  # regressor map: meng ENERGY→amplitude
+                                     #   | None | 'sqrt' | 'signed_sqrt' | 'log1p'
+    tuning_standardize = False       # z-score each filter regressor → magnitudes comparable across
+                                     #   convs (recommended for method='sta'; ridge z-scores internally)
+    tuning_ens_which   = 'sig'        # ensembles/ens_cells: 'sig' (significant) | 'all'
+    _repo_dir = cr.f_conv_repo_dir(src['features_dir'], est1['dset_name'], tuning_conv_tag)
+    print('tuning repo:', _repo_dir)
+
+
+#%% Tuning — compute (both methods) → per-unit preferred orientation / wavelength [/ tfreq]
+if 1:
+    _fs = dec.f_imaging_fs(frame_t)
+    # CACHE the conv regressors (reading the repo dense maps is the slow I/O step). Re-read only when
+    # the repo / kind / wavelength / odeg / tfreq changes — NOT when tuning_source/methods/lags change.
+    _tun_key = (str(_repo_dir), tuning_kind, str(tuning_wavelengths), str(tuning_odegs),
+                str(tuning_tfreqs), str(tuning_transform), bool(tuning_standardize))
+    try:    _reuse_reg = (_tun_key_prev == _tun_key) and (X_stim_full is not None)
+    except NameError:  _reuse_reg = False
+    if _reuse_reg:
+        print('tuning: reusing cached conv regressors (repo/kind/filters/transform unchanged)')
+    else:
+        X_stim_full, filt_df = tun.f_conv_regressors(_repo_dir, kind=tuning_kind, wavelengths=tuning_wavelengths,
+                                                 odegs=tuning_odegs, tfreqs=tuning_tfreqs, frame_ds=1,
+                                                 transform=tuning_transform, standardize=tuning_standardize)
+        _tun_key_prev = _tun_key
+    X_stim = X_stim_full
+    Y_units, tun_labels, tun_kind = tun.f_select_tuning_units(
+        tuning_source, Y_neu_raw, ens_out=(ens_out if 'ens_out' in dir() else None),
+        ens_table=(ens_table if 'ens_table' in dir() else None), dimred_params=dimred_params,
+        ens_src_which=tuning_ens_which, fs=_fs)
+    _n = min(X_stim.shape[0], Y_units.shape[0])   # crop to shared frames (repo may be full session)
+    if X_stim.shape[0] != Y_units.shape[0]:
+        print(f'  tuning: aligning conv {X_stim.shape[0]} / neural {Y_units.shape[0]} → {_n} frames')
+    X_stim, Y_units = X_stim[:_n], Y_units[:_n]
+    _lags = enc.f_lags_from_ms(tuning_lags_ms, _fs)
+    from threadpoolctl import threadpool_limits
+    tun_readouts = {}
+    with threadpool_limits(limits=max(1, (os.cpu_count() or 2) - 1)):
+        for _m in tuning_methods:
+            _fit = tun.f_reverse_corr_tuning(X_stim, filt_df, Y_units, _lags, method=_m)
+            tun_readouts[_m] = tun.f_tuning_readout(_fit, fs=_fs, labels=tun_labels)
+    _rd = tun_readouts[tuning_methods[-1]]        # display the last method (ridge by default)
+    _cols = ['unit', 'pref_odeg', 'pref_wavelength', 'pref_tfreq', 'peak_abs', 'peak_lag_ms',
+             'osi', 'sf_sel', 'tf_sel']
+    _cols = [c for c in _cols if c in _rd['table'].columns]
+    with pd.option_context('display.max_rows', None, 'display.width', 200):
+        print(f'{dset_tag} — {tuning_kind} tuning ({tun_kind}, {tuning_methods[-1]}, '
+              f'{Y_units.shape[1]} units):')
+        print(_rd['table'].sort_values('peak_abs', ascending=False)[_cols].to_string(index=False))
+
+
+#%% Tuning — plots (population + example units + STA vs ridge)
+if 1:
+    tuning_plot_z = True            # z-score tuning across filters for the heatmap + all-filters bars
+                                    #   (peak in SD units, scale-free vs cross-frequency magnitude)
+    _rd = tun_readouts[tuning_methods[-1]]
+    encp.f_plot_tuning_population(_rd['table'], dset_tag=f'{dset_tag} {tuning_kind}', method=_rd.get('method', ''))
+    encp.f_plot_tuning_marginals(_rd, u=None, dset_tag=f'{dset_tag} {tuning_kind}')   # population mean
+    encp.f_plot_tuning_lags(_rd, dset_tag=f'{dset_tag} {tuning_kind}')                # tuning strength vs lag
+    _top = _rd['table'].sort_values('peak_abs', ascending=False).index.to_numpy()[:3]   # 3 strongest
+    for _u in _top:
+        encp.f_plot_tuning_heatmap(_rd, int(_u), dset_tag=f'{dset_tag} {tuning_kind}',
+                                   zscore=tuning_plot_z)                                    # ori × wl grid
+        encp.f_plot_tuning_allfilters(_rd, int(_u), dset_tag=f'{dset_tag} {tuning_kind}',
+                                      zscore=tuning_plot_z)                                 # ALL filters, selected marked
+    if len(tuning_methods) >= 2 and 'sta' in tun_readouts and 'ridge' in tun_readouts:
+        encp.f_plot_tuning_compare(tun_readouts['sta'], tun_readouts['ridge'], dset_tag=f'{dset_tag} {tuning_kind}')
+    # STA: for the top unit, show WHICH high-activity frames drive the average, on the activity trace
+    if 'sta' in tun_readouts:
+        sta_trigger_pct = 90                      # frames above this activity percentile = 'triggers'
+        _sr = tun_readouts['sta']; _sk = _sr.get('keep_cells')
+        _Yk = Y_units[:, np.asarray(_sk, bool)] if _sk is not None else Y_units
+        _uS = int(_sr['table'].sort_values('peak_abs', ascending=False).index[0])   # top unit
+        _ftS = frame_t if len(frame_t) == Y_units.shape[0] else None
+        #encp.f_plot_sta_triggers(_Yk[:, _uS], frame_t=_ftS, thresh_pct=sta_trigger_pct,
+        #                    dset_tag=f'{dset_tag} u{_sr["table"].iloc[_uS]["unit"]}')
+
+
+#%% Tuning — VERIFY in monitor space: WHERE the tuning sits + the selected feature (re-reads repo)
+# For the top ensembles, load the PREFERRED filter's responses from the conv_repo and show (a) the
+# LOCATION map (reverse-corr of each screen location with the unit activity → RF blob) and (b) the
+# activity-weighted STA (the selected feature rendered in monitor shape) — eyeball verification.
+if 1:
+    # plt.close('all')
+    tuning_verify_n     = 2      # # top ensembles to verify (each re-reads the repo — a bit slow)
+    tuning_loc_ds       = 8      # spatial stride for the LOCATION map (larger = coarser/faster)
+    tuning_sta_frame_ds = 20     # read every Nth frame for the STA (larger = faster/less RAM)
+    tuning_side         = 'both' # 'both' = L‖R monitors side by side (wide) | 'L' | 'R'
+    tuning_monitor_z    = True   # z-score the monitor maps across pixels (SD units, diverging) so
+                                 #   absolute magnitude doesn't set the color scale
+    _rd = tun_readouts[tuning_methods[-1]]
+    _keep = _rd.get('keep_cells')
+    _Ykept = Y_units[:, np.asarray(_keep, bool)] if _keep is not None else Y_units   # kept-unit activity
+    _topv = _rd['table'].sort_values('peak_abs', ascending=False).index.to_numpy()[:tuning_verify_n]
+    for _u in _topv:
+        _u = int(_u); _frow = tun.f_preferred_filt_row(_rd, _u); _act = _Ykept[:, _u]
+        _lab = _rd['table'].iloc[_u]['unit']
+        _tfv = _frow.get('tfreq', np.nan)                 # meng: show the preferred temporal freq
+        _tfs = f' tf{_tfv:g}' if not (_tfv is None or (isinstance(_tfv, float) and np.isnan(_tfv))) else ''
+        _tag = (f'{dset_tag} {tuning_kind} u{_lab} (o{_frow["odeg"]:.0f} wl{_frow["wavelength"]:g}{_tfs}) '
+                f'[{_rd.get("method", "")}]')
+        try:
+            _nmon = 2 if tuning_side == 'both' else 1
+            _mlab = ['L', 'R'] if tuning_side == 'both' else [tuning_side]
+            _loc = tun.f_tuning_location_map(_repo_dir, _frow, _act, ds=tuning_loc_ds, side=tuning_side)
+            if _loc is not None:
+                encp.f_plot_tuning_monitor(_loc, dset_tag=_tag, title=f'location (corr, {tuning_side})',
+                                      diverging=True, n_monitors=_nmon, labels=_mlab, zscore=tuning_monitor_z)
+            _sta = tun.f_tuning_feature_sta(_repo_dir, _frow, _act, frame_ds=tuning_sta_frame_ds, side=tuning_side)
+            if _sta is not None:
+                encp.f_plot_tuning_monitor(_sta, dset_tag=_tag, title=f'preferred-filter STA ({tuning_side})',
+                                      diverging=False, n_monitors=_nmon, labels=_mlab, zscore=tuning_monitor_z)
+        except Exception as _e:
+            print(f'  tuning verify u{_lab}: skipped ({type(_e).__name__}: {_e})')
+
+    # (viz) a gabor KERNEL centered on a blank monitor frame — to eyeball its SPATIAL SCALE
+    # (σ = sigma_scale·wavelength) relative to the monitor. Spatial kernel is the same for gabor and
+    # meng (Adelson-Bergen uses a gabor spatial front-end). By default uses the top unit's PREFERRED
+    # filter; set kern_wl / kern_odeg to OVERRIDE and draw any size you want (kern_wl can be a LIST
+    # to compare sizes side by side).
+    if 0:
+        import matplotlib.pyplot as plt
+        kern_wl          = None      # None = preferred wavelength | a number | a LIST e.g. [6, 12, 24]
+        kern_odeg        = None      # None = preferred orientation (deg) | a number
+        kern_sigma_scale = 0.5       # σ = sigma_scale·wavelength (registry default 0.5)
+        kern_aspect      = 16 / 9    # display each monitor at this W:H (physical); None = square render grid
+        _fr = tun.f_preferred_filt_row(_rd, int(_topv[0]))
+        _odeg = float(_fr['odeg']) if kern_odeg is None else float(kern_odeg)
+        _wls = ([float(_fr['wavelength'])] if kern_wl is None
+                else ([float(w) for w in kern_wl] if np.ndim(kern_wl) else [float(kern_wl)]))
+        _mon_hw = (render_vert_samp, render_lat_samp)      # one monitor (H, W render resolution)
+        _ch, _cw = _mon_hw; _th = np.radians(_odeg)
+        _nc = len(_wls)
+        fig, _axes = plt.subplots(1, _nc, figsize=(4.2 * _nc, 4.4), squeeze=False)
+        for _ax, _wl in zip(_axes[0], _wls):
+            _sig = kern_sigma_scale * _wl
+            _ev, _od = vf._gabor_pair(_th, _wl, _sig, 1.0)     # even (cosine-phase) kernel
+            _kh, _kw = _ev.shape
+            _canvas = np.zeros(_mon_hw, np.float32)            # blank ONE-monitor frame
+            _ys, _xs = max(0, (_ch - _kh) // 2), max(0, (_cw - _kw) // 2)   # center-embed (crop if bigger)
+            _kys, _kxs = max(0, (_kh - _ch) // 2), max(0, (_kw - _cw) // 2)
+            _hh, _ww = min(_kh, _ch), min(_kw, _cw)
+            _canvas[_ys:_ys + _hh, _xs:_xs + _ww] = _ev[_kys:_kys + _hh, _kxs:_kxs + _ww]
+            _v = float(np.abs(_ev).max()) or 1.0
+            _ax.imshow(_canvas, cmap='RdBu_r', vmin=-_v, vmax=_v, interpolation='nearest')
+            if kern_aspect:                                # stretch square render grid → physical W:H
+                _ax.set_aspect((_cw / _ch) / kern_aspect)
+            _ax.set_title(f'o{_odeg:.0f} wl{_wl:g}  σ={_sig:g}px\nkernel {_kh}×{_kw} in {_ch}×{_cw}', fontsize=8)
+            _ax.set_xticks([]); _ax.set_yticks([])
+        fig.suptitle(f'{dset_tag} — gabor kernel(s) on monitor', fontsize=9)
+        fig.tight_layout()
 
 
 #%% Decode behavior from CEBRA embedding — time-blocked KNN cross-validation
 # =============================================================================
 # SECTION 4 · DECODING · core — bar A/B, PCA sweep (R²+AUC), shuffled null
 # =============================================================================
+# takes neural data and embeds it with supervision from some behavior input.. 
+# then uses that data to decode behavior, complares to equivalent number of pca comp
+
+
 # The right A/B test: for each behavior feature, train a KNN regressor on the
 # embedding and predict the feature on held-out time blocks. Higher R² ⇒ the
 # CEBRA embedding (and thus the neural population, given CEBRA's supervision)
@@ -994,6 +1356,10 @@ bar_standardize    = True    # z-score embedding cols (train-fold stats) — sto
                              # one embedding axis from dominating KNN distance.
                              # (New default; the old cell did not standardize.)
 bar_embargo_sec    = 0.0     # purge gap (s) each side of the test block.
+bar_fold_scheme    = 'interleaved'  # 'contiguous' = whole-epoch folds |
+                             # 'interleaved' = chop into bar_n_blocks small blocks
+                             # round-robin'd to folds (no fold = one quiet/odd epoch).
+bar_n_blocks       = None    # interleaved only: # small blocks (None → n_folds*10).
 bar_detrend_sigma_sec = None # GLOBAL high-pass σ (s) for every target column;
                              # None = off. Use LARGE σ (~20–60 s) — behavior is
                              # slow. See #8/#10. Used only when bar_detrend_blocks
@@ -1007,13 +1373,13 @@ bar_detrend_blocks = None    # block-selective high-pass; overrides the global �
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Imaging fs for the sec→frame conversions (frame_t set in the build cell).
-_fs_bar = f_imaging_fs(frame_t)
+_fs_bar = dec.f_imaging_fs(frame_t)
 bar_embargo_fr     = int(round(bar_embargo_sec * _fs_bar))
 # Decoder FIR: lag-embed the embedding over a window (bidirectional). [0] = off.
-bar_lags           = f_lags_from_ms(list(range(-300, 301, 100)), _fs_bar)
+bar_lags           = dec.f_lags_from_ms(list(range(-300, 301, 100)), _fs_bar)
 
 # PCA-3 baseline on neural data — same out_dim as CEBRA.
-pca_neu = f_pca_prefix(Y_neu, 3)
+pca_neu = dec.f_pca_prefix(Y_neu, 3)
 
 # Which feature blocks (from built_blocks registry) to decode. Each entry
 # in target_blocks_bar gets its own bar group, with bars colored by embedding.
@@ -1022,6 +1388,7 @@ pca_neu = f_pca_prefix(Y_neu, 3)
 #   ['agg', 'motion']             — position vs velocity from same embeddings
 #   ['agg', 'motion', 'pix']      — three target groups, three bar clusters
 target_blocks_bar = ['agg', 'pix', 'grid', 'flow', 'gabor', 'meng']   # 'gabor'=edge energy, 'meng'=motion energy (A/B vs agg/pix)
+target_blocks_bar = [b for b in target_blocks_bar if b in built_blocks]   # keep only loaded blocks
 
 # How to aggregate per-column R² when a block has multiple output dims.
 # 'uniform_average'   — current default; each column counts equally. Drags
@@ -1029,7 +1396,8 @@ target_blocks_bar = ['agg', 'pix', 'grid', 'flow', 'gabor', 'meng']   # 'gabor'=
 # 'variance_weighted' — joint R² (task #26); weights each column by its
 #                       variance. More honest when high- and low-variance
 #                       targets are mixed (e.g. lat/vert vs presence).
-bar_multioutput = 'uniform_average'
+bar_multioutput = 'variance_weighted'   # 'uniform_average' = equal per-column mean |
+                                      # 'variance_weighted' = joint R² (high-variance cols dominate)
 bar_skip_presence = True       # drop binary 'pres_*' columns (degenerate under
                                # the R² metric); score presence via the AUC sweep.
 
@@ -1048,7 +1416,7 @@ for grp in target_blocks_bar:
     if bar_skip_presence:
         keep = [i for i, nm in enumerate(b['names']) if not nm.startswith('pres')]
         Xb = Xb[:, keep]
-    Xb = f_apply_block_detrend(Xb, grp, bar_detrend_blocks,   # #8/#10 high-pass
+    Xb = dec.f_apply_block_detrend(Xb, grp, bar_detrend_blocks,   # #8/#10 high-pass
                                bar_detrend_sigma_sec, _fs_bar)
     feats_to_decode.append((f'{grp} ({Xb.shape[1]}d)', Xb))
 
@@ -1067,18 +1435,19 @@ r2_table = np.zeros((len(feats_to_decode), len(embeddings)))
 r2_std   = np.zeros_like(r2_table)
 for i, (fname, target) in enumerate(feats_to_decode):
     for j, (ename, emb) in enumerate(embeddings):
-        m, s = f_blocked_cv_r2(emb, target, n_folds=5, decoder=bar_decoder,
+        m, s = ceb.f_blocked_cv_r2(emb, target, n_folds=5, decoder=bar_decoder,
                                k_nn=bar_k_nn, n_components=bar_n_components,
                                embargo=bar_embargo_fr,
                                standardize=bar_standardize,
                                multioutput=bar_multioutput, return_std=True,
-                               lags=bar_lags)
+                               lags=bar_lags,
+                               fold_scheme=bar_fold_scheme, n_blocks=bar_n_blocks)
         r2_table[i, j] = m
         r2_std[i, j]   = s
         print(f'  decode {fname:18s}  from  {ename:18s}  R² = {m:+.3f} ± {s:.3f}')
 
 # Grouped bar plot — feature groups × embeddings.
-f_plot_decode_bars(
+dec.f_plot_decode_bars(
     [n for n, _ in feats_to_decode], [n for n, _ in embeddings], r2_table, r2_std,
     title=f'{dset_tag}\ndecoding behavior from 3D embeddings '
           f'({bar_decoder}, k={bar_k_nn}, standardize={bar_standardize})')
@@ -1170,7 +1539,7 @@ if 1:
     # ─────────────────────────────────────────────────────────────────────────
 
     # Imaging sample rate from frame_times, for the sec→frame conversions above.
-    fs_img = f_imaging_fs(frame_t)
+    fs_img = dec.f_imaging_fs(frame_t)
     embargo_fr       = int(round(embargo_sec * fs_img))
     detrend_sigma_fr = (detrend_sigma_sec * fs_img) if detrend_sigma_sec else None
     # f_detrend_col is imported from f_feature_helpers (unified 2026-06-03;
@@ -1183,8 +1552,13 @@ if 1:
     # feature). [0] = instantaneous (old behavior). Lag-after-PCA; needs
     # pca_within_fold=False (else f_blocked_cv_r2 raises).
     decode_lags_ms = list(range(-300, 301, 100))
-    decode_lags    = f_lags_from_ms(decode_lags_ms, fs_img)
+    decode_lags    = dec.f_lags_from_ms(decode_lags_ms, fs_img)
     sweep_target_blocks = ['agg', 'pix', 'motion', 'pix_mot', 'beh', 'self_mot', 'grid', 'flow', 'gabor', 'meng']    # sweep over these ('gabor'=edge energy, 'meng'=motion energy)
+    # Keep only loaded blocks. A vis_sets BANK is stored as `<bank>:<cell>` keys, so match those too —
+    # f_run_decode_sweep expands the bank name itself (f_expand_blocks); a plain `in built_blocks`
+    # test drops it here before that can happen.
+    sweep_target_blocks = [b for b in sweep_target_blocks
+                           if b in built_blocks or any(k.startswith(b + ':') for k in built_blocks)]
                                             # All possible block names (must have been
                                             # built in the build cell — see its build_* knobs):
                                             #   'agg'      — per-side object POSITION
@@ -1240,7 +1614,7 @@ if 1:
     # 2026-06-03; logic preserved verbatim inside f_blocked_cv_r2.)
     def f_cv_r2_single(emb, y, n_folds=5, embargo=0, standardize=True,
                        Y_raw=None, n_pcs=None, task='regression', lags=None):
-        return f_blocked_cv_r2(emb, y, n_folds=n_folds, embargo=embargo,
+        return ceb.f_blocked_cv_r2(emb, y, n_folds=n_folds, embargo=embargo,
                                standardize=standardize, decoder=decoder,
                                ridge_alpha=ridge_alpha, k_nn=k_nn,
                                ridgecv_alphas=ridgecv_alphas, n_components=n_components,
@@ -1257,9 +1631,19 @@ if 1:
         'detrend_blocks': detrend_blocks, 'detrend_embedding': detrend_embedding,
         'pca_within_fold': pca_within_fold, 'decode_lags_ms': decode_lags_ms,
     }
+    # ── CPU cap ──────────────────────────────────────────────────────────────
+    # sklearnex/MKL/OpenMP otherwise grab EVERY core for the KNN/Ridge/PCA fits in
+    # the sweep → machine unresponsive / kernel crash. Cap the thread pools so
+    # `leave_cores_free` core(s) stay idle. threadpoolctl (a sklearn dep) limits
+    # BLAS / OpenMP / oneDAL threads at RUNTIME — no kernel restart / re-import.
+    leave_cores_free = 1
+    _n_threads = max(1, (os.cpu_count() or 2) - leave_cores_free)
+    from threadpoolctl import threadpool_limits
     t0 = time.perf_counter()
-    sweep = f_run_decode_sweep(built_blocks, Y_neu, frame_t, decode_cfg)
-    print(f'PCA decoding sweep ({decoder}): {time.perf_counter()-t0:.1f}s')
+    with threadpool_limits(limits=_n_threads):
+        sweep = dec.f_run_decode_sweep(built_blocks, Y_neu, frame_t, decode_cfg)
+    print(f'PCA decoding sweep ({decoder}, ≤{_n_threads}/{os.cpu_count()} threads): '
+          f'{time.perf_counter()-t0:.1f}s')
     # Unpack into the globals the plots + null / grid / diagnostic cells expect.
     r2_mat       = sweep['r2_mat'];         auc_mat = sweep['auc_mat']
     targets_all  = sweep['targets_all'];    targets_bin = sweep['targets_bin']
@@ -1270,21 +1654,46 @@ if 1:
     r2_pix = r2_mat[group_rows.get('pix', [])]
 
     # Heatmap — single overview (clipped ±0.5; dividers between feature groups).
-    f_plot_feature_heatmap(
+    dec.f_plot_feature_heatmap(
         r2_mat, n_pcs_sweep, [f'{g}:{n}' for g, n, _ in targets_all],
         group_sizes=[len(group_rows[g]) for g in sweep_groups_present],
         title=f'{dset_tag}\nper-feature blocked-CV R² (PCA → {decoder} decoding)',
         cbar_label='R²  (clipped at ±0.5)')
 
     # Per-feature R²-vs-n_pcs line plots, one panel per group.
-    f_plot_sweep_lines(n_pcs_sweep, r2_mat, targets_all, group_rows,
+    dec.f_plot_sweep_lines(n_pcs_sweep, r2_mat, targets_all, group_rows,
                        sweep_groups_present, dset_tag=dset_tag)
 
     # Aggregate decoding-performance-vs-n_pcs summary (2-axis: analog R² left,
     # binary AUC right) — see f_decoding.f_plot_decode_sweep_summary.
-    f_plot_decode_sweep_summary(n_pcs_sweep, r2_mat, group_rows,
+    dec.f_plot_decode_sweep_summary(n_pcs_sweep, r2_mat, group_rows,
                                 sweep_groups_present, targets_bin, auc_mat,
                                 dset_tag=dset_tag, decoder=decoder)
+
+
+#%% Score feature representations — one decode R² + encode r per built block
+# f_score_representations: decode_r2 (neural PCs → feature, leak-free within-fold PCA) +
+# encode_r_med (feature → neural, f_encode_per_neuron). Compact single-value-per-method format.
+# smp_compare=None scores EVERY loaded block (whatever feature_list built — gaborS/mengS/pix/…);
+# pass a list to restrict, e.g. ['gaborS', 'mengS', 'pix'] or +['agg','gabor','meng'] for grid-pooled.
+if 1:
+    from f_dataset_scan import f_score_representations
+    _fs = dec.f_imaging_fs(frame_t)
+    _emb = int(round(0.5 * _fs))
+    smp_compare = None      # None = every block in built_blocks; else a list of block names
+    smp_scores = f_score_representations(built_blocks, Y_neu, smp_compare, n_pcs=30,
+                                         lags_ms=(0, 100, 200), embargo=_emb, n_folds=5, fs=_fs)
+    print(smp_scores.to_string(index=False))
+    _d = smp_scores.set_index('method')
+    fig, ax = plt.subplots(1, 2, figsize=(11, 4.5), sharey=True)
+    _d['decode_r2'].plot.barh(ax=ax[0], color='steelblue')
+    ax[0].set_title('decode R²  (neural → feature)')
+    _d['encode_r_med'].plot.barh(ax=ax[1], color='indianred')
+    ax[1].set_title('encode r  (feature → neural)')
+    for a in ax:
+        a.axvline(0, color='gray', lw=0.6)
+    fig.suptitle(f'{dset_tag} — feature-representation scorecard (decode + encode)')
+    fig.tight_layout()
 
 
 #%% Shuffled-control null distribution for the PCA decoding sweep
@@ -1338,8 +1747,12 @@ null_cfg = {'n_shuffles': n_shuffles, 'shuffle_mode': shuffle_mode,
             'min_shift_frames': min_shift_frames, 'shuffle_seed': shuffle_seed,
             'independent_target_shifts': independent_target_shifts}
 print(f'shuffled-control sweep ({shuffle_mode}, n={n_shuffles}, decoder={decoder})...')
+# Same CPU cap as the sweep cell — leave a core free (see leave_cores_free there).
+from threadpoolctl import threadpool_limits
+_n_threads = max(1, (os.cpu_count() or 2) - globals().get('leave_cores_free', 1))
 t_null = time.perf_counter()
-null = f_run_decode_null(sweep, built_blocks, Y_neu, null_cfg)
+with threadpool_limits(limits=_n_threads):
+    null = dec.f_run_decode_null(sweep, built_blocks, Y_neu, null_cfg)
 r2_mat_null  = null['r2_mat_null']
 auc_mat_null = null['auc_mat_null']
 print(f'shuffled-control total: {time.perf_counter()-t_null:.1f}s')
@@ -1355,7 +1768,7 @@ print(f'shuffled-control total: {time.perf_counter()-t_null:.1f}s')
 
 # Combined 2-axis real-vs-null figure (analog R² left, binary AUC right) —
 # see f_decoding.f_plot_decode_real_vs_null.
-f_plot_decode_real_vs_null(n_pcs_sweep, r2_mat, r2_mat_null, group_rows,
+dec.f_plot_decode_real_vs_null(n_pcs_sweep, r2_mat, r2_mat_null, group_rows,
                            sweep_groups_present, targets_bin, auc_mat, auc_mat_null,
                            dset_tag=dset_tag, decoder=decoder,
                            shuffle_mode=shuffle_mode, n_shuffles=n_shuffles)
@@ -1364,7 +1777,7 @@ f_plot_decode_real_vs_null(n_pcs_sweep, r2_mat, r2_mat_null, group_rows,
 # Reads as "how much R² each feature gains over chance, at each n_pcs."
 null_mean_per_feat = r2_mat_null.mean(axis=0)        # (n_features, n_pcs)
 delta = r2_mat - null_mean_per_feat
-f_plot_feature_heatmap(
+dec.f_plot_feature_heatmap(
     delta, n_pcs_sweep, [f'{g}:{n}' for g, n, _ in targets_all],
     group_sizes=[len(group_rows[g]) for g in sweep_groups_present],
     title=f'{dset_tag}\nR²(real) − R²(null mean)  [{shuffle_mode}, {decoder}]',
@@ -1383,7 +1796,7 @@ f_plot_feature_heatmap(
 #                view.
 
 # Per-feature 2×N grid (raw R² + null band; ΔR²) — one column per group.
-f_plot_perfeature_null_grid(n_pcs_sweep, r2_mat, r2_mat_null, group_rows,
+dec.f_plot_perfeature_null_grid(n_pcs_sweep, r2_mat, r2_mat_null, group_rows,
                             sweep_groups_present, targets_all, dset_tag=dset_tag,
                             decoder=decoder, shuffle_mode=shuffle_mode,
                             n_shuffles=n_shuffles)
@@ -1400,7 +1813,7 @@ if save_decode:
     from f_decode_cache import f_save_decode, f_decode_path
     _dmeta = {'mouse_id': mouse_id, 'n_dset': n_dset, 'dset_name': est1['dset_name'],
               'region': None, 'n_cells': int(Y_neu.shape[1]),
-              'fs': float(f_imaging_fs(frame_t)), 'n_frames': int(frame_t.shape[0])}
+              'fs': float(dec.f_imaging_fs(frame_t)), 'n_frames': int(frame_t.shape[0])}
     _dpath = f_decode_path(decode_dir, mouse_id, est1['dset_name'], decode_tag)
     f_save_decode(_dpath, sweep, null, meta=_dmeta, gen_config=decode_cfg)
     print(f'saved decode [{decode_tag}] -> {_dpath}')
@@ -1454,7 +1867,7 @@ if 1:
     # Raw (undetrended) target columns for the chosen blocks — detrending is
     # applied per grid cell below so each σ gets its own high-pass. (fs omitted →
     # build_target_columns returns raw columns; presence included, like before.)
-    grid_targets_raw = build_target_columns(built_blocks, grid_blocks)
+    grid_targets_raw = dec.build_target_columns(built_blocks, grid_blocks)
     grid_names       = [n for _, n, _ in grid_targets_raw]
     grid_feat_labels = [f'{g}:{n}' for g, n, _ in grid_targets_raw]
     n_gf             = len(grid_targets_raw)
@@ -1489,7 +1902,7 @@ if 1:
         for grp, _, yraw in grid_targets_raw:
             _apply = (ds_fr is not None) and (grid_detrend_blocks is None
                                               or grp in grid_detrend_blocks)
-            ys.append(f_detrend_col(yraw, ds_fr) if _apply else yraw)
+            ys.append(fh.f_detrend_col(yraw, ds_fr) if _apply else yraw)
 
         # real
         for fi, y in enumerate(ys):
@@ -1522,9 +1935,9 @@ if 1:
 
     # Δ R² heatmap over the grid (with p<0.05 stars) + focus-feature rescue
     # line plots — see f_decoding.f_plot_grid_delta_heatmap / _focus_lines.
-    f_plot_grid_delta_heatmap(grid_delta, grid_p, combo_labels, grid_feat_labels,
+    dec.f_plot_grid_delta_heatmap(grid_delta, grid_p, combo_labels, grid_feat_labels,
                               dset_tag=dset_tag, n_pcs_grid=n_pcs_grid, decoder=decoder)
-    f_plot_grid_focus_lines(detrend_grid, embargo_grid, combos, grid_real,
+    dec.f_plot_grid_focus_lines(detrend_grid, embargo_grid, combos, grid_real,
                             focus_null_all, focus_feats, grid_names,
                             dset_tag=dset_tag, n_pcs_grid=n_pcs_grid)
 
@@ -1587,7 +2000,7 @@ if 1:
     # f_blocked_cv_r2(return_predictions=True), so the fold / embargo / standardize
     # logic matches the sweep exactly (the re-rolled _fit_fold loop is gone).
     def _diag_cv(npc):
-        return f_blocked_cv_r2(pca_neu_full[:, :npc], y_diag, n_folds=diag_n_folds,
+        return ceb.f_blocked_cv_r2(pca_neu_full[:, :npc], y_diag, n_folds=diag_n_folds,
                                embargo=embargo_fr, standardize=standardize_emb,
                                decoder=decoder, ridge_alpha=ridge_alpha, k_nn=k_nn,
                                return_predictions=True, lags=decode_lags)
@@ -1679,7 +2092,7 @@ if 1:
     # train R² low (e.g. ~0.3 even at k=50) the feature is only weakly/linearly
     # in the neural PCs at all; the OOF (test) being negative on top of that is
     # then weak-signal + blocked-CV pessimism rather than pure overfitting.
-    ins = f_insample_predict(pca_neu_full[:, :diag_insample_n_pcs], y_diag,
+    ins = dec.f_insample_predict(pca_neu_full[:, :diag_insample_n_pcs], y_diag,
                              decoder=decoder, ridge_alpha=ridge_alpha, k_nn=k_nn,
                              standardize=standardize_emb)
     print(f'  in-sample TRAIN R² @k={diag_insample_n_pcs}: {ins["r2"]:+.3f}')
@@ -1759,16 +2172,16 @@ if 1:
     if pred_block not in built_blocks:
         raise ValueError(f'block {pred_block!r} not built; have {list(built_blocks)}')
     _b = built_blocks[pred_block]
-    _sig_fr = f_resolve_detrend_sigma(pred_block, detrend_blocks,
+    _sig_fr = fh.f_resolve_detrend_sigma(pred_block, detrend_blocks,
                                       detrend_sigma_sec, fs_img)
     _oof_targets = []
     for ci in range(min(pred_max_feats, _b['X'].shape[1])):
         y = _b['X'][:, ci]
         if _sig_fr:
-            y = f_detrend_col(y, _sig_fr)
+            y = fh.f_detrend_col(y, _sig_fr)
         _oof_targets.append((_b['names'][ci], y))
 
-    f_plot_oof_trace_scatter(
+    dec.f_plot_oof_trace_scatter(
         emb_diag, _oof_targets, t_img_plot,
         dset_tag=dset_tag, emb_tag=emb_tag, block_label=pred_block,
         n_folds=n_folds, embargo=embargo_fr, standardize=standardize_emb,
@@ -1797,11 +2210,11 @@ if 1:
 
 if 1:
     dist_name = side_feat_names_single[3]   # 'dist' or 'ang_size'
-    f_plot_input_raster(
+    dec.f_plot_input_raster(
         S_raster, t_img_plot,
         built_blocks['agg']['X'], built_blocks['pix']['X'],
         side_tags, n_per_side, dist_name=dist_name, n_pix_plot=3,
-        dset_tag=dset_tag, side=side, agg_mode=agg_mode)
+        dset_tag=dset_tag, side=side, agg_mode=build_cfg['agg_mode'])
 
 
 #%% Diagnostic — generic feature-block viewer (plot ANY block's channels)
@@ -1820,11 +2233,13 @@ if 1:
     plot_block_heatmap = None      # None=auto | True=heatmap | False=lines
     plot_block_maxlines = 14       # d <= this → line traces, else heatmap
 
-    if plot_block_name not in built_blocks:
-        raise ValueError(f'{plot_block_name!r} not in built_blocks: '
-                         f'{list(built_blocks)}')
+    if plot_block_name not in built_blocks:                      # fall back to a loaded block
+        _fallback = next(iter(built_blocks))
+        print(f'{plot_block_name!r} not loaded; showing {_fallback!r} instead '
+              f'(available: {list(built_blocks)})')
+        plot_block_name = _fallback
     _pb = built_blocks[plot_block_name]
-    f_plot_block_traces(
+    dec.f_plot_block_traces(
         _pb['X'], _pb['names'], t_img_plot,
         S_sorted=(S_raster if plot_block_raster else None),
         title=f'{dset_tag}: block {plot_block_name!r} '
@@ -1869,11 +2284,11 @@ cum_shuf_runs = np.zeros((n_shuffles, max_k))
 _rng_pca = np.random.default_rng(42)
 _min_shift_pca = 0
 for s in range(n_shuffles):
-    Y_shuf = f_shuffle_neural(Y_neu, _rng_pca, min_shift=_min_shift_pca)
+    Y_shuf = dec.f_shuffle_neural(Y_neu, _rng_pca, min_shift=_min_shift_pca)
     cum_shuf_runs[s] = PCA(n_components=max_k, random_state=42).fit(Y_shuf) \
                           .explained_variance_ratio_.cumsum()
 ks = np.arange(1, max_k + 1)
-f_plot_real_vs_shuffle_line(
+dec.f_plot_real_vs_shuffle_line(
     ks, cum_real, cum_shuf_runs, xlabel='# neural PCs',
     ylabel='R² of reconstruction (cumulative explained variance)',
     title=f'{dset_tag}\nNeural PCA reconstruction R²  '
@@ -1945,18 +2360,18 @@ skip_presence_dec = True       # drop binary 'pres_*' columns from the target.
 # elif target_choice == 'both':    target_dec = np.concatenate([X_agg, X_pix], axis=1)
 
 if target_choice is not None:
-    target_blocks_dec = legacy_target_blocks(target_choice)
+    target_blocks_dec = dec.legacy_target_blocks(target_choice)
     print(f'  legacy target_choice={target_choice!r} → target_blocks_dec={target_blocks_dec!r}')
 
 # Imaging fs for sec→frame conversions.
-_fs_dec = f_imaging_fs(frame_t)
+_fs_dec = dec.f_imaging_fs(frame_t)
 embargo_fr_dec = int(round(embargo_sec_dec * _fs_dec))
 # Decoder FIR: lag-embed the neural PCs over a window (bidirectional). [0] = off.
-decode_lags_dec = f_lags_from_ms(list(range(-300, 301, 100)), _fs_dec)
+decode_lags_dec = dec.f_lags_from_ms(list(range(-300, 301, 100)), _fs_dec)
 
 # Concatenated multi-output target, block-selectively high-passed (#8/#10).
 # Old single-call form: target_dec, _ = combine_blocks(target_blocks_dec)
-target_dec, target_dec_names = build_target_matrix(
+target_dec, target_dec_names = dec.build_target_matrix(
     built_blocks, target_blocks_dec, detrend_blocks=detrend_blocks_dec,
     detrend_sigma_sec=detrend_sigma_sec_dec, fs=_fs_dec,
     skip_presence=skip_presence_dec)
@@ -1970,7 +2385,7 @@ target_label_dec = '+'.join(target_blocks_dec)
 # within-fold-PCA options.
 def _cv_r2_multi(emb, target, n_folds=5, alpha=1.0, multioutput='uniform_average',
                  embargo=0, standardize=True, Y_raw=None, n_pcs=None, lags=None):
-    return f_blocked_cv_r2(emb, target, n_folds=n_folds, embargo=embargo,
+    return ceb.f_blocked_cv_r2(emb, target, n_folds=n_folds, embargo=embargo,
                            standardize=standardize, decoder=decoder_dec,
                            ridge_alpha=alpha, k_nn=k_nn_dec,
                            n_components=n_components_dec,
@@ -1980,7 +2395,7 @@ def _cv_r2_multi(emb, target, n_folds=5, alpha=1.0, multioutput='uniform_average
 max_pcs_dec = max(n_pcs_sweep_dec)
 
 # Real
-pca_real_full = f_pca_prefix(Y_neu, max_pcs_dec)
+pca_real_full = dec.f_pca_prefix(Y_neu, max_pcs_dec)
 r2_real_dec = np.array([_cv_r2_multi(pca_real_full[:, :k], target_dec, n_folds, ridge_alpha,
                                       multioutput=multioutput_dec,
                                       embargo=embargo_fr_dec, standardize=standardize_dec,
@@ -1994,8 +2409,8 @@ t0 = time.perf_counter()
 _rng_dec = np.random.default_rng(42)
 _min_shift_dec = 0
 for s in range(n_shuf_dec):
-    Y_shuf = f_shuffle_neural(Y_neu, _rng_dec, min_shift=_min_shift_dec)
-    pca_shuf_full = f_pca_prefix(Y_shuf, max_pcs_dec)
+    Y_shuf = dec.f_shuffle_neural(Y_neu, _rng_dec, min_shift=_min_shift_dec)
+    pca_shuf_full = dec.f_pca_prefix(Y_shuf, max_pcs_dec)
     for ki, k in enumerate(n_pcs_sweep_dec):
         r2_shuf_runs_dec[s, ki] = _cv_r2_multi(pca_shuf_full[:, :k], target_dec, n_folds, ridge_alpha,
                                                 multioutput=multioutput_dec,
@@ -2003,7 +2418,7 @@ for s in range(n_shuf_dec):
                                                 lags=decode_lags_dec)
     print(f'  shuffle {s+1}/{n_shuf_dec}  cumulative {time.perf_counter()-t0:.1f}s')
 _valid_dec = int((~np.isnan(target_dec).any(axis=1)).sum())
-f_plot_real_vs_shuffle_line(
+dec.f_plot_real_vs_shuffle_line(
     n_pcs_sweep_dec, r2_real_dec, r2_shuf_runs_dec, xlabel='# neural PCs',
     ylabel=f'blocked-CV R²  ({decoder_dec} α={ridge_alpha}, '
            f'multioutput={multioutput_dec}, standardize={standardize_dec})',
@@ -2066,7 +2481,7 @@ input_source       = 'pca_neural'  # 'pca_neural' | 'cebra:<name>' | 'block:<nam
                                 #                    — sanity test: reconstruct a monitor target
                                 #                    from a DIFFERENT monitor representation.
                                 #   'pix_pca'      — back-compat alias for 'block:pix'.
-target_blocks      = ['agg']    # list of block names from built_blocks registry
+target_blocks      = ['gaborS']    # list of block names from built_blocks registry
                                 # Examples:
                                 #   ['agg']                — position channels
                                 #   ['motion']             — velocity channels
@@ -2145,13 +2560,13 @@ from sklearn.cross_decomposition import PLSRegression, CCA
 # elif target_choice_rec == 'both':      target_rec = np.concatenate([X_agg, X_pix], axis=1); target_names_rec = list(agg_feat_names) + [f'pix_PC{i+1}' for i in range(X_pix.shape[1])]
 
 if target_choice_rec is not None:
-    target_blocks = legacy_target_blocks(target_choice_rec)
+    target_blocks = dec.legacy_target_blocks(target_choice_rec)
     print(f'  legacy target_choice_rec={target_choice_rec!r} → target_blocks={target_blocks!r}')
 
 # Concatenated target (fresh array — no view mutation), optionally dropping the
 # binary presence channels. No detrend here (fs omitted). skip_presence affects
 # both the decoder fit and the plots.
-target_rec, target_names_rec = build_target_matrix(
+target_rec, target_names_rec = dec.build_target_matrix(
     built_blocks, target_blocks, skip_presence=skip_presence)
 
 # Build decoder input based on input_source.
@@ -2159,12 +2574,12 @@ if input_source == 'pca_neural':
     if use_shuffle:
         # uniform circshift null (seeded rng).
         _rng_rec = np.random.default_rng(shuf_seed)
-        Y_use = f_shuffle_neural(Y_neu, _rng_rec, min_shift=0)
+        Y_use = dec.f_shuffle_neural(Y_neu, _rng_rec, min_shift=0)
         src_tag = 'SHUFFLED neural (per-cell circshift)  ←  PCA'
     else:
         Y_use = Y_neu
         src_tag = 'real neural  ←  PCA'
-    pca_rec_full = f_pca_prefix(Y_use, n_pcs_rec)
+    pca_rec_full = dec.f_pca_prefix(Y_use, n_pcs_rec)
 elif input_source.startswith('cebra_') or input_source.startswith('cebra:'):
     # Accepts either 'cebra:<name>' or legacy 'cebra_<name>'. Looks up the
     # corresponding entry in cebra_models. Any model name configured in
@@ -2220,12 +2635,12 @@ for f in range(n_folds_rec):
         continue
     # Estimator from the shared factory (pls/cca rank auto-clamped to the dims).
     if decoder_rec in ('pls', 'cca'):
-        _n_c = f_resolve_n_components(
+        _n_c = dec.f_resolve_n_components(
             n_components_pls if decoder_rec == 'pls' else n_components_cca,
             pca_rec_full.shape[1], target_rec.shape[1])
-        reg = make_decoder(decoder_rec, n_components=_n_c)
+        reg = dec.make_decoder(decoder_rec, n_components=_n_c)
     else:
-        reg = make_decoder(decoder_rec, ridge_alpha=ridge_alpha_rec, k_nn=k_nn_rec)
+        reg = dec.make_decoder(decoder_rec, ridge_alpha=ridge_alpha_rec, k_nn=k_nn_rec)
     Xin = pca_rec_full
     if standardize_rec:
         _mu = pca_rec_full[tr].mean(axis=0)
@@ -2244,11 +2659,11 @@ for f in range(n_folds_rec):
 # Figures via f_decoding plot helpers (scatter grid + temporal traces).
 _rec_tag = (f'target={"+".join(target_blocks)}  |  decoder={decoder_rec}  '
             f'|  input={src_tag}  |  in_dim={pca_rec_full.shape[1]}')
-f_plot_pred_scatter(target_rec, preds_rec, target_names_rec,
+dec.f_plot_pred_scatter(target_rec, preds_rec, target_names_rec,
                     suptitle=f'{dset_tag}\nreal vs predicted  |  {_rec_tag}',
                     max_panels=max_targets_plot)
 t_img = t_img_plot
-f_plot_pred_traces(target_rec, preds_rec, target_names_rec, t_img,
+dec.f_plot_pred_traces(target_rec, preds_rec, target_names_rec, t_img,
                    suptitle=f'{dset_tag}\ntemporal traces — real vs predicted  |  {_rec_tag}',
                    max_panels=max_targets_plot)
 
@@ -2286,7 +2701,7 @@ from scipy.spatial import procrustes
 #     ('CEBRA-agg',      np.asarray(cebra_agg['embedding'])),
 #     ('CEBRA-pix',      np.asarray(cebra_pix['embedding'])),
 # ]
-pca_neu3 = f_pca_prefix(Y_neu, 3)
+pca_neu3 = dec.f_pca_prefix(Y_neu, 3)
 embeddings_to_compare = [('PCA-3 (unsup)', pca_neu3)]
 for _cname, _m in cebra_models.items():
     embeddings_to_compare.append((f'CEBRA-{_cname}', np.asarray(_m['embedding'])))
@@ -2358,8 +2773,6 @@ else:
 # grouped per latent dim, active frames per dim, sorted-by-coeff raster.
 
 if 1:
-    from f_ensembles import f_ens_get_thresh, f_apply_thresh
-    from f_ensemble_plots import f_plot_ens_overview, f_plot_comp_scatter
     from sklearn.linear_model import Ridge
 
     # Pick which CEBRA model to dissect. Use the agg-supervised one by
@@ -2368,17 +2781,17 @@ if 1:
     cm = cebra_models[cebra_key]
     emb = cm['embedding']                         # (T, d_emb)
     scores_c = emb.T                              # (d_emb, T) — k × T
-    S = est1['S']                                  # (n_cells, T)
+    S = S_active                                   # (n_active, T) — silent cells dropped, matches emb
 
     # ridge fit: S.T (T, n_cells) on emb (T, d_emb)
     W = Ridge(alpha=1.0).fit(emb, S.T).coef_      # (n_cells, d_emb)
     coeffs_c = W
 
-    thresh_c, thresh_s = f_ens_get_thresh(
+    thresh_c, thresh_s = ens.f_ens_get_thresh(
         S, coeffs_c, scores_c, mode='signal_z',
         signal_z_thresh=2.5, dred_method='nmf',   # one-sided shuff doesn't apply
     )
-    ens_out_cebra = f_apply_thresh(coeffs_c, scores_c, thresh_c, thresh_s)
+    ens_out_cebra = ens.f_apply_thresh(coeffs_c, scores_c, thresh_c, thresh_s)
 
     # Decorate the dict so f_plot_ens_overview sees the same shape as a
     # regular f_ensemble_extract result.
@@ -2395,6 +2808,8 @@ if 1:
         print(f"  latent {i+1}: {len(ci)} cells, "
               f"{len(ens_out_cebra['trials']['ens_list'][i])} active frames")
 
-    f_plot_ens_overview(ens_out_cebra, S, mouse_dset_tag=dset_tag)
-    f_plot_comp_scatter(coeffs_c, ens_out_cebra['cells']['clust_ident'],
+    ensp.f_plot_ens_overview(ens_out_cebra, S, mouse_dset_tag=dset_tag, cmap=raster_cmap,
+                             **(dict(vmin=ens_vmin, vmax=ens_vmax) if ens_fix_scale
+                                else dict(vmax_pct=ens_vmax_pct)))
+    ensp.f_plot_comp_scatter(coeffs_c, ens_out_cebra['cells']['clust_ident'],
                         dim=3, title=f'{dset_tag} — CEBRA-{cebra_key} coeff scatter')

@@ -31,13 +31,14 @@ def _safe(name):
 
 
 def f_features_path(features_dir, mouse_id, dset_name, tag=None):
-    """Cache path for one dataset:
-    <dir>/<mouse>_<dset>[_<tag>]_features.joblib. `tag` = the feature-generation
-    version (GEN_TAG) so different configs coexist without overwrite."""
+    """Cache path for one dataset — all block caches live in ONE `cache/` subfolder (parallel to
+    `conv_repo/`), no per-dataset subfolders:
+    <dir>/cache/<mouse>_<dset>[_<tag>]_features.joblib. `tag` = the feature-generation version
+    (GEN_TAG) so different configs coexist without overwrite."""
     stem = f'{_safe(mouse_id)}_{_safe(dset_name)}'
     if tag:
         stem += f'_{_safe(tag)}'
-    return Path(features_dir) / f'{stem}_features.joblib'
+    return Path(features_dir) / 'cache' / f'{stem}_features.joblib'
 
 
 def f_features_exist(features_dir, mouse_id, dset_name, tag=None):
@@ -46,13 +47,14 @@ def f_features_exist(features_dir, mouse_id, dset_name, tag=None):
 
 
 def f_list_feature_files(features_dir, dset_name=None):
-    """Sorted list of *_features.joblib cache Paths in `features_dir`. If
-    `dset_name` is given, keep only those whose filename contains it. Returns []
-    when the directory is missing."""
+    """Sorted list of *_features.joblib cache Paths under `features_dir`, searched
+    RECURSIVELY so the per-dataset subfolders are found (and any legacy flat files too).
+    If `dset_name` is given, keep only those whose filename contains it. Returns [] when
+    the directory is missing."""
     features_dir = Path(features_dir)
     if not features_dir.is_dir():
         return []
-    files = sorted(features_dir.glob('*_features.joblib'))
+    files = sorted(features_dir.rglob('*_features.joblib'))
     if dset_name:
         files = [p for p in files if _safe(dset_name) in p.name]
     return files

@@ -1,0 +1,21 @@
+
+
+
+
+
+
+
+VR_feature_recon - analyzing which feature representation represents the stimulus best.
+	per feature method reconstruction r2 (cell 164)
+	per added pc recon (cell 214)
+	recon freames examples
+	per cv r2
+	test mov saving
+
+VR_feature_optim - given feature representations which parameters optimize it.
+	use optim outputs to plug into recon
+
+
+VR_feature_viz_conv_repo - analyze the magnitudes of feature intensities across params
+
+VR_feature_viz_cache - 

@@ -27,7 +27,7 @@ import gc
 import numpy as np
 import matplotlib.pyplot as plt
 
-from f_pipeline import f_load_session, f_build_features
+from f_pipeline import f_load_session, f_build_features, f_render_session
 from f_decoding import f_imaging_fs, f_lags_from_ms
 from f_feature_viz import f_plot_movie_frames_compare, f_pick_motion_frames
 from f_functions import f_save_mon_movie
@@ -52,6 +52,14 @@ obj_size     = {'x': 5, 'y': 20, 'z': 5, 'height': 2}
 dsets    = [4]           # e.g. [4] single | [4, 5, 6] pooled | [('L',4), ('M',2)] cross-mouse
 n_frames = 20000          # frame SUBSET PER session (contiguous, keeps meng temporal continuity)
 num_samp = 101
+
+# Feature source (SINGLE-session path only): 'build' = render + extract (unchanged) |
+# 'conv_repo' = still render the movie for the TARGET, but LOAD the feature blocks from a
+# conv_repo (skip re-extraction) — blocks named gaborS_ds*/mengS_ds* (point feature_sets at them).
+feat_source  = 'build'
+conv_tag     = 'gen_7_11_26'   # must match the conv_repo you built (folder <dset>_<conv_tag>)
+conv_ds_list = [8]        # sampling stride(s) loaded from the repo
+conv_n_pca   = 120
 
 # Target-movie smoothing (used by BOTH single + pooled paths).
 target_mode  = 'lowpass'   # 'lowpass' (acuity Gaussian) | 'rank' (drop pix) | 'raw'
@@ -90,13 +98,25 @@ if len(dsets) == 1:
     fs_img = f_imaging_fs(session['frame_t'])
     sigma_px = f_acuity_sigma_px(session['cam_params'], num_samp, cutoff_cpd)
     session_sub = f_truncate_session(session, n_frames)
-    built_blocks, frame_t, side_tags, two_mon_frames = f_build_features(session_sub, cfg)
+    if feat_source == 'build':
+        built_blocks, frame_t, side_tags, two_mon_frames = f_build_features(session_sub, cfg)
+    else:                                      # conv_repo: render for the target, LOAD features
+        from f_conv_repo import f_conv_repo_dir, f_load_conv_blocks
+        _l, _r, two_mon_frames = f_render_session(session_sub, cfg)
+        frame_t, side_tags = session_sub['frame_t'], ['L', 'R']
+        _repo = f_conv_repo_dir('F:/VR/features/' + _m, session['est1']['dset_name'], conv_tag)
+        built_blocks, _ = f_load_conv_blocks(_repo, conv_ds_list, n_pca=conv_n_pca)
+        _n = two_mon_frames.shape[0]           # repo maps are FULL-length → truncate to the subset
+        for _b in built_blocks.values():
+            _b['X'] = _b['X'][:_n]
     target = f_make_target(two_mon_frames, mode=target_mode, sigma_px=sigma_px,
                            rank=target_rank, n_target_pcs=n_target_pcs, n_mon=len(side_tags))
-    motion = f_motion_score(built_blocks, block='pix')
+    _mblk = 'pix' if 'pix' in built_blocks else next(iter(built_blocks))
+    motion = f_motion_score(built_blocks, block=_mblk)
     session_ids = None
     dset_tag = f"{_m} dset{_d}  {session['est1']['dset_name']}"
-    print(f'{dset_tag}: {session_sub["T_img"]} frames  movie {two_mon_frames.shape}')
+    print(f'{dset_tag}: {session_sub["T_img"]} frames  movie {two_mon_frames.shape}  '
+          f'feat_source={feat_source}')
 else:
     accs, sigma_px, fs_img, _names = [], None, None, []
     for _entry in dsets:
@@ -198,7 +218,7 @@ if 1:
 # Uses cv_kw / lags / motion / target from the decode cell above.
 if 1:
     sweep_block  = 'meng'
-    sweep_prefix = 'gabor_gabP'        # 'gabor_gabM' mag | 'gabor_gabP' phase | meng→None
+    sweep_prefix = 'meng_PC2'        # 'gabor_gabM' mag | 'gabor_gabP' phase | meng→None
     k_list       = [2, 5, 10, 15, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 
     pc_series    = ('pooled', 'high', 'low')        # ('pooled','per_fold','high','low')

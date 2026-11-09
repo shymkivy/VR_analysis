@@ -1717,3 +1717,850 @@ Next: run D1+D2 on a real session (build mode); relay AUDIT flags to researcher 
 Deferred D-items: D2 smoothness, D3 banded/variance-partition, D4 behavior bands
  (fwd/lat/yaw + capture-offset FIR), D6 per-cell lags, D7 estimator dual-readout (→P5), D8
  regime, D9 separable/generative.
+
+2026-07-10 P2 encoding spine — D2 nested guard + self_mot fwd/lat/yaw + D3 banded ridge
+(all synthetic-gated, NOT yet run on a real session):
+- D2 nested/held-out guard (researcher directive, P2 §7): f_encode_tune_sigma_lambda now SELECTS
+  (σ,λ) on the leading (1-report_frac) of time and REPORTS the winner on a held-out tail (embargo
+  gap between). New fields sel_r / report_r / report_r_per_cell; report_frac=0 → old single-split
+  behavior. Synthetic: select r=0.240 vs held-out report r=0.102 — the gap IS the removed
+  hyperparameter-selection optimism. Rationale: at N_neurons≈N_eff (P0), sweeping many
+  hyperparameters against OOF r overfits the hyperparameters even when each fit is CV'd.
+- self_mot fwd/lat/yaw decomposition (P2a-9, was required precursor to the partition):
+  f_self_motion_decomp = heading projection fwd=dx·cosφ+dz·sinφ, lat=−dx·sinφ+dz·cosφ, yaw=dφ
+  (old f_self_motion_features kept — it collapsed fwd+lat into one speed scalar). Wired via a
+  default-off self_motion_decomp knob in build_feature_blocks → f_pipeline. Synthetic-verified:
+  fwd²+lat²==speed² (orthogonal rotation), lat≈0 / fwd>0 for pure-forward motion, yaw identical
+  to the old block. Forward must be separated because forward self-motion drives looming/expanding
+  optic flow (dominant visual consequence of running at an object) while lat/yaw give different
+  flow geometry — collapsing them misattributes visual variance in the P2b-5 partition.
+- D3 banded ridge + variance partition (P2a-5 / P2b-1): BandedRidge (f_decoding) = separate L2 λ
+  per feature-space band, implemented as ordinary Ridge(α=1) on per-band column-rescaled design
+  X·diag(1/√α_b) then unscale weights (reuses sklearn solver; verified == closed-form
+  (XᵀX+diag(α))⁻¹Xᵀy on centered data). predict_band = additive per-band contribution (the
+  partition seam). Threaded 'banded' through make_decoder + f_blocked_cv_r2 (bands index emb
+  columns; survive standardize since columns aren't reordered; emb path only, no Y_raw/PCA).
+  Encoding wrappers: f_encode_banded (per-neuron banded CV, sel_range slab for the nested split),
+  f_encode_tune_bands (per-band α joint grid, same nested select/report guard),
+  f_encode_variance_partition (drop-one on the JOINT banded model → per-cell visual-unique /
+  behavior-unique / shared R²). Gate step 4 PASSED: planted vis+beh+noise → unique R² vis 0.734,
+  beh 0.270, noise −0.000 (redundant band zeroed), shared≈0 for independent bands. D3 driver cell
+  in VR_ca_encoding.py groups blocks into 'visual' vs 'behavior' bands (enable self_motion_decomp
+  for the honest closed-loop read).
+- Discussion (feature-opt objective): Chain-1 (feature→movie R²) certifies a feature set is a
+  faithful/sufficient STIMULUS representation and is a strong prior for the encoding basis (a
+  linear encoder can express any linear fn of the movie the neuron computes iff the basis spans
+  it). But Chain-1 optimum ≠ neural optimum: it measures completeness not neural-relevance, and R²
+  partly rewards capacity (more n_pca ⇒ better recon), so parsimony must come from elsewhere. A
+  neural-objective sweep (encoding / decoding / composite neuron→movie) is warranted to confirm
+  whether extra recon R² is information the brain uses — the sweep engine (f_sweep_recon) is
+  feature-agnostic so only the scorer swaps; f_feature_optim has a parked neural path. meng's low
+  Chain-1 R² does NOT by itself disqualify it as a neural target — depends on neural decodability.
+
+2026-07-16 — GPU feature-tuning scan (wide gabor/meng grid → per-cell & per-ensemble tuning):
+- Goal (distinct from cebra, which loads a known-good feature set for encode/decode): SURVEY a wide
+  gabor/motion-energy grid, generated as we go (no pre-built repo), and read out each cell's AND each
+  ensemble's preferred filter (orientation × wavelength [× tfreq]). GPU-accelerated (torch on the
+  3090); cupy rejected (not installed, no speed win, we parity-test anyway).
+- f_conv_gpu.py: torch conv mirroring the CPU math (reuses _gabor_pair/_temporal_quad as the math
+  source of truth). KEY parity fix: torch conv2d/conv1d is cross-correlation, scipy fftconvolve is
+  true convolution → FLIP kernels, else the meng opponent |R|²−|L|² negates (R/L swap). Verified
+  allclose vs CPU incl. sign (corr≈1.0000, rel ~1e-6..1e-5, within uint16 quant). Reduce-fused
+  batched f_gabor_activity_gpu (filters as conv2d out-channels → whole-monitor magnitude, no dense
+  materialization); meng shares the spatial gabor across tfreqs (each tfreq = a different temporal
+  quadrature conv = a gabor drifting at a different speed; preferred speed ≈ tfreq·wavelength px/frame,
+  opponent gives direction).
+- f_feature_scan.py: splits GENERATION (f_scan_conv_activity → X_stim (T,n_filt) whole-monitor
+  magnitude regressors, magnitude-ONLY, filt_batch = GPU resource knob, joblib cache, cpu fallback)
+  from a PLUGGABLE SCORER (f_score_scan). scorer='tuning' (v1) reuses f_tuning per source
+  (cells/ensembles); 'encode'/'decode' are stubbed extension points (will reuse f_score_representations
+  / f_run_encoder / f_run_decode_sweep) so encode/decode performance scans drop in WITHOUT touching
+  generation. f_filter_activity_maps re-convolves a unit's preferred filter on the fly (no stored
+  repo) for the monitor-space location/STA verify.
+- VR_feature_tuning.py: the cell-based driver (load → ensembles via f_ensemble_pipeline → render once
+  → GPU scan → tuning per cell+ensemble → plots → verify → cell↔ensemble summary).
+- Bonus: f_build_conv_repo gained backend='cpu'|'gpu' (+device) at the _spec_maps seam (parity 3.4e-5
+  rel vs CPU); VR_feature_gen cfg conv_backend='gpu'. So the existing dense-repo generation is now
+  GPU-accelerated too. filt_batch/backend must NOT change results (verified: Δ=0 across filt_batch).
+- Verified: GPU↔CPU conv parity (gabor+meng incl. sign), scan filt_batch-invariance (exact), GPU vs
+  CPU backend rel 2.7e-7, tuning scorer tables, encode/decode NotImplementedError stubs, dense-repo
+  GPU↔CPU parity. NOT yet run end-to-end on a real session (the compute is parity/smoke-tested on
+  synthetic movies; the script mirrors the proven cebra prelude + tuning cells).
+- GPU gabor scan speedup: 48 filters × 6000-frame × 101² × 2 sides → CPU 353s vs GPU 22.7s = 15.5×
+  (parity 9.4e-5). Scales further with full sessions + wider grids.
+
+2026-07-16 (follow-up) — resumable single-file scan store (crash-safe, widen-without-rescan, portable):
+- f_scan_conv_activity gained `scan_file` (joblib) — the whole bundle is REWRITTEN ATOMICALLY (temp +
+  os.replace) after EVERY batch, so a crash loses at most the in-flight batch, and a re-run SKIPS
+  filters already present (keyed by canonical identity kind_o{deg}_wl{λ}[_tf{f}]) → widen scan_specs
+  freely, old columns reused byte-for-byte (verified: resume identical; widen preserves all old cols).
+  Data stored RAW (transform applied, standardize deferred to assembly so it's not baked in).
+- The file is a SELF-CONTAINED artifact: `data` bundle embedded = dataset identity + frame_t/fs +
+  active_cells/cell_ids + dimred_params/seed, plus (store_neural=True, default) the cell traces
+  Y_neu_raw + ensemble outputs ens_out/ens_table. So reloading needs NO session reload / re-extraction;
+  store_neural=False keeps only identity+seed for deterministic regeneration (same seed → identical
+  ensembles). Rationale: the tuning readout depends on the neural + ensembles, so bundling them makes
+  the scan reproducible + portable across scripts.
+- Readers (safe to call mid-scan — atomic rewrite gives consistent snapshots): f_scan_load (X_stim/
+  filt_df, specs subset + standardize), f_scan_load_data (the bundle), f_scan_progress (counts +
+  remaining-vs-target), f_plot_scan_coverage (orientation×wavelength done-grid). New companion script
+  VR_feature_tuning_progress.py watches a running scan from another process → coverage + partial
+  tuning (using the embedded neural). Cost: full-file rewrite/batch (tens of MB w/ neural) — cheap;
+  raise filt_batch for fewer, larger saves.
+- Provenance + result persistence: the scan file's data bundle now also carries ens_params (the
+  enspipe apply+stats kwargs: signal_z/thresh_mode/cv_method/membership/consensus_frac/sig_method/…)
+  + dimred_params + seed, so a reload knows exactly HOW ens_out was made. f_save_scan_results /
+  f_load_scan_results persist the SCORER output for later re-plot with NO recompute — the fitted
+  ridge/STA RESPONSE W (n_filter,n_lags,n_units) + per-unit tables + marginals + all params (scan +
+  tuning + ens + seed). VR_feature_tuning.py writes <..>_tuning.joblib next to the scan file;
+  VR_feature_tuning_progress.py has an (if 0) cell to reload it and re-plot. Verified: W + params
+  round-trip byte-exact.
+
+2026-07-16 (follow-up 2) — FOV correction + physical (cyc/deg, Hz) filter units + sample_ds knob:
+- Rig FOV corrected: DEFAULT_CAM_PARAMS (f_pipeline.py) now FOV_axis='horizontal', FOV_deg=98.4 →
+  f_comp_FOV_adj derives vFOV=66.18° (matches measured rig 98.4/66.18 exactly; old vertical/65.9 gave
+  98.1/65.9). Unity clamps HORIZONTAL, derives vertical: FOV_V = 2·atan(tan(FOV_H/2)/aspect) — exactly
+  the f_comp_FOV_adj 'horizontal' branch. Angular ratio hFOV:vFOV = 1.487 (NOT 16:9=1.78) — so the
+  angularly-isotropic render is lat:vert≈1.49, e.g. 150×101 (deg/px≈0.656 both axes). VR_feature_gen
+  cam_params updated to match; VR_ca_analysis.py / VR_analysis.py still carry the old vertical/65.9
+  (their own inline copies — update if used). CONV_REPO must be regenerated (was 101×101 square).
+- f_scan_conv_activity `sample_ds` (int/(ds_h,ds_w)): point-samples the movie BEFORE conv → decouples
+  render (video-gen) pixelation from scan resolution (render once, scan coarser/faster). Baked into the
+  scan_file meta so resume is consistent.
+- PHYSICAL, resolution-independent filter units (f_conv_repo.f_conv_filter_specs_phys + f_deg_per_px):
+  specify gabor spatial freq in CYCLES/DEGREE ('sf_cyc_deg') + meng temporal freq in HZ ('tf_hz');
+  converted to px/frame via deg/px (from hFOV/vFOV + resolution × sample_ds) and fs
+  (wavelength_px=1/(sf·deg_per_px); tfreq_cpf=tf_hz/fs). Physical values (sf_cyc_deg/wl_deg/tf_hz) flow
+  into the scan filt_df and the tuning readout reports pref_sf_cyc_deg + pref_tf_hz. Verified: 0.04
+  cyc/deg → 38.1 px at 150×101 (exact); readout carries physical prefs. Comparable across
+  renders/datasets (mouse V1 SF peaks ~0.02-0.08 cyc/deg — the grid default spans 0.02-0.32).
+
+2026-07-16 (follow-up 3) — conv_repo + feature-plan fully migrated to PHYSICAL units:
+- Rig FOV corrected in the pipeline default: DEFAULT_CAM_PARAMS + VR_feature_gen cam_params =
+  horizontal/98.4 (→ vFOV 66.18). f_default_build_cfg render now 150×101 (was square 101).
+  VR_ca_analysis/VR_analysis keep their own old vertical/65.9 copies.
+- conv_repo built in cyc/deg + Hz: VR_feature_gen conv_specs use sf_cyc_deg/tf_hz;
+  f_build_conv_repo_one_dataset detects physical specs → f_conv_filter_specs_phys (converts at render
+  geometry + fs). f_build_conv_repo stores sf_cyc_deg/wl_deg/tf_hz in each manifest entry; _conv_filter
+  + f_load_conv_blocks gained sf_cyc_deg/tf_hz selectors (rounded 4/3 dp) → gaborS/mengS load by
+  physical units. Verified: sf 0.085→17.94px stored+selectable, tf_hz 2.0 selectable.
+- f_default_feature_plan: gabor/meng (build, grid) + gaborS/mengS (repo) + gaborS+mengS combine blocks
+  now specify sf_cyc_deg/tf_hz. Build path converts via _visual_spec_from_input(deg_per_px, fs) in
+  _resolve_build (deg/px from cam_params+resolution, fs from frame_t); repo path passes them to
+  _conv_filter. Verified build-path 0.13cyc/deg→11.73px, 2Hz→0.1333cpf.
+- IMPORTANT: existing conv_repos (px, 101×101) are incompatible — regenerate with VR_feature_gen
+  (physical conv_specs). Legacy px selectors (wavelengths/tfreqs) still accepted for old repos.
+  sf_cyc_deg/tf_hz are independent of the SAMPLING stride ds (spatial-output only); sf depends on
+  render deg/px + tf on fs, both converted so the physical value is render/framerate-invariant.
+2026-07-16 (follow-up 4) — dataset stats in the tuning scan:
+- f_scan_conv_activity spatial_mean=True: while convolving, also accumulate per-filter TIME-MEAN
+  magnitude map (L‖R hstacked), stored in the scan file → f_scan_spatial reads them. Shows WHERE each
+  filter's activity concentrates on the monitor (interpret tuning vs where/how often that feature
+  appeared — total time spent). f_conv_gpu.f_gabor_activity_gpu/f_meng_activity_gpu gained
+  return_spatial (accumulate sum-over-time/T); CPU path computes from the dense map.
+- f_scan_stats(scan_file, percentiles): per-filter magnitude distribution of the whole-monitor
+  regressor (RAW, pre-standardize) — mean/std/min/max + p5/p25/p50/p75/p95 — the conv-repo-style
+  magnitude analysis, one row per filter. Recompute-free (reads raw cols). VR_feature_tuning.py DATASET
+  STATS cell prints the table + plots the top-6-by-mean spatial activity maps. Verified on synthetic.
+- Scan diagnostic plots (f_feature_scan, driven by VR_feature_tuning_progress.py DATASET STATS cell):
+  f_plot_scan_magnitude (whole-monitor magnitude vs SF / orientation / TF, mean + p25-p75 band, per
+  kind — shows how well the gabor/meng bank responds across the grid), f_plot_scan_traces (magnitude
+  vs frame grouped by SF/TF, conv_repo-style temporal dynamics), f_plot_scan_spatial (overall + per-
+  group[odeg/tf] time-mean spatial maps → where activity sits). All read the scan file (neural-free,
+  safe mid-scan). Verified on synthetic.
+- Scan file is now a versioned artifact: f_scan_path(features_dir, dset_name, gen_tag, lat, vert,
+  sample_ds) → <features_dir>/scan/<dset>_<gen_tag>_<lat>x<vert>[_ds..]_scan.joblib (scan/ parallel to
+  conv_repo/). VR_feature_tuning.py sets scan_tag='gen_7_16_26'; gen_tag (+dset_name) embedded in the
+  file + CHECKED on resume (wrong tag raises). VR_feature_tuning_progress.py builds the SAME path from
+  the shared tag+resolution and shows gen_tag in the progress print. Verified: path, storage, guard.
+2026-07-16 (follow-up 5) — per-SF post-conv sampling + Nyquist limits + scan timing:
+- Post-conv sampling ds for gaborS/mengS (f_default_feature_plan): the point-sampled quantity is the
+  phase-invariant MAGNITUDE map, smooth on σ=sigma_scale·λ (0.5λ), so Nyquist FLOOR ds≲σ. f_ds_from_wl
+  (f_conv_repo) = Nyquist-matched per-filter stride; f_sample_conv_to_block `ds` now also accepts a
+  CALLABLE ds(entry); plan sample inputs take ds=int/(h,w)/'nyquist'(+ds_factor). Set gaborS/mengS
+  ds=2 (OVERSAMPLE ~3/σ, margin beyond Nyquist; raw cols ∝1/ds², PCA compresses). For the finest SF
+  0.13 cyc/deg at 150×101, σ≈5.9px so ds≲5.9 is the floor; ds=2 is safe for all.
+- f_scan_path gen_tag versioning (scan/ parallel to conv_repo/); scan file embeds+checks gen_tag.
+- f_feature_scan.f_nyquist_limits(cam_params, lat, vert, fs, sample_ds, temporal_support) → resolvable
+  sf_cyc_deg (+wavelength deg) / tf_hz for a render×downsample+fs combo (max sf=1/(2·deg_px_eff),
+  min λ=2px; max tf=fs/2, min tf=fs/support). VR_feature_tuning.py has an `if 0:` one-liner call.
+  At fs≈60, support=11 → min tf_hz≈5.45, so tf grids with 1-3 Hz are under-resolved (raise support).
+- f_scan_conv_activity verbose now prints per-batch + total CONVOLVE vs DISK-SAVE timing (filt/s) to
+  profile render/ds/batch. First GPU batch includes CUDA warmup (one-off).
+- Rig FOV = horizontal/98.4 (vFOV 66.18); render default 150×101 (deg/px 0.656, render Nyquist sf 0.76).
+- f_nyquist_limits SPEED line: speed(deg/s)=tf_hz/sf_cyc_deg (grating drifts at tf/sf along the
+  orientation normal); `sf_ref` param (default 0.1). So the min-resolvable tf sets the SLOWEST probed
+  speed at a given sf (e.g. 5.45Hz/0.1 ≈ 55 deg/s) — NOT 5 deg/s.
+- temporal_support='auto' (constant-cycle / constant-Q meng bank): f_auto_support(tf_hz, fs, n_cycles=2,
+  support_min=7, support_max=91) → per-tf support ≈ round(n_cycles·fs/tf), odd, clamped. Mirrors the
+  spatial gabor (σ=sigma_scale·λ = constant spatial cycles) so every tf spans the same #temporal cycles
+  (uniform bandwidth); fixed support instead under-resolves low tf (1Hz→0.18 cycle at support 11) and
+  over-narrows high tf. f_conv_filter_specs_phys emits per-tf support; the scan groups meng by
+  (θ,wl,output) — dropping support from the key — so per-tf support keeps sharing ONE spatial conv;
+  f_meng_maps_gpu / f_meng_activity_gpu / _meng_activity_cpu accept {tf:support}. At fs=60,n_cycles=2:
+  1Hz→91(capped, ~1.5 cyc; raise support_max to 120 for full 2), 3→41, 6→21, 9→13. Set 'auto' in the
+  tuning scan + VR_feature_gen conv_specs. GPU↔CPU parity verified.
+2026-07-16 (follow-up 6) — GPU OOM fix: STREAM the movie (long sessions):
+- Bug: f_conv_gpu moved the ENTIRE movie to the GPU (as_movie_tensor) and meng held the full-time
+  response there → on a long session (~140k frames at 150×101, one (T,H,W) float32 = 8.5 GB) the GPU
+  OOM'd, and filt_batch didn't help (the full-movie residency is fixed, not per-batch).
+- Fix: the movie stays on CPU in native dtype (uint8); only a chunk (+halo for meng's temporal conv)
+  is converted to float32 and moved to the GPU (`_to_chunk`). f_gabor_activity_gpu streams time-chunks;
+  f_meng_activity_gpu streams chunks WITH a temporal halo (=support//2), recomputing the cheap spatial
+  conv per chunk so the full-time field is never on the GPU. Dense f_gabor_map_gpu/f_meng_maps_gpu now
+  also stream and return CPU numpy (built chunk-by-chunk) — so the conv_repo GPU backend + verify don't
+  OOM either. Peak VRAM ∝ chunk_t·filt_batch·H·W — INDEPENDENT of session length. chunk_t default
+  4000→2000; `scan_chunk_t` knob in VR_feature_tuning.py. GPU↔CPU parity intact (rel ~2e-7).
+- gaborS/mengS generation: 'auto' origin loads the conv_repo if present else BUILDs on the fly
+  (render+extract). Repo built by VR_feature_gen (GEN_MODE='conv_repo', physical conv_specs + auto
+  support); cebra loads by sf_cyc_deg/tf_hz selectors. GEN_TAG + f_default_source tag bumped to
+  'gen_7_16_26' (physical repo, distinct from the old px/101 one). ds='nyquist' build-fallback
+  crashes avoided (single support sized for lowest tf).
+- Added a to-scale Gabor-kernel overlay to the Gabor sanity cell (VR_ca_encoding.py): kernels drawn
+  at true monitor-pixel footprint inside grid cells over a real frame (λ=6 ≈1 cell, λ=12 ≈2 cells
+  at the current defaults) — see gabor size vs pooling cell / monitor by eye.
+Next: run D1→D2→D3 on a real session (build mode, self_motion_decomp on); then D4 (task-event band
++ capture/offset FIR regressor) OR the neural-objective feature sweep. Deferred: D6/D7/D8/D9.
+
+2026-07-16 — anisotropic render/sampling + ensemble-workflow modularization:
+- Anisotropic monitor render + conv-sampling: the monitor is 16:9 (w:h) but the render maps angle→
+  pixel LINEARLY, so equal deg/px needs lat_samp:vert_samp = hFOV:vFOV ≈ 98:65.9 ≈ 1.49 (NOT 16:9;
+  e.g. 150×101), not square num_samp. Added lat_samp (width) / vert_samp (height) knobs: f_render_session
+  (f_pipeline) + f_default_build_cfg + both f_feature_gen build paths + the VR_feature_gen cfg (None→
+  num_samp). Sampling side: f_sample_conv_to_block / _make_reducer (f_visual_features) accept ds as a
+  scalar or (ds_h,ds_w) tuple; _norm_ds/_ds_tag helpers (f_conv_repo) → block name 'gaborS_ds8x16';
+  f_load_conv_blocks iterates ds_list element-wise (a single anisotropic stride must be WRAPPED
+  [(8,16)]). Manifest now records mon_hw = actual rendered (H,W) (f_conv_repo_meta falls back to
+  (num_samp,num_samp) for legacy repos). NOT yet done: regenerate data at a non-square resolution;
+  two downstream square-assumptions remain (cache-viz mon_hw=(num_samp,num_samp); f_plot_tuning_monitor
+  n_monitors inference) — patch when rendering at the new resolution.
+- f_ensemble_pipeline.py (new): factored the ensemble orchestration glue out of the VR_ca_cebra.py
+  APPLY/STATISTICS/ASSIGN cells so any script gets the workflow from one import (enspipe). Motivation:
+  VR_ca_dimred.py already had a second inline copy of the extract glue → divergence risk. Four drivers:
+  f_ensemble_apply (fit+threshold → ens_out, pristine ens_list_apply), f_ensemble_stats (membership +
+  per-ensemble CV score/significance → ens_table with the extraction-idx→true-neuron-ID map; mutates
+  ens_out in place; cheap to re-run), f_run_ensembles (one-call apply→stats→optional plots), f_neural_source
+  (ens_out/ens_table or dim-red mode → the reassigned decoder input Y_neu). Code moved VERBATIM; cebra
+  cells now just set param knobs + call the drivers (cell structure + cheap-iterate workflow preserved).
+  Synthetic smoke test recovers 3 planted ensembles (cv_r2≈0.998) and all neural_source modes give the
+  right shapes. VR_ca_dimred.py left as-is (its f_ensemble_extract calls serve a different purpose, no
+  shared stats/table glue). Next planned: same modularization treatment for feature loading.
+
+2026-07-17 — Cross-dataset per-neuron ENCODING sweep (VR_encode_scan.py + VR_encode_scan_plots.py +
+functions/f_encode_scan.py). New, ensemble-free, large-scale arm: loop mice × datasets and for EACH
+neuron record its OOF R² (+ Pearson r) regressing onto each feature BLOCK (agg / self_mot / pix /
+gaborS+mengS) under each MODEL (ridge, cca) — a per-neuron × block × model grid. Two scripts by design:
+SCRIPT 1 computes + saves scores only; SCRIPT 2 loads the file and plots scores vs neuron location.
+  Store: ONE tag-versioned, resumable joblib (mirror of the feature-tuning scan) — atomic temp+os.replace
+after EVERY (dataset, block, model) combo, skip-done keyed by (mouse, dset_name, block, model), so a
+crash/stop loses nothing and widening blocks/models only computes the new combos. It stores ONLY neuron
+indices (cell_ids into est1 rows) + per-combo r2/r/keep (length n_active, NaN where a cell was dropped)
++ dataset-identity params (mouse/n_dset/dset_name/n_cells_total/n_active/cell_ids/T/fs/…) for later
+verification. NO locations in script 1 (per the user).
+  Neural proxy = drop-silent → f_gauss_smooth → peak-normalize, NO hclust (rows stay in est1['A'] order
+so cell_ids index footprints directly). Features via f_resolve_features (build pix/agg/self_mot, load
+gaborS+mengS from the conv_repo). Each block scored ALONE (f_encode_per_neuron on [block]); model flows
+through to f_decoding.make_decoder. f_encode_prepare builds Y_enc+features ONCE per dataset, f_encode_one
+does one block×model fit and scatters kept-cell R² back to n_active — driver controls save cadence.
+  Locations (script 2 only): no centroids exist in the data — computed from est1['A'] (sparse footprints)
++ est1['dims'] as footprint center-of-mass (order='F'). Cross-dataset spatial comparison uses the manual
+4-corner FOV→widefield landmarks already in VR_data.xlsx (tp_fov_locs → wf_locs, per VR_register_2pfov.py):
+a numpy DLT homography maps each session's centroids onto the mouse's common widefield map. Registration
+is per-mouse (widefield image per mouse); cross-MOUSE atlas is out of scope. Script 2 reloads est1
+(behavior=False), verifies n_cells_total/dset_name against the stored record, then overlays per-neuron R²
+on the widefield map per (block, model) across a mouse's datasets. Significance (circshift null) left as a
+documented optional knob (user wanted "just the score").
+  Verified: store resume skips done combos, table indexes true cell_ids with NaN for dropped cells,
+homography maps the 4 corners exactly, and f_encode_one runs for ridge + cca (constant cell → NaN).
+Full end-to-end build not run in-session to avoid contending with the running tuning scan.
+
+2026-07-17 (cont.) — GPU backend for the feature-BUILD path (gabor/meng), so the encode scan
+(VR_encode_scan.py) builds visual features as fast as the tuning scan. The CPU build
+(f_visual_features.f_gabor_features / f_motion_energy_features via scipy.fftconvolve) both convolves
+slowly AND materializes the full dense (T,H,W) response per filter (~8.5 GB each at 140k×150×101) —
+the reason it was "super slow". Added f_conv_gpu.f_gabor_pooled_gpu / f_meng_pooled_gpu: stream time-
+chunks, convolve on GPU (torch), then apply the SAME numpy stat (chan) + spatial pool (_make_reducer)
+per chunk on the small per-chunk output — never materializing the full dense field, and reusing the
+CPU stat/pool as the single source of truth so parity is limited to the conv. Threaded a `backend`
+('cpu'|'gpu') + `device` through f_gabor_features / f_motion_energy_features → build_visual_blocks
+(injects for gabor/meng only) → f_pipeline.f_build_features (reads cfg['conv_backend']) →
+f_default_build_cfg (new 'conv_backend'/'conv_device' defaults, 'cpu'). VR_encode_scan.py exposes
+conv_backend='gpu'/conv_device='cuda' knobs. Default stays 'cpu' (cebra unaffected unless opted in).
+Parity verified GPU vs CPU allclose (rel ~1e-6) for gabor magnitude and meng opponent, both sample and
+grid pooling; column names identical. Note: this GPU-BUILDS the features on the fly (no conv_repo
+needed) — orthogonal to loading gaborS/mengS from a pre-built repo (which requires the repo at the
+matching tag; current repos are gen_7_11_26/101×101, not the gen_7_16_26/150×101 the scan expects).
+
+2026-07-17 (cont.) — Wired ENSEMBLES into the encode scan (VR_encode_scan.py) as a second unit
+SOURCE alongside raw cells. Per dataset, after building features + Y_enc (raw cells), ensembles are
+extracted ONCE via f_ensemble_pipeline.f_run_ensembles with general dimred_params + FAST stats
+(sig_method='cv', n_shuffle=0 → NO bootstrap/shuffle; plots OFF), and each ensemble's score trace is
+encoded exactly like a unit (ens_which='all' so we keep r2 for EVERY ensemble; significance flagged
+separately). The store gained a source dimension: _enc_key(mouse,dset,source,block,model); results
+carry per-unit r2/r/keep + labels (cells→true est1 id, ensembles→ensemble idx); datasets[dkey]['ens']
+= f_ensemble_record(ens_table,n_ens) (compact: sig/cv_r2/members, no full scores since the store is
+rewritten each combo). f_encode_scan_table now emits source/unit/sig columns (sig = ensemble
+significance, NaN for cells). Script 2 (VR_encode_scan_plots.py): locations join only CELLS (ensembles
+have no footprint) via (mouse,dset,source='cells',unit); added SECTION 7 = significant-ensemble R²
+compared across datasets (per block×model, sig highlighted) + a sig-ensemble median table. Verified
+store resume/skip with the source dimension, ensemble record sig mapping, and table sig column on
+synthetic data; all files compile and the ens pipeline signatures match.
+
+2026-07-17 (cont.) — VR_feature_gen.py now uses the GPU conv backend in BOTH modes. conv_repo mode
+already forwarded cfg['conv_backend'] to f_build_conv_repo; the BLOCKS mode (f_build_one_dataset) was
+building flat_cfg WITHOUT conv_backend, so f_build_features fell back to CPU for gabor/meng. Added
+conv_backend/conv_device to flat_cfg (cfg.get('conv_backend','gpu')). So a blocks-mode cache build
+(GEN_MODE='blocks') now GPU-convolves gabor/meng too. cfg already had conv_backend='gpu'/conv_device
+='cuda'; comment updated to note it applies to both modes.
+
+2026-07-17 (cont.) — conv_repo filenames now use PHYSICAL units. Physical specs
+(f_conv_filter_specs_phys) carry a raw pixel wavelength that is a long float (sf 0.13 cyc/deg →
+wl 11.7326697… px), and _filter_fname was naming maps 'gabM_L_o0_wl11.732669724420347.npy' — the ugly
+long strings. Changed _filter_fname to name PHYSICAL maps by sf_cyc_deg (+ tf_hz) → clean
+'gabM_L_o0_sf0.13.npy' / 'mengopp_L_o0_sf0.13_tf2.npy'; legacy pixel specs keep _wl{px}[_tf{tag}].
+Safe minimal change (option B): the filename is only an on-disk key + label — all
+selection/loading uses the manifest fields (entry['file'] + kind/odeg/wavelength/sf_cyc_deg/tf_hz),
+and column names use isf/itf indices (_chan_prefix), so nothing parses the filename. f_conv_repo_retag
+now also migrates an existing physical repo's px-named files → the clean sf/tf names (passes the
+manifest's sf_cyc_deg/tf_hz). For the in-progress gen_7_16_26 repo with ugly names: either delete +
+rebuild (clean names now) or run f_conv_repo_retag(repo_dir) once before further incremental builds.
+Verified GPU build writes clean names + loads via manifest.
+
+2026-07-17 (cont.) — PCA-reduced feature-gen (GEN_MODE='pca_feat') + load-time whiten. The dense
+conv_repo (uint16 (T,H,W) per filter×side) is too big on disk; new gen path convolves → PCA → saves
+ONLY the small reduced blocks. Two independent granularities to SEPARATE tagged caches:
+  COMBINED ('_pcacomb'): one PCA per INPUT (all orientations of a gabor/meng at its sf[/tf], both
+    monitors combined) — matches the analysis grouping.
+  SEPARATED ('_pcasep'): one PCA per FILTER (orientation×SF×TF), both monitors combined.
+Realization that kept it small: both are just different PCA groupings of the SAME point-sampled block,
+and f_apply_block_pca already strips the side (L/R) prefix + groups by name prefix — so a per-filter
+prefix ('gabM_o0sf0' / 'mengopp_o0sf0tf0') automatically pools both monitors. New pieces:
+  - f_visual_features._pca_fit: accept (frac, cap) tuple → variance-fraction capped at N comps
+    (truncates the fitted PCA in place, no 2nd fit). f_pca_group_spec(names, 'filter'|'orient', n_pca)
+    → the grouping dict (side-stripped, startswith-safe prefixes).
+  - f_feature_gen.f_build_pca_feat_one_dataset: render once (f_resolve_features build, GPU conv, does
+    the physical sf_cyc_deg/tf_hz→px conversion) → RAW sampled blocks → PCA at both granularities →
+    f_save_features to two tagged caches. n_pca_combined/n_pca_separated = int | float | (frac,cap).
+  - VR_feature_gen: GEN_MODE='pca_feat' branch + SAVE_COMBINED/SAVE_SEPARATED knobs + pca_specs +
+    summary tally ('pca+<c>/<s>').
+  - LOAD-TIME WHITEN: saved blocks are UNWHITENED (natural-variance PC scores + fitted pca kept).
+    f_feature_source.f_resolve_features gained whiten=False → _whiten_block rescales loaded PC scores to
+    unit variance (÷√explained_variance_, single PCA or grouped {prefix:PCA} via pca_groups xslices),
+    applied AFTER save so saved caches stay unwhitened. cebra has a feat_whiten knob. Cebra loads these
+    via origin='cache'/'auto' (cache_tag = the pca tag). Verified: cap-tuple truncation, filter/orient
+    grouping, whiten unit-variance (single + grouped) + idempotent + raw no-op. Scoped to single-source
+    gabor/meng inputs; multi-source combine (gaborS+mengS) stays a cebra-side concat.
+
+2026-07-17 (cont.) — pca_feat follow-ups: (1) SAVE_RAW knob → also save the point-sampled conv WITHOUT
+PCA (tag '_pcaraw'); so three independent save granularities (comb/sep/raw), each its own tagged cache.
+(2) OOM fix: f_feature_source._input_transform now float32 + in-place (np.abs→sqrt(out=)→copysign(out=));
+was np.asarray(X,float)=float64 → 17 GiB crash on the 23.7k-col mengS block (3 tf × 4 ori × 2 sides at
+ds=4). meng is the heavy one (TF axis ×3) — SAVE_SEPARATED (per-filter, ~2k cols) is always memory-safe;
+SAVE_COMBINED on meng PCAs the whole block → raise ds / drop tf if RAM-bound. (3) Variance printout:
+f_feature_gen._pca_var_report prints per block raw->kept dims, #PCs, cumulative variance, and whether it
+reached the (frac) target or hit the (cap) — ASCII-safe ('->', no unicode → cp1252-safe). (4) cebra load
+wiring: VR_ca_cebra knob feat_pca_variant (None|'pcacomb'|'pcasep'|'pcaraw') points cache_tag at
+<tag>_<variant> so gaborS/mengS in feature_list load from the pca_feat cache via origin='auto'/'cache'
+(blocks not in the cache still build); feat_whiten toggles the load-time whiten. f_resolve_features cache
+load now prints the cache's stored gen_config (pca_gran/n_pca/pca_specs) + per-block loaded dims so you
+can verify the loaded params match. Scope: pca gen saves single-source gaborS/mengS (not the multi-source
+gaborS+mengS combine — that stays cebra-side).
+
+2026-07-17 (cont.) — VR_register_2pfov_cells.py: sister to VR_register_2pfov.py that projects 2p CELL
+ROIs (footprint centroids) onto the mouse widefield VC map. Loads every do_proc dataset, computes
+centroids (est1['A']/dims), homography-maps them via the 4-corner tp_fov_locs→wf_locs landmarks, and
+plots all cells on one widefield atlas colored by dataset (coverage) + FOV rectangles; optional cell
+(if 0:) colors by the VR_encode_scan per-cell R² (join by dset+neuron). rot_k knob rotates the output
+image + coords together (verified vs np.rot90 for k=0..3). Verified on mouse L: all 17 do_proc datasets
+have landmarks, centroids map inside the FOV quads (90/90 for 10_21_25).
+  Factored the shared registration into functions/f_fov_register.py (f_footprint_centroids,
+f_fov_homography/f_apply_homography, f_load_fov_landmarks, f_neuron_widefield_coords, f_rot_xy/
+f_rot_for_plot, f_plot_neuron_scores_fov). f_encode_scan now RE-EXPORTS these (identity), so
+VR_encode_scan_plots.py is unchanged; VR_register_2pfov_cells.py imports f_fov_register directly.
+
+2026-07-17 (cont.) — VR_register_2pfov_cells background overlay: to check 2p↔widefield ORIENTATION by
+blood vessels, added a 2p BACKGROUND overlay. f_utils.f_load_caim_data now loads b/f (guarded).
+f_fov_register.f_bg_image(est1) reconstructs the structural image b@mean(f)→(d1,d2); f_warp_to_widefield
+perspective-warps it into the widefield frame via the inverse tp→wf homography (scipy map_coordinates,
+NaN outside FOV — no cv2). The script composites per-dataset backgrounds (nanmean) into one widefield-
+sized overlay and draws widefield (gray, wf_alpha) + 2p vessels (bg_cmap, bg_alpha), both <0.5 alpha
+(>50% transparent), under the cells; rot_k rotates all together. Verified on L/10_21_25: b (65536,1) /
+f (1,96229) load, bg (256,256), warped non-NaN region == the FOV quad exactly (x1058-1373 y718-1053).
+
+2026-07-17 — VR_register_2pfov_cells.py ROI projection + orientation fixes
+- cell_mode='roi': instead of centroid dots, warp each cell's actual A footprint onto the widefield.
+  f_fov_register.f_footprint_label_map paints footprints into a 2p-space image (per-pixel = max-intensity
+  cell LABEL + intensity, thresholded at roi_thresh*max); f_warp_to_widefield gained order= (0 nearest for
+  the label map, 1 bilinear for intensity). Section 3 tints each dataset's warped footprints by dataset
+  color; Section 4 maps the global label image -> per-cell encode R² and imshows it. One warp per dataset
+  (not per cell), so it stays fast for thousands of cells.
+- transpose_2p: tp_fov_locs were digitized on the tp_im TIFF (x=col,y=row), but A/b reshape order='F' is
+  its transpose (square FOV). Fix applied consistently to centroids (swap x<->y), bg image (.T), AND the
+  footprint label map (.T) so dots/vessels/ROIs all match the landmarks. Confirmed via the warped-vessel
+  overlay lining up with the widefield vessels.
+- Added knobs: show_cells (toggle cells), bg_darkness (0..1 dim the warped 2p-FOV backgrounds),
+  show_date (label each FOV with its dset_name under the visually-topmost edge, rotation-aware).
+
+2026-07-17 — feature_source: 'derived' blocks (from_block inputs) reuse loaded per-input PCAs
+- A block input may now be {from_block: NAME} instead of {source: ...}. Such a block resolves to
+  origin='derived': it is assembled from OTHER already-built blocks (concat + input_norm + one joint
+  PCA), NO render/convolution. The resolver auto-pulls the referenced blocks (inserted earlier in the
+  resolve order) and builds derived blocks AFTER their sources (prior=built_blocks).
+- f_default_feature_plan['gaborS+mengS'] is now DERIVED: inputs=[{from_block:'gaborS'},{from_block:
+  'mengS'}], input_norm='total_var', n_pca=500. So loading the pca_feat caches (gaborS/mengS) and
+  listing 'gaborS+mengS' in feature_list reuses those per-input PCAs — no reconvolution. This replaces
+  the script-side feat_combine list (f_combine_loaded_pca still exists but is no longer the primary path).
+  Verified on L/11_2_25 pcacomb: gaborS(455)+mengS(500) -> balanced -> joint PCA (140426,500), raw_dim 955.
+- Rationale (user): the composite's input_norm='pca' path already PCAs each input then concatenates;
+  since the cache stores exactly those per-input PCAs, an input that "says to do pca" can just LOAD it.
+  gaborS+mengS2/3 stay BUILD blocks (meng tf-subsets tf=3 / tf=(3,1) aren't in the all-tf pcacomb cache;
+  use the pcasep variant if per-tf structure is needed). VR_encode_scan uses the same plan-derived path.
+
+2026-07-17 — pca_feat gen: cache pix movie-PCA + per-tf mengS; pix origin 'auto'
+- pca_feat gen renders the movie once for gabor/meng, so it now ALSO saves the pix movie-PCA into
+  every granularity cache (cfg['SAVE_PIX'], cfg['n_pix_pca']; passthrough — pix is already reduced,
+  not re-PCA'd by the combined/separated step). f_default_feature_plan['pix'] origin 'build'->'auto'
+  so cebra/encode-scan LOAD pix from the pca_feat cache (NO re-render); falls back to build if absent.
+- mengS split into per-tf blocks in the gen pca_specs: mengS=1Hz, mengS2=2Hz, mengS3=3Hz. Composites
+  gaborS+mengS/2/3 are DERIVED (from_block) from those. After regen (OVERWRITE=True), a full load
+  build-group is just ['agg'] (cheap behavior vectorization, NO render, NO convolution).
+
+2026-07-17 — cross-dataset feature-TUNING scan (reverse-correlation, cache-loaded, resumable)
+- New parallel to the encode scan: functions/f_tuning_scan.py + VR_tuning_scan.py (write) +
+  VR_tuning_scan_plots.py (read). For every cell AND ensemble in every dataset, reverse-correlate (STA)
+  activity against the cached gabor/meng features (per orientation × temporal freq) + agg/pix/self_mot.
+- Features LOADED from the pca_feat pcasep caches (per-orientation×tf PCA groups), NO reconvolution: each
+  o×tf group → a whole-monitor magnitude regressor via the cheap PCA-inverse column-mean
+  X[:,xslice]@components_.mean(1)+mean_.mean() (verified == _recon_raw col-mean, corr=1.0). meng feat_set
+  spans mengS(1Hz)+mengS2(2Hz)+mengS3(3Hz) → 4 orient × 3 tf response matrix; gabor = 4 orient.
+- Fit = f_tuning.f_reverse_corr_tuning(method='sta') + f_tuning_readout (orientation/tf readout for
+  gabor/meng). Store keeps a COMPACT per-unit result (peak-lag response profile + readout table +
+  marginals; not full W×lags) + per-dataset per-filter time-mean monitor maps. Resumable/atomic store
+  mirrors f_encode_scan, keyed (mouse,dset,source,feat_set); save after every combo, restart-safe.
+- Plots: population orientation×tf matrix, per-unit marginals + heatmaps, monitor-average frames,
+  cell↔ensemble comparison, opt-in significance (circshift null) + widefield projection by pref orientation.
+- Verified end-to-end on the regenerated L/10_21_25 pcasep cache (meng→12 filters, gabor→4, pix→300;
+  store round-trip + all plot helpers render headless).
+
+2026-07-17 — cache load: n_pca in f_default_feature_plan is now an UPPER-BOUND cap
+- f_feature_source._cap_loaded_block (called in _build_block's origin='cache' path) truncates a LOADED
+  PCA block to at most the plan's n_pca, keeping the top variance-sorted PCs. Single-PCA (pcacomb) caps
+  the whole block; grouped (pcasep) caps EACH group; X/names/pca/pca_groups truncated consistently so
+  whiten / inverse / the derived-composite path stay valid. Fewer saved than n_pca → take all.
+- n_pca as a positive INT = the cap. n_pca = None / dict / float / tuple / 0 = import whatever was saved
+  (no load-time cap). Verified on L/10_21_25 (gaborS 211->200, mengS grouped per-group cap; None->211).
+
+================================================================
+2026-07-18 — Citations for the gabor + motion-energy (meng) feature models
+================================================================
+Canonical references for the visual front-end feature banks (f_visual_features:
+f_gabor_features / f_motion_energy_features). Design lineage: Hubel-Wiesel ->
+Adelson-Bergen -> Gallant-lab encoding models (notes.txt 2026-06-06,
+PLAN_monitor_features.md).
+
+GABOR energy bank ('gabor'; gabM magnitude is the phase-invariant / complex-cell
+energy channel):
+- Marcelja, S. (1980). Mathematical description of the responses of simple
+  cortical cells. JOSA 70(11), 1297-1300. [Gabor functions for V1 simple cells.]
+- Daugman, J. G. (1985). Uncertainty relation for resolution in space, spatial
+  frequency, and orientation optimized by two-dimensional visual cortical
+  filters. JOSA A 2(7), 1160-1169. [2D Gabor model of V1.]
+- Jones, J. P. & Palmer, L. A. (1987). An evaluation of the two-dimensional Gabor
+  filter model of simple receptive fields in cat striate cortex. J. Neurophysiol.
+  58(6), 1233-1258. [empirical validation.]
+- Pollen, D. A. & Ronner, S. E. (1983). Visual cortical neurons as localized
+  spatial frequency filters. IEEE Trans. SMC. [quadrature-phase complex-cell
+  energy = the magnitude channel.]
+- Kay, K. N., Naselaris, T., Prenger, R. J. & Gallant, J. L. (2008). Identifying
+  natural images from human brain activity. Nature 452, 352-355. [Gabor-wavelet-
+  pyramid ENCODING model = the feature-bank-as-regressors approach.]
+
+MOTION ENERGY ('meng'; Adelson-Bergen opponent-energy construction, incl. the
+opponent output + per-tf temporal quadrature):
+- Adelson, E. H. & Bergen, J. R. (1985). Spatiotemporal energy models for the
+  perception of motion. JOSA A 2(2), 284-299. [THE motion-energy model; our
+  opponent construction is directly this.]
+- Watson, A. B. & Ahumada, A. J. (1985). Model of human visual-motion sensing.
+  JOSA A 2(2), 322-341. [companion linear motion-sensor model.]
+- Nishimoto, S., Vu, A. T., Naselaris, T., Benjamini, Y., Yu, B. & Gallant, J. L.
+  (2011). Reconstructing visual experiences from brain activity evoked by natural
+  movies. Current Biology 21(19), 1641-1646. [motion-energy ENCODING model = meng-
+  as-features, the pipeline we use.]
+
+
+================================================================
+2026-07-23 — object WIDTH render bug fixed: obj_size['x'] was half-width
+================================================================
+
+obj_size['x'] (object FULL width, e.g. 5) was being applied as a
+LATERAL HALF-EXTENT in the renderer AND the agg/motion angular-size
+feature, while obj_size['y'] (full height, e.g. 20) was correctly
+treated as full (y/2 half-extent). This inconsistency (the old
+2026-05-19 note called it "harmless" — it is NOT) rendered objects
+~2x too wide, so a 5x20 tall object looked ~square.
+
+Fix: interpret obj_size['x'] as the FULL width everywhere -> use
+obj_size['x']/2 as the half-extent. 8 sites:
+ - f_functions.py: f_angles_to_movie_v2 (antialias + hard-edge) +
+   legacy f_angles_to_movie  -> arctan2(obj_size['x']/2, dist).
+ - f_feature_helpers.py x5: agg salience_mean weight + 'angular'
+   ang_size, per_obj, motion (x2) -> 2*arctan2(obj_size['x']/2, dist).
+Unchanged (correct/unused): obj_size['z'] (not in the 2-D silhouette),
+obj_size['y'] (full height), obj_size['height'] (ground offset),
+f_render_diagnostics (uses 'height' only). Scripts only DEFINE obj_size
+values (x=5 stays) — no script edits; VR_video_recon.py + f_render_session
+pick up the fix via f_angles_to_movie_v2.
+
+IMPACT: objects now render at true width (half as wide as before) ->
+tall rectangle not square; agg 'size' channel halved. ALL render- and
+agg-derived caches (pix/gabor/meng, conv_repo, pca_feat, agg decode)
+are STALE -> regenerate.
+
+FOV (checked, not a bug): hFOV=98.4 deg / vFOV=66.18 deg (measured rig,
+2026-07-16 correction). Pixel mapping + 150x101 angularly-square render
+are correct; the square look was purely the x-half bug.
+
+
+================================================================
+2026-07-24 — VR_feature_search: conv autosave + GPU-native pool +
+             SF naming + extended timing (+ thread-cap gotcha)
+================================================================
+
+Context: stress-testing VR_feature_search.py surfaced crashes + a
+huge slowdown. Four changes, all opt-in / parity-preserving.
+
+1) GPU-NATIVE stat+pool (the real speedup). The "GPU" conv path only
+   ran conv2d/conv1d on the GPU, then transferred the FULL-RES (t,H,W)
+   response to CPU PER FILTER and computed magnitude/opponent + spatial
+   pool in numpy. For long sessions that CPU stat+pool dominated
+   (~900 s/bank, GPU near-idle, all cores pegged). Moved magnitude/
+   phase/even/luminance + meng opponent/both AND the spatial pool onto
+   the GPU (f_conv_gpu._gab_stat_torch + _make_reducer_torch), so only
+   the small pooled (t,ny,nx) crosses to CPU. Pooled fns now take
+   `tokens` + `pool/grid/sample_ds` (not numpy chan/reduce_fn);
+   extractor assembly unchanged. Grid mean-pool reimplemented as 0/1-
+   assignment matmuls over the EXACT f_grid_bounds reduceat segments ÷
+   per-cell area (a plain avg_pool2d would break on non-divisible edge
+   cells); sample = centered strided index. PARITY vs CPU numpy path:
+   torch-CPU EXACT (~1e-7) for mag/phase/even/lum × opponent/both ×
+   grid(incl. non-divisible)/sample. On CUDA gabor's batched conv2d
+   picks a TF32 algo → ~2e-4 scale-rel; this is PRE-EXISTING (the
+   conv2d was always on GPU, old code only moved stat+pool to CPU) and
+   negligible for standardized regression features (all configs share
+   the path). Disabling torch.backends.cudnn/cuda.matmul.allow_tf32 →
+   1e-7 if bit-parity ever needed; kept TF32 on for speed.
+
+2) CONV AUTOSAVE (f_conv_autosave.py). Configs sharing a bank but
+   differing only in proc/marginalize (the pyr_sets mag/mag2pca/
+   mag1norm variants) RE-CONVOLVED every time — the in-run raw_cache
+   frees each conv per unit to bound RAM, so there was no cross-config
+   reuse. Now _raw_block optionally reloads the RAW pooled block from
+   SSD (keyed by extraction recipe [proc stripped] × pixel realization
+   [lat/vert_samp, deg_per_px, fs, sigma_scale, gamma, side]) and saves
+   it after a build. Save point is PRE proc/marginalize, so ONE block
+   serves every variant (the "don't save too late" constraint). Per-
+   COLUMN uint16 quant (a pooled block mixes filters/stats of different
+   scale → single per-array min/max would lose precision; rel ~1e-5).
+   Opt-in build_cfg['conv_autosave'] (+ tag); gabor/meng only (pix has
+   no conv). To share across ds/render size use a conv_repo instead.
+
+3) SF NAMING. cyc_fov/hFOV_deg makes ~20-sig-fig SF floats
+   (0.010162601626016261). Only f_iter_grid_cells stringified them raw
+   (cell/block names + timing prints); everywhere else already used :g.
+   Added f_feature_helpers.f_num_tag(x, sig=4) (shared with autosave
+   filenames) → 'sf0.01016'. Raw float stays in the streaming cell KEY
+   (contributor match); formatted only at the name join. f_score_grid
+   re-parses the short names (display-only → round-trip-safe). Chose a
+   rounding helper over a full cyc_fov refactor: sf_cyc_deg is the
+   intrinsic downstream unit; only the display/naming boundary needed
+   the format.
+
+4) EXTENDED TIMING. f_feature_search gained `timing=False` (additive
+   over verbose): flushed timestamped START + duration per major step
+   (render / per conv-unit / finalize-PCA / build+pca [pix raw-extract
+   vs PCA split] / decode / encode split in f_score_representations) so
+   the slow step is visible live against CPU/GPU monitoring. This is
+   what localizes the conv-vs-PCA-vs-encode bottleneck.
+
+THREAD-CAP GOTCHA (diagnosis, not a code change): the BLAS env-var cap
+(_thread_cap atop the script) is IMPORT-TIME ONLY — in a warm Spyder
+kernel where numpy/torch/MKL were already imported, editing os.environ
+does nothing, so the cap silently doesn't apply (→ all threads pegged,
+the crash risk). RESTART THE KERNEL before a run for the cap to take
+effect. torch also has its own thread pools not covered by those 4 env
+vars; a runtime cap (torch.set_num_threads + threadpoolctl.
+threadpool_limits) would apply even to a warm kernel — offered, not yet
+added. CPU% is aggregate over all 20 logical cores: a correctly-applied
+6-thread cap → ~30% ceiling; 90-100% on all threads = cap not applied.
+
+Files: functions/f_conv_gpu.py, functions/f_visual_features.py (2 call
+sites), functions/f_conv_autosave.py (new), functions/f_feature_search.py,
+functions/f_feature_helpers.py, functions/f_dataset_scan.py
+(f_score_representations timing=), VR_feature_search.py (cell 1 autosave
+knobs + cell 3 timing=True). All compile; parity + autosave round-trip +
+SF round-trip unit-tested (rnn env: numpy 1.26 + torch + CUDA).
+
+
+================================================================
+2026-07-25 — FFT convolution for the GPU gabor/meng path
+             (+ signed-quadrature gabors; phase-gate finding)
+================================================================
+
+Context: the search sat at "GPU 3%" for many minutes per bank.
+
+DIAGNOSIS (two layers). First, Task Manager's default GPU graph is
+the 3D engine; CUDA work lands on Compute_0. nvidia-smi said
+utilization 100%, memory-bus 2% — the GPU was SATURATED and
+compute-bound, not idle. So splitting the work (temporal blocks,
+extra streams, bigger chunk_t) could not help: one 2000-frame chunk
+already presents ~1.8e8 independent output elements to 82 SMs.
+
+Second, the real cause was ALGORITHMIC. The CPU path convolves with
+scipy.signal.fftconvolve (cost independent of kernel size); the GPU
+port used F.conv2d — DIRECT spatial convolution, cost proportional
+to K^2. At sigma_scale=0.5 a cyc_fov=1 gabor is sigma=75 → 453x453
+on a 101x150 frame: the filter is LARGER than the image, and that
+one level was ~75% of the bank's arithmetic. Last session's port
+bought ~100x hardware and gave back ~100x algorithm.
+
+FIX — `_spatial_conv`, an exact drop-in for F.conv2d used at all six
+spatial conv sites, doing two things:
+
+1) `_crop_kernel` — drop kernel rows/cols that can only ever hit the
+   zero pad. With padding ph, output row i reads kernel row u only
+   for u in [ph-H+1, ph+H-1], so anything beyond 2H-1 x 2W-1 is
+   multiplying zeros. EXACT (measured 0.00e+00 vs uncropped), and it
+   shrinks 453^2 to 201x299 — a free 3.4x on the direct path too.
+2) `_fft_conv2d` — rfft2 → pointwise → irfft2, with ONE forward
+   transform per frame-block SHARED across every filter of a
+   conv-unit (same SF → same kernel size, so 7 transforms instead of
+   12 for 6 filters). Sub-chunks over frames internally
+   (FFT_BUDGET_BYTES): linear-conv padding inflates 101x150 to
+   ~315x448, so the caller's chunk_t would blow up VRAM.
+   Crossover FFT_MIN_K=48 (K^2 vs ~2250 MAC-equiv/px); below that
+   direct conv2d stays.
+
+PARITY TRAP handled: torch conv2d is CROSS-CORRELATION, a frequency
+multiply is TRUE convolution. Kernels arrive already flipped (for
+conv2d) so _fft_conv2d flips them BACK. Without this the even gabor
+(symmetric) is fine but the ODD gabor and the meng opponent come out
+NEGATED — the odd-kernel sign correlation is the test that catches it.
+
+MEASURED (400 frames, 3 orientations, magnitude; GPU contended by a
+concurrent run so treat ratios not absolutes):
+  cyc_fov  K    cropped   direct   fft     speedup
+     1    453  201x299   0.749s  0.167s    4.5x
+     2    227  201x227   1.701s  0.048s   35.4x
+     4    115  115x115   0.155s  0.040s    3.9x
+     8     59   59x59    0.074s  0.043s    1.7x
+    16     31   31x31    0.049s  0.038s    1.3x
+  TOTAL                  2.728s  0.336s    8.1x
+=> ~23 min to ~3 min per bank over 100k frames x 2 monitors. The
+per-SF pattern is distorted by cuDNN algo selection + contention;
+re-bench on an idle GPU. FFT still wins at K=31, so FFT_MIN_K could
+drop to ~24.
+
+Magnitude parity vs the CPU reference IMPROVES ~100x (3.9e-7 vs the
+direct path's 3.6e-5) — the reference is itself an FFT, so the FFT
+path is CLOSER to it than the direct path ever was. Also more
+accurate than the TF32 conv2d already in use (~2e-4).
+
+PHASE GATE (a finding, only partly a fix). Phase is re/mag gated by
+an ABSOLUTE `mag > 1e-6`. Over a BLACK screen region the true
+response is exactly 0, so direct conv2d returns exact zeros (gate
+closed → phase 0) while ANY FFT engine returns ~1e-5 rounding (gate
+opens → an arbitrary UNIT vector). Point-sampled phase correlation
+drops to 0.86. This is PRE-EXISTING, not new: the two engines that
+already shipped — cpu(scipy, an FFT) vs gpu(direct) — ALREADY
+disagree on phase at corr 0.9917. The GATE is the bug, not the
+engine. So FFT_WITH_PHASE defaults False: gabor phase stays on the
+direct path and every cached value is unchanged. A scale-RELATIVE
+gate would fix it for all engines, but that changes feature
+semantics — do it deliberately with #70/#71.
+
+SIGNED QUADRATURE (#74, new stat). `stats=('quadrature',)` gives
+gabQe/gabQo = the signed even/odd responses themselves, no magnitude
+taken, no normalization. Since re=|R|cos(phi) and ro=|R|sin(phi)
+this keeps magnitude AND phase jointly (|R|=sqrt(Qe^2+Qo^2)
+recovered EXACTLY, measured 0.00e+00), so it is a strict superset of
+magnitude-only and of normalized phase, in 2 channels not 3.
+Rationale for preferring it over mag+phase: the combination a ridge
+would need from {mag, cos phi} is the PRODUCT mag*cos(phi), which a
+linear model cannot form — and mag*cos(phi) IS re. So under ridge,
+mag+phase carries identical information to quadrature but worse
+conditioned; it is only a genuinely different hypothesis under a
+NONLINEAR decoder. Quadrature also has no division, hence no gate,
+hence full FFT parity (cpu-vs-gpu-fft 2.4e-7, ~100x better than
+direct). Not phase-invariant, so keep the Nyquist lambda/2 sampling.
+
+MENG has no quadrature analogue worth adding: its linear space-time
+components (R.real/R.imag/L.real/L.imag before squaring) are linear
+combinations of time-LAGGED gabQe/gabQo, and the encoder already
+lag-embeds — so lag-embedded quadrature already spans them. The
+SQUARING is the part no linear model can build from linear features,
+i.e. meng's entire contribution. What IS worth changing there is
+output='both' over 'opponent': opponent keeps only eR-eL (1 channel)
+and maps empty screen, static edge, and opposing motion all to ~0;
+'both' keeps eR and eL so a linear model can form the difference AND
+the sum (total motion energy). Documented at both call sites; not
+switched. Avoid a normalized direction index (eR-eL)/(eR+eL) — same
+divide-by-near-zero explosion as phase.
+
+Files: functions/f_conv_gpu.py (engine + all 6 sites),
+functions/f_visual_features.py (quadrature stat + meng output doc),
+CLAUDE.md, TODO.md (#70/#71 annotated, #74 added).
+Parity/bench: scratchpad test_fft_conv_parity.py,
+test_phase_zero_region.py, test_quadrature.py, bench_fft_conv.py.
+
+
+================================================================
+2026-07-26 — FFT-spectrum features (#73) + the search feature
+             config wired into VR_ca_cebra
+================================================================
+
+FFT FEATURES (#73) — premise: a Gabor response at (x0,y0,theta,lam)
+IS one Fourier coefficient of the Gaussian-windowed patch at
+f=(cos(theta)/lam, sin(theta)/lam). So the bank is a lossy SUBSAMPLE
+of the patch FFT, which computes every coefficient at once. Caveat:
+the bank is constant-Q (sigma=0.5*lam, window scales with lam — a
+wavelet pyramid) while a single patch FFT is constant-bandwidth, so
+matching requires ONE PATCH SIZE PER LEVEL. `f_fft_features` does
+exactly that.
+
+Design choice that made it cheap: columns reuse the GABOR AXIS
+NAMING (fftM/fftQe/fftQo_o{io}sf{isf}_r{iy}c{ix}), so
+f_pca_group_cols / marginalize / layer1-2 procs / f_iter_grid_cells /
+f_score_grid all work UNCHANGED. Geometry is shared too (same sigma,
+same ceil(3*sigma) support capped per axis at H-1/W-1, same
+_sample_idx centres), so at n_sf_sub=n_ori_sub=1 the columns align
+index-for-index with the gabor pyramid and any fft-over-gabor gap is
+exactly the intra-sector frequency spread the bank discards.
+magnitude = sector-mean |F|; quadrature = Re/Im at the NEAREST
+coefficient (complex values cannot be sector-averaged — phase
+cancels). n_sf_sub/n_ori_sub>1 subdivide sectors = strictly richer.
+Requires gamma=1 (an anisotropic window is orientation-DEPENDENT, so
+one patch FFT cannot serve the bank) and reduce='sample'.
+
+VERIFIED the premise: agreement reaches corr 0.9998 when the target
+frequency lands on a lattice point. But the error source was NOT what
+was predicted. Expected DC-removal + the broadband envelope (only ~1
+carrier cycle under the envelope at sigma_scale=0.5) to dominate;
+measured, it is LATTICE QUANTIZATION. With frac = |N/lam -
+round(N/lam)|, corr(frac, agreement) = -0.88: frac<0.15 gives 0.96,
+frac>0.35 gives 0.39, frac~0.03 gives 0.9998. Since the patch size is
+OURS to choose and the window is the Gaussian either way,
+`patch_snap=True` (default) nudges the patch +-15% so the target
+lands on a lattice point: mean agreement 0.961 to 0.985, every config
+at frac<0.15. Also de-ramped the phase: rfft2 references the patch
+CORNER, the gabor its CENTRE.
+
+Column budget came in far under the plan's estimate: 2589 per side
+for the 5-level pyramid, not ~100k — each level carries ONE SF, so
+the 8x4-bins-per-level assumption was wrong. layer1_proc=None is fine.
+
+CEBRA INTEGRATION — a representation that wins the search could not
+be moved into the encoding arm. Three gaps, three fixes:
+ (a) f_grid_block hardcoded is_gabor=(kind=='gabor'), so kind='fft'
+     fell into the meng branch → now `kind in NO_TF_KINDS`.
+ (b) The config FORMS differed (search: named pyr_sets consumed by
+     f_pyramid_grid; cebra: feature_plan dict edits) → new
+     `f_vis_sets_to_plan`, the plan-side twin of f_pyramid_grid with
+     identical keyword names, so a winning config PASTES over. Cell
+     names also had to match: _build_grid_block used {sfv:g} (6 sig)
+     vs the search's f_num_tag (4 sig) — unified on f_num_tag.
+     Verified identical cell names for gabor/meng/fft x every
+     marginalize.
+ (c) Downstream cells addressed old sampled names and f_encoding
+     raised on anything not literally in built_blocks → new
+     `f_expand_blocks`: a BANK name expands to all its <bank>:<cell>
+     blocks (sorted — order matters, _joint_feature_block
+     concatenates), exact names pass through verbatim. Wired into the
+     encoder and the decode sweep. Bank vs explicit-cell-list gives
+     BIT-IDENTICAL scores.
+Cell 401 keeps feature_list for the non-visual blocks (agg / pix /
+motion / pix_mot / self_mot / beh / obj_vis) and the feat_pca_variant
+cache path; the visual half is now a `vis_sets` dict. All of it still
+resolves in the ONE f_resolve_features call (one shared render).
+
+CONV AUTOSAVE MOVED to the shared choke point. It lived in
+f_feature_search._raw_block, so cebra re-convolved banks the search
+had already done. Now hooked SPEC-LEVEL inside build_visual_blocks —
+which f_resolve_features → f_build_features → build_visual_blocks
+funnels every build path through — so both scripts share ONE store.
+Re-keyed on the RESOLVED extractor params (they already bake in the
+geometry: sf_cyc_deg → wavelengths px, ds='nyquist' → sample_ds) x
+sides x movie shape x #imaging frames, skipping perf-only knobs
+(backend/device/chunk_t) so a cpu/gpu or chunk-size change still
+reuses. Cached PRE-PCA/pre-proc → one block serves every n_pca / proc
+/ marginalize variant. Root defaults to the source features_dir.
+NB the old <mouse>_<dset>_<tag>_<geomhash> store is orphaned by the
+new <mouse>_<dset>_<tag> layout — delete it.
+The f_conv_autosave import must be DEFERRED inside
+build_visual_blocks: f_conv_autosave → f_conv_repo →
+f_visual_features would be circular.
+
+Files: functions/f_visual_features.py (f_fft_features + helpers +
+registry + autosave hook), functions/f_feature_source.py
+(f_grid_block fft, f_num_tag cell names, f_vis_sets_to_plan,
+f_expand_blocks, autosave-root default), functions/f_encoding.py,
+functions/f_decoding.py, functions/f_pipeline.py,
+functions/f_conv_autosave.py (f_autosave_ctx/f_spec_fname),
+functions/f_feature_search.py, VR_ca_cebra.py (cells 401/926),
+VR_feature_search.py (fft_pyr_sets), CLAUDE.md, TODO.md (#73).
+Tests: scratchpad test_fft_sanity.py, test_fft_vs_gabor.py,
+test_fft_lattice.py, test_fft_final.py, test_cebra_integration.py,
+test_cellname_match.py, test_bank_encode.py, test_autosave_bvb.py,
+test_regression.py. All compile; NONE of this session's work has run
+on a real session yet.
+
+
+================================================================
+2026-07-27 — marginalize='all' drift fix (silent); one-per-type
+             vis_sets in cebra + quadrature configs in the search
+================================================================
+
+BUG (silent, found while adding magcomb2pca-equivalent configs to
+VR_ca_cebra). `marginalize=('all',)` is the shortcut for "pool every
+axis" → one cell for the whole bank. The SEARCH honoured it:
+f_feature_search._marg_axes normalized 'wl'→'sf' AND expanded 'all'
+to {'ori','sf','tf'}. The PLAN side did not: _build_grid_block had
+its own inline `{('sf' if a=='wl' else a) for a in marginalize}`,
+which leaves 'all' as an unrecognized axis name — so every
+`if 'ori' not in marg` test passed and NOTHING was pooled. The same
+config therefore gave ONE block in the search and 15 per-filter
+blocks in cebra, with no error anywhere: the failure mode is a
+scorecard/encoder silently fed a different representation than the
+one that was requested.
+
+Two copies of one rule is the root cause, so the fix removes the
+copy rather than patching it: `f_feature_source.f_marg_axes` is now
+canonical (also tolerates a bare string, e.g. marginalize='all'),
+_build_grid_block calls it, and f_feature_search._marg_axes delegates
+to it. Verified both sides agree for 'all' / ('ori',) / ('ori','wl')
+/ () and that the cebra-vs-search CELL NAMES still match for
+gabor/meng/fft across every marginalize.
+
+CONFIGS. VR_ca_cebra `vis_sets` now carries ONE entry per feature
+type at IDENTICAL magcomb2pca params (cyc_fov=(1,2,4,8,16),
+odegs=(0,45,90), marginalize='all', layer1 None, layer2 pca 50):
+gabmag / gabquad / fftmag / fftquad / mengopp — each builds to a
+single '<name>:all' block at 50 dims, so the only thing differing
+between them is the REPRESENTATION. meng has no `stats` knob, so its
+analogue is output='opponent' (+signed_sqrt); it also runs 20
+conv-units (5 SF x 4 TF) vs 5 for the others, pooled away by 'all'.
+VR_feature_search gained the quadrature counterparts: quadcomb2pca /
+quadcomb1norm2pca in the ACTIVE pyr_sets2, and quad / quad2pca /
+quad1norm2pca in pyr_sets.
+
+CAVEAT for reading either scorecard: the pca-50 makes the entries
+fair head-to-head, but the RAW widths differ before it — magnitude is
+1 channel per filter, quadrature 2 (Qe+Qo, measured 105 → 210 cols on
+one bank), meng multiplies by its tf axis. Dropping the pca to compare
+raw blocks would confound representation with dimensionality.
+
+Files: functions/f_feature_source.py (f_marg_axes + _build_grid_block),
+functions/f_feature_search.py (_marg_axes delegates), VR_ca_cebra.py
+(vis_sets), VR_feature_search.py (quadrature entries), CLAUDE.md.
+Tests: scratchpad test_visset_all.py (marg axes + one-block-per-entry +
+cebra/search name match), test_regression.py, test_cellname_match.py.
+Still unrun on a real session.

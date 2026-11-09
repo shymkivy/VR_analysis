@@ -1,0 +1,4 @@
+l1 rat	alpha
+1e-5	1e1(right shoulder before drop)
+1e-4	1e1
+1e-3	1

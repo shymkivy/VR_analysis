@@ -786,7 +786,7 @@ def f_get_monitor_coords(mov_data, mon_phi, mon_theta, bh_data_slice, cam_params
     else:
         obj_used = np.arange(num_obj)
     
-    ovj_vec_data = {'obj_mouse_vec':    obj_mouse_vec,        # 
+    ovj_vec_data = {'obj_mouse_vec':    obj_mouse_vec,        #
                     'obj_mon_idx':      obj_mon_idx,
                     'obj_used':         obj_used,
                     'obj_dist':         obj_dist_all,
@@ -794,7 +794,77 @@ def f_get_monitor_coords(mov_data, mon_phi, mon_theta, bh_data_slice, cam_params
                     'obj_vert_angle':   obj_vert_angle_all,
                     'num_rewards':      num_rewards}
     return ovj_vec_data
-    
+
+
+def f_get_monitor_coords_both(mov_data, mon_l_phi, mon_r_phi, mon_theta, bh_data_slice,
+                              cam_params, remove_outside_objects=True):
+    """Both monitors at once, sharing the monitor-INDEPENDENT work. The object→mouse spherical
+    conversion (f_cart_to_spheric_np — the slow transcendental step), the distance, the vertical
+    angle and the reward gating do NOT depend on which screen, so they are computed ONCE here instead
+    of twice (as two separate f_get_monitor_coords calls). Only the lateral angle (mon_phi) differs
+    per side. Returns (vec_data_l, vec_data_r), each byte-identical to f_get_monitor_coords."""
+    df_obj_data = bh_data_slice['object_data']
+    df_obj_events = bh_data_slice['object_events']
+
+    mouse_xyz = np.array((mov_data['x_pos'], mov_data['y_pos'], mov_data['z_pos'])).T
+    obj_locs = np.vstack((df_obj_data.ObjLocX.to_numpy(), df_obj_data.ObjLocY.to_numpy(),
+                          df_obj_data.ObjLocZ.to_numpy())).T
+    obj_ev_locs = np.vstack((df_obj_events.ObjLocX.to_numpy(), df_obj_events.ObjLocY.to_numpy(),
+                             df_obj_events.ObjLocZ.to_numpy())).T
+    num_obj = obj_locs.shape[0]
+    (num_t, num_d) = mouse_xyz.shape
+
+    obj_mouse_vec = np.zeros((num_t, num_d, num_obj), dtype=float)
+    obj_dist_all = np.zeros((num_t, num_obj), dtype=float)
+    vert_all = np.zeros((num_t, num_obj), dtype=float)
+    lat_l_all = np.zeros((num_t, num_obj), dtype=float)
+    lat_r_all = np.zeros((num_t, num_obj), dtype=float)
+    mon_l_idx = np.zeros((num_t, num_obj), dtype=bool)
+    mon_r_idx = np.zeros((num_t, num_obj), dtype=bool)
+    num_rewards = 0
+    for n_obj in range(num_obj):
+        is_reward = np.sqrt(np.sum((obj_locs[n_obj, :] - obj_ev_locs)**2, axis=1)) == 0
+
+        spher_vec_objs = f_cart_to_spheric_np(obj_locs[n_obj, :] - mouse_xyz)   # ONCE (monitor-indep)
+        obj_mouse_vec[:, :, n_obj] = spher_vec_objs
+        obj_dist_all[:, n_obj] = spher_vec_objs[:, 0]
+
+        vert_angle = f_add_phase(mon_theta, - spher_vec_objs[:, 1])             # same for both monitors
+        vert_all[:, n_obj] = vert_angle
+        lat_l = f_add_phase(mon_l_phi, - spher_vec_objs[:, 2])
+        lat_r = f_add_phase(mon_r_phi, - spher_vec_objs[:, 2])
+        lat_l_all[:, n_obj] = lat_l
+        lat_r_all[:, n_obj] = lat_r
+
+        idx_dist = spher_vec_objs[:, 0] < cam_params['clip_len']                # monitor-independent
+        idx_vert = np.abs(vert_angle) < cam_params['vFOV_rad'] / 2
+        if np.sum(is_reward):
+            ev_shift = bh_data_slice['bh_pulse_delay'] if mov_data.get('delay_corrected') else 0.0
+            reward_time = df_obj_events[is_reward].Time.values[0]
+            idx_not_rewarded = mov_data['time'] < (reward_time - ev_shift)
+            num_rewards += 1
+        else:
+            idx_not_rewarded = np.ones((num_t), dtype=bool)
+
+        _dv = idx_dist & idx_vert & idx_not_rewarded                            # shared FOV gate
+        mon_l_idx[:, n_obj] = _dv & (np.abs(lat_l) < cam_params['hFOV_rad'] / 2)
+        mon_r_idx[:, n_obj] = _dv & (np.abs(lat_r) < cam_params['hFOV_rad'] / 2)
+
+    def _pack(mon_idx, lat_all):
+        omv, midx, dist, lat, vert = obj_mouse_vec, mon_idx, obj_dist_all, lat_all, vert_all
+        if remove_outside_objects:
+            keep = np.sum(mon_idx, axis=0) > 0
+            obj_used = np.where(keep)[0]
+            omv, midx = obj_mouse_vec[:, :, keep], mon_idx[:, keep]
+            dist, lat, vert = obj_dist_all[:, keep], lat_all[:, keep], vert_all[:, keep]
+        else:
+            obj_used = np.arange(num_obj)
+        return {'obj_mouse_vec': omv, 'obj_mon_idx': midx, 'obj_used': obj_used,
+                'obj_dist': dist, 'obj_lat_angle': lat, 'obj_vert_angle': vert,
+                'num_rewards': num_rewards}
+
+    return _pack(mon_l_idx, lat_l_all), _pack(mon_r_idx, lat_r_all)
+
 
 def f_angles_to_movie(vec_data, time, cam_params, obj_size, lat_samp = 51, vert_samp = 51):
     # Legacy 4-edge OUTLINE renderer (rectangle border + center pixel).
@@ -827,7 +897,7 @@ def f_angles_to_movie(vec_data, time, cam_params, obj_size, lat_samp = 51, vert_
         # extent of the geometry, so the half-extent above center is y/2.
         # obj_size['height'] is the center-above-ground offset, used to clip
         # the silhouette at the terrain surface.
-        obj_x_ang_pix = np.round(np.arctan2(obj_size['x'],       obj_dist) / cam_params['hFOV_rad'] * (lat_samp - 1))
+        obj_x_ang_pix = np.round(np.arctan2(obj_size['x'] / 2.0,       obj_dist) / cam_params['hFOV_rad'] * (lat_samp - 1))
         obj_y_ang_pix = np.round(np.arctan2(obj_size['y'] / 2.0, obj_dist) / cam_params['vFOV_rad'] * (vert_samp - 1))
         obj_h_ang_pix = np.round(np.arctan2(obj_size['height'],  obj_dist) / cam_params['vFOV_rad'] * (vert_samp - 1))
 
@@ -870,9 +940,9 @@ def f_angles_to_movie_v2(vec_data, time, cam_params, obj_size, lat_samp = 51, ve
     # center above the ground. The visible portion runs from ground
     # (= center - height) up to the top of the geometry (= center + y/2);
     # the rest of the cylinder/cube sits below ground and should not render.
-    # obj_size['x'] / obj_size['z'] remain LATERAL HALF-EXTENTS (radius for
-    # cylinders, half-side for cubes) — convention mismatch with 'y' is
-    # legacy but harmless because the renderer applies them as half-widths.
+    # obj_size['x'] is the FULL lateral width (like obj_size['y'] is the full height); the renderer
+    # halves it internally (x/2) to get the half-extent. (Fixed 2026-07-23 — was treated as a half-width,
+    # making objects 2× too wide / ~square; obj_size['z'] is unused for the 2-D silhouette.)
     #
     # Pixel mapping convention (this function and f_render_terrain): both
     # lat and vert pixel formulas NEGATE the angle, so default image viewers
@@ -906,7 +976,7 @@ def f_angles_to_movie_v2(vec_data, time, cam_params, obj_size, lat_samp = 51, ve
     #    original v1 edge-naming (top=small pix, bottom=large pix) matches
     #    both world up/down AND display top/bottom under default origin.
     #
-    # The horizontal half-extent is obj_size['x'] in both modes.
+    # The horizontal half-extent is obj_size['x']/2 in both modes (x = FULL width).
     #
     # v2 step 2: filled silhouettes instead of a 4-edge wireframe (default).
     # Massive sparsity reduction for downstream PCA / CEBRA — most of the
@@ -978,6 +1048,12 @@ def f_angles_to_movie_v2(vec_data, time, cam_params, obj_size, lat_samp = 51, ve
     num_frames = time.shape[0]
     if max_frames is not None:
         num_frames = min(num_frames, int(max_frames))
+    if num_frames < time.shape[0]:            # TRUNCATE the time-indexed inputs FIRST, so bounds + paint
+        vec_data = {**vec_data,               # only compute num_frames (was: full-T angle precompute, clip)
+                    'obj_mon_idx':    vec_data['obj_mon_idx'][:num_frames],
+                    'obj_dist':       vec_data['obj_dist'][:num_frames],
+                    'obj_lat_angle':  vec_data['obj_lat_angle'][:num_frames],
+                    'obj_vert_angle': vec_data['obj_vert_angle'][:num_frames]}
 
     mon_frames = np.zeros((num_frames, vert_samp, lat_samp), dtype=np.uint8)
     if return_depth:
@@ -1039,7 +1115,7 @@ def f_angles_to_movie_v2(vec_data, time, cam_params, obj_size, lat_samp = 51, ve
             # extent of the geometry (so the half-extent above center =
             # obj_size['y']/2). 'height' is the offset of the registered
             # center above the ground.
-            obj_x_ang_pix_f = np.arctan2(obj_size['x'],       obj_dist) / cam_params['hFOV_rad'] * (lat_samp - 1)
+            obj_x_ang_pix_f = np.arctan2(obj_size['x'] / 2.0,       obj_dist) / cam_params['hFOV_rad'] * (lat_samp - 1)
             obj_y_ang_pix_f = np.arctan2(obj_size['y'] / 2.0, obj_dist) / cam_params['vFOV_rad'] * (vert_samp - 1)
             # below-center extent: ground level if clip_underground, else full -y/2.
             if clip_underground:
@@ -1167,7 +1243,7 @@ def f_angles_to_movie_v2(vec_data, time, cam_params, obj_size, lat_samp = 51, ve
             obj_dist = vec_data['obj_dist'][:, n_obj]
             # obj_size: 'x' lateral half-extent, 'y' FULL vertical extent
             # (half above center = y/2), 'height' center-above-ground.
-            obj_x_ang_pix_f = np.arctan2(obj_size['x'],       obj_dist) / cam_params['hFOV_rad'] * (lat_samp - 1)
+            obj_x_ang_pix_f = np.arctan2(obj_size['x'] / 2.0,       obj_dist) / cam_params['hFOV_rad'] * (lat_samp - 1)
             obj_y_ang_pix_f = np.arctan2(obj_size['y'] / 2.0, obj_dist) / cam_params['vFOV_rad'] * (vert_samp - 1)
             if clip_underground:
                 obj_h_ang_pix_f = np.arctan2(obj_size['height'], obj_dist) / cam_params['vFOV_rad'] * (vert_samp - 1)
@@ -1257,7 +1333,9 @@ def f_render_terrain(terrain_data, mouse_xyz, mon_phi, mon_theta, cam_params,
                       eye_height=0.0, stride=4, max_intensity=200, chunk_t=2000,
                       flip_x=False, flip_z=True, swap_xz=False,
                       clip_len=None, point_size=1, max_diff_bytes=int(2e9),
-                      return_depth=False, max_frames=None, verbose=True):
+                      return_depth=False, max_frames=None,
+                      terrain_mode='points', terrain_shade='depth', gray_level=128,
+                      terrain_close_iter=2, verbose=True):
     # Render a heightmap as a depth-shaded ground-plane image on the monitor.
     # Sibling of f_angles_to_movie_v2 — composite with np.maximum to get
     # objects on top of ground:
@@ -1329,6 +1407,21 @@ def f_render_terrain(terrain_data, mouse_xyz, mon_phi, mon_theta, cam_params,
     #               buffer (np.inf where nothing was drawn) for downstream
     #               Z-buffer compositing with the object renderer. Returns
     #               (out_intensity, out_depth) tuple instead of just out.
+    # terrain_mode: 'points' (default) paints scattered terrain vertices — the
+    #               depth buffer is gappy so objects behind terrain leak through
+    #               the holes when composited. 'surface' fills each screen column
+    #               from its horizon (topmost painted terrain row) down to the
+    #               bottom, producing a watertight depth surface so objects behind
+    #               terrain are fully occluded by f_composite_with_depth.
+    # terrain_shade: intensity of the terrain surface ('surface' mode only).
+    #               'depth' (default) = distance-shaded like the points; 'gray' =
+    #               solid gray_level (visible occluding hill); 'none' = 0 so the
+    #               terrain is an INVISIBLE occluder (objects behind it just vanish;
+    #               depth is still filled so occlusion works).
+    # gray_level  : intensity value used when terrain_shade='gray'.
+    # terrain_close_iter: 'surface' horizontal-close passes — each smooths one
+    #               more pixel of ridge-notch / empty-column width. 2 handles the
+    #               usual 1-2px cracks; raise if wider slivers remain.
 
     if stride is None or stride >= 1:
         # Original path: shared helper + integer modulo subsample.
@@ -1570,9 +1663,109 @@ def f_render_terrain(terrain_data, mouse_xyz, mon_phi, mon_theta, cam_params,
 
         t_start = t_end
 
+    # Watertight surface: fill the gappy scatter into a continuous ground plane
+    # so the depth buffer occludes objects behind terrain (needs the depth).
+    if terrain_mode == 'surface' and return_depth:
+        _terrain_surface_fill(out, out_depth, terrain_shade, gray_level,
+                              close_iter=terrain_close_iter)
+
     if return_depth:
         return out, out_depth
     return out
+
+
+def _terrain_surface_fill(out, out_depth, terrain_shade='depth', gray_level=128,
+                          close_iter=2, chunk_t=4000):
+    # In-place watertight fill of a scattered terrain render into a ground plane.
+    # For a heightfield seen from above the ground, every screen column is solid
+    # terrain from its horizon (topmost painted row) down to the bottom of view.
+    # Two passes:
+    #  1) VERTICAL ffill-down: fill each column's holes from the last painted
+    #     pixel at-or-above (conservative — filled holes take the slightly-
+    #     farther neighbor depth, so terrain never over-occludes).
+    #  2) HORIZONTAL close (close_iter times): the raw scatter leaves a jagged
+    #     horizon (ridge notches) + 1px-wide empty columns (transparent slivers).
+    #     Fill any remaining hole that is bracketed by terrain on an OPPOSITE
+    #     side (left&right OR up&down) with the nearest (min-depth) neighbor.
+    #     This smooths the ridge and closes 1px slivers WITHOUT growing the outer
+    #     silhouette (an edge pixel has terrain on only one side → left alone).
+    #     Each iteration closes one more pixel of width.
+    # Then shade the whole filled region per terrain_shade. Processed in time
+    # chunks so peak memory is bounded on long (full-session) renders.
+    #   out       : (T, V, L) uint8 intensity, modified in place.
+    #   out_depth : (T, V, L) float32 depth, np.inf where unpainted; modified in place.
+    T = out_depth.shape[0]
+    for t0 in range(0, T, int(chunk_t)):
+        _terrain_surface_fill_block(out[t0:t0 + int(chunk_t)],
+                                    out_depth[t0:t0 + int(chunk_t)],
+                                    terrain_shade, gray_level, int(close_iter))
+
+
+def _terrain_surface_fill_block(out, out_depth, terrain_shade, gray_level, close_iter):
+    # One time-chunk of _terrain_surface_fill (per-frame independent). Slices are
+    # views into the parent buffers, so in-place edits propagate.
+    V = out_depth.shape[1]
+    rows = np.arange(V)[None, :, None]                       # (1, V, 1)
+    painted = np.isfinite(out_depth)                         # (t, V, L)
+    has = painted.any(axis=1)                                # (t, L) column has terrain
+    horizon = np.argmax(painted, axis=1)                     # (t, L) topmost painted row
+    region = (rows >= horizon[:, None, :]) & has[:, None, :]  # (t, V, L) terrain area
+    shade_depth = (terrain_shade == 'depth')
+
+    # 1) vertical ffill-down within each column.
+    src = np.where(painted, np.arange(V)[None, :, None], -1)
+    src = np.maximum.accumulate(src, axis=1)                 # (t, V, L)
+    fillable = region & (~painted) & (src >= 0)
+    ti, vi, li = np.nonzero(fillable)
+    s = src[ti, vi, li]
+    out_depth[ti, vi, li] = out_depth[ti, s, li]
+    if shade_depth:
+        out[ti, vi, li] = out[ti, s, li]
+
+    # 2) horizontal close of ridge notches + 1px empty columns.
+    for _ in range(close_iter):
+        fin = np.isfinite(out_depth)
+        if fin.all():
+            break
+        dl = np.full_like(out_depth, np.inf); dl[:, :, 1:]  = out_depth[:, :, :-1]
+        dr = np.full_like(out_depth, np.inf); dr[:, :, :-1] = out_depth[:, :, 1:]
+        du = np.full_like(out_depth, np.inf); du[:, 1:, :]  = out_depth[:, :-1, :]
+        dd = np.full_like(out_depth, np.inf); dd[:, :-1, :] = out_depth[:, 1:, :]
+        opp = ((np.isfinite(dl) & np.isfinite(dr)) |
+               (np.isfinite(du) & np.isfinite(dd)))
+        target = (~fin) & opp
+        if not target.any():
+            break
+        nd = np.minimum(np.minimum(dl, dr), np.minimum(du, dd))   # nearest neighbor
+        ti, vi, li = np.nonzero(target)
+        out_depth[ti, vi, li] = nd[ti, vi, li]
+        if shade_depth:
+            il = np.zeros_like(out); il[:, :, 1:]  = out[:, :, :-1]
+            ir = np.zeros_like(out); ir[:, :, :-1] = out[:, :, 1:]
+            iu = np.zeros_like(out); iu[:, 1:, :]  = out[:, :-1, :]
+            id_ = np.zeros_like(out); id_[:, :-1, :] = out[:, 1:, :]
+            ni = np.maximum(np.maximum(il, ir), np.maximum(iu, id_))
+            out[ti, vi, li] = ni[ti, vi, li]
+
+    # 3) fill ENCLOSED interior holes the opposite-pair rule misses (odd specks,
+    #    diagonal corners). binary_fill_holes only fills fully-surrounded gaps, so
+    #    it never grows the outer silhouette. Depth from the nearest finite pixel.
+    for f in range(out_depth.shape[0]):
+        M = np.isfinite(out_depth[f])
+        enclosed = sc.ndimage.binary_fill_holes(M) & ~M
+        if not enclosed.any():
+            continue
+        iy, ix = sc.ndimage.distance_transform_edt(~M, return_distances=False,
+                                                   return_indices=True)
+        out_depth[f][enclosed] = out_depth[f][iy[enclosed], ix[enclosed]]
+        if shade_depth:
+            out[f][enclosed] = out[f][iy[enclosed], ix[enclosed]]
+
+    # 4) shade the full filled region.
+    if terrain_shade == 'gray':
+        out[np.isfinite(out_depth)] = np.uint8(gray_level)   # solid visible occluder
+    elif terrain_shade == 'none':
+        out[np.isfinite(out_depth)] = 0                      # invisible occluder
 
 
 def f_composite_with_depth(layers):
@@ -1608,6 +1801,36 @@ def f_composite_with_depth(layers):
     return out
 
 
+def f_object_visibility(mon_per_obj, obj_dist, terrain_depth, absent=np.nan):
+    # Per-object fraction of its on-screen silhouette NOT occluded by terrain.
+    #   mon_per_obj  : (T, vert, lat, n_obj) uint8 — each object's coverage rendered
+    #                  ALONE (f_angles_to_movie_v2 return_per_object). This is the
+    #                  un-occluded on-screen silhouette (FOV/monitor clipping +
+    #                  antialiased edge coverage), used as the denominator.
+    #   obj_dist     : (T, n_obj) object CENTER distance per frame (vec_data['obj_dist']).
+    #   terrain_depth: (T, vert, lat) float32 terrain depth, np.inf where no terrain
+    #                  (f_render_terrain return_depth; use the 'surface' watertight fill).
+    #   absent       : value returned for a frame where the object has zero on-screen
+    #                  coverage (default NaN — "not present", distinct from 0 = fully
+    #                  occluded). Pass 0.0 to treat absent as invisible.
+    # Returns visible_frac (T, n_obj) in [0, 1]: coverage-weighted fraction of the
+    #   object's silhouette whose per-pixel terrain is FARTHER than the object center
+    #   (or absent) → object is the front surface there. Per-pixel terrain vs a scalar
+    #   object distance makes this a PARTIAL fraction: a hill nearer than the object
+    #   occludes its lower pixels while its top stays visible.
+    cov = mon_per_obj.astype(np.float32) / 255.0            # (T, V, L, n_obj) coverage
+    T, V, L, n_obj = cov.shape
+    # object in front where terrain is farther-or-equal, or terrain absent (inf).
+    td = terrain_depth[:, :, :, None]                        # (T, V, L, 1)
+    visible = (~np.isfinite(td)) | (td >= obj_dist[:, None, None, :])
+    denom = cov.sum(axis=(1, 2))                             # (T, n_obj) total silhouette
+    numer = (cov * visible).sum(axis=(1, 2))                 # (T, n_obj) visible silhouette
+    with np.errstate(invalid='ignore', divide='ignore'):
+        frac = numer / denom
+    frac[denom <= 0] = absent                                # object off-screen → absent
+    return frac
+
+
 def f_add_terrain_to_monitor(terrain_data, mouse_xyz, mon_phi, theta, cam_params,
                               mon_frames, mon_depth,
                               lat_samp=51, vert_samp=51,
@@ -1615,7 +1838,8 @@ def f_add_terrain_to_monitor(terrain_data, mouse_xyz, mon_phi, theta, cam_params
                               flip_x=False, flip_z=True, swap_xz=False,
                               eye_height=0.0, stride=0.1, max_intensity=200, chunk_t=2000,
                               point_size=1, clip_len=None, max_frames=None,
-                              verbose=True):
+                              terrain_mode='points', terrain_shade='depth', gray_level=128,
+                              terrain_close_iter=2, verbose=True):
     # Render the terrain heightmap onto a monitor and Z-buffer composite with
     # an existing object render. Convenience wrapper around f_render_terrain
     # + f_composite_with_depth — use to add the terrain layer behind/around
@@ -1670,7 +1894,9 @@ def f_add_terrain_to_monitor(terrain_data, mouse_xyz, mon_phi, theta, cam_params
         flip_x=flip_x, flip_z=flip_z, swap_xz=swap_xz,
         eye_height=eye_height, stride=stride, max_intensity=max_intensity,
         chunk_t=chunk_t, clip_len=clip_len, point_size=point_size,
-        return_depth=True, max_frames=max_frames, verbose=verbose,
+        return_depth=True, max_frames=max_frames,
+        terrain_mode=terrain_mode, terrain_shade=terrain_shade, gray_level=gray_level,
+        terrain_close_iter=terrain_close_iter, verbose=verbose,
     )
     return f_composite_with_depth([(terrain, terrain_depth),
                                     (mon_frames, mon_depth)])

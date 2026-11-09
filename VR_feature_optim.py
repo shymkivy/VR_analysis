@@ -28,7 +28,7 @@ from f_decoding import f_imaging_fs
 from f_feature_recon import f_truncate_session, f_acuity_sigma_px, f_make_target
 from f_feature_optim import (f_build_gabor_banks, f_gabor_configs, f_build_meng_banks,
                              f_meng_configs, f_sweep_marginal, f_sweep_recon,
-                             f_plot_sweep_marginal)
+                             f_plot_sweep_marginal, f_conv_configs)
 
 #%% Config — single dataset, render + smoothing, gabor MASTER bank, sweep axes
 mouse_id     = 'L'
@@ -156,3 +156,49 @@ if 1:
         sel = [r for r in mrows if r['axis'] == a]
         b = max(sel, key=lambda r: (r['r2_hi'] if np.isfinite(r['r2_hi']) else -np.inf))
         print(f'  best {a:8s}: {str(b[_mval[a]]):>18s}   R²(hi-motion)={b["r2_hi"]:+.3f}')
+
+
+#%% CONV_REPO sampled — optimize #PCs on POINT-SAMPLED gaborS/mengS (no grid pooling, no re-conv)
+# Loads the DENSE maps from this dataset's conv_repo and POINT-SAMPLES them (gaborS/mengS style)
+# instead of grid-pooling here, then sweeps n_pca (nested truncation, free) → recon R² vs the SAME
+# rendered target — "how many PCs of the sampled feature do we actually need." Requires a conv_repo
+# for this dataset (VR_feature_gen GEN_MODE='conv_repo'); features are truncated to the rendered
+# n_frames. Optionally also sweep sampling stride ds / wavelengths / orientations / (meng) tf by
+# listing them below (each combo → its own r2-vs-#PC line). gabor → pooled R²; meng → HIGH-motion R².
+if 1:
+    from f_conv_repo import f_conv_repo_dir
+    import itertools as _it
+    import matplotlib.pyplot as plt
+
+    opt_features_dir = 'F:/VR/features/' + mouse_id
+    opt_conv_tag  = 'gen_7_11_26'         # conv_repo GEN_TAG (folder <dset_name>_<tag>)
+    opt_kind      = 'gabor'               # 'gabor' | 'meng'
+    opt_ds_list   = [8]                   # sampling stride(s) — one line per ds
+    opt_wl_subsets   = [None]             # None = all repo wavelengths; or [(6, 9, 12)], [(9,)]
+    opt_odeg_subsets = [None]             # None = all orientations;      or [(0, 90)]
+    opt_tf_subsets   = [None]             # meng only: None = all tfreqs; or [(0.15,)]
+    opt_npca_list = [5, 10, 20, 40, 80, 120, 200]   # the axis being optimized
+    opt_lags      = [[0]] if opt_kind == 'gabor' else [[0, 100, 200]]
+    opt_decoder   = [('ridge', 1.0)]
+    opt_y         = 'r2' if opt_kind == 'gabor' else 'r2_hi'   # meng judged on HIGH-motion
+
+    _repo = f_conv_repo_dir(opt_features_dir, session['est1']['dset_name'], opt_conv_tag)
+    _cfgs = list(f_conv_configs(_repo, opt_ds_list, kind=opt_kind, n_frames=_sub['T_img'],
+                                wl_subsets=opt_wl_subsets, odeg_subsets=opt_odeg_subsets,
+                                tf_subsets=opt_tf_subsets))
+    print(f'conv_repo {_repo.name}: {len(_cfgs)} config(s), raw dims {[c[1].shape[1] for c in _cfgs]}')
+    crows = f_sweep_recon(_cfgs, target, cv_kw, fs_img, n_pca_list=opt_npca_list,
+                          lags_list=opt_lags, decoder_list=opt_decoder, motion=motion)
+
+    fig, ax = plt.subplots(1, 1, figsize=(6.2, 4.2))
+    for _key, _grp in _it.groupby(sorted(crows, key=lambda r: (r['grid'], r['dim'], r['n_pca'])),
+                                  key=lambda r: (r['grid'], r['dim'])):
+        _g = list(_grp)
+        ax.plot([r['n_pca'] for r in _g], [r[opt_y] for r in _g], '-o', ms=4,
+                label=f'{opt_kind} {_key[0]} (raw dim {_key[1]})')
+    ax.set_xlabel('# PCs'); ax.set_ylabel(f'recon R² ({opt_y})')
+    ax.axhline(0, color='gray', lw=0.6); ax.legend(fontsize=8, loc='lower right')
+    ax.set_title(f'{dset_tag} — {opt_kind} SAMPLED (conv_repo) recon R² vs #PCs')
+    fig.tight_layout()
+    _best = max(crows, key=lambda r: (r[opt_y] if np.isfinite(r[opt_y]) else -np.inf))
+    print(f"  best: n_pca={_best['n_pca']}  raw dim={_best['dim']}  {opt_y}={_best[opt_y]:+.3f}")

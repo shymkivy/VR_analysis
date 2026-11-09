@@ -105,7 +105,7 @@ cam_params = {'aspect':             16/9,           # 1920/1080
               'FOV_axis':           'vertical',     # which axis is fixed
               'FOV_deg':            65.9,           # 80
               'cam_rotation_deg':   49.2,           # was 80/2
-              'clip_len':           60,
+              'clip_len':           100,
               'num_mon':            2,
               'cam_height':         0.6}            # camera Y offset above
                                                     # mov_data['y_pos'] (= rb
@@ -138,17 +138,19 @@ mon_l_phi = f_add_phase(phi, -cam_params['cam_rotation_rad'])
 vec_data_r = f_get_monitor_coords(mov_data_eye, mon_r_phi, theta, bh_data[n_dset], cam_params, remove_outside_objects=True)
 vec_data_l = f_get_monitor_coords(mov_data_eye, mon_l_phi, theta, bh_data[n_dset], cam_params, remove_outside_objects=True)
 
-num_samp = 101
+lat_samp  = 150     # WIDTH per monitor — angular aspect hFOV:vFOV ≈ 1.49 (matches feature pipeline 150×101)
+vert_samp = 101     # HEIGHT per monitor
+num_samp  = lat_samp   # legacy alias (a few refs); render uses lat_samp/vert_samp explicitly
 # max_frames: cap on the time axis for both monitor + terrain renderers.
 # Set to None to render the full session; small integer (e.g., 200, 1000) for
 # fast debugging. Threaded through f_angles_to_movie_v2 and f_render_terrain.
-max_frames = 500
-# left_mon_frames  = f_angles_to_movie(vec_data_l, mov_data['time'], cam_params, obj_size, lat_samp=num_samp, vert_samp=num_samp)
-# right_mon_frames = f_angles_to_movie(vec_data_r, mov_data['time'], cam_params, obj_size, lat_samp=num_samp, vert_samp=num_samp)
-left_mon_frames, left_mon_depth  = f_angles_to_movie_v2(vec_data_l, mov_data['time'], cam_params, obj_size, lat_samp=num_samp, vert_samp=num_samp
-                                        , filled = True, antialias = True, chunk_t = None, return_depth = True, max_frames = max_frames)
-right_mon_frames, right_mon_depth = f_angles_to_movie_v2(vec_data_r, mov_data['time'], cam_params, obj_size, lat_samp=num_samp, vert_samp=num_samp
-                                        , filled = True, antialias = True, chunk_t = None, return_depth = True, max_frames = max_frames)
+max_frames = 2000
+# left_mon_frames  = f_angles_to_movie(vec_data_l, mov_data['time'], cam_params, obj_size, lat_samp=lat_samp, vert_samp=vert_samp)
+# right_mon_frames = f_angles_to_movie(vec_data_r, mov_data['time'], cam_params, obj_size, lat_samp=lat_samp, vert_samp=vert_samp)
+left_mon_frames, left_mon_depth  = f_angles_to_movie_v2(vec_data_l, mov_data['time'], cam_params, obj_size, lat_samp=lat_samp, vert_samp=vert_samp,
+                                        filled = True, antialias = True, chunk_t = None, return_depth = True, max_frames = max_frames)
+right_mon_frames, right_mon_depth = f_angles_to_movie_v2(vec_data_r, mov_data['time'], cam_params, obj_size, lat_samp=lat_samp, vert_samp=vert_samp,
+                                        filled = True, antialias = True, chunk_t = None, return_depth = True, max_frames = max_frames)
 
 # Terrain coord-system sanity checks. Each block is toggled by `if 0:` / `if 1:`.
 # All four use chunk_pitch=122, chunk_centered=True, flip_z=True (the orientation
@@ -189,14 +191,24 @@ if 0:
 # renderer uses cell_size = chunk_pitch / cell_max ≈ 0.984 internally.
 # Adjust eye_height if the mouse should be raised above terrain.
 render_terrain = True
-terrain_clip_len   = None   # None = use cam_params['clip_len']. Override to render
+terrain_clip_len   = cam_params['clip_len']   # None = use cam_params['clip_len']. Override to render
                              # terrain farther/closer than objects (e.g., 120).
-terrain_stride     = 0.1      # integer ≥ 1 keeps every Nth cell; float < 1
+terrain_stride     = 1      # integer ≥ 1 keeps every Nth cell; float < 1
                              # (e.g., 0.5) oversamples via bilinear interp.
                              # Memory ~ (1/stride)² when below 1.
 terrain_point_size = 1      # pixel half-size of patch painted per sample.
                              # 1 = single pixel (gappy near-field); 2-3 fills
                              # gaps cheaply without increasing sample count.
+terrain_mode  = 'surface'   # 'points' = scatter vertices (gappy depth, objects
+                             # leak through). 'surface' = watertight column fill
+                             # so objects behind terrain are fully occluded.
+terrain_shade = 'gray'      # 'surface' look: 'depth' distance-shaded, 'gray'
+                             # solid visible occluder, 'none' invisible occluder
+                             # (objects behind terrain vanish, no ground drawn).
+terrain_gray  = 0         # intensity for terrain_shade='gray'.
+terrain_close = 2           # 'surface' horizontal-close passes: smooths the
+                             # jagged horizon + closes 1px transparent slivers.
+                             # Raise if wider cracks remain.
 if render_terrain:
     # Use the eye-shifted xyz (mouse_y + cam_height) so the renderer's camera
     # matches f_get_monitor_coords' camera. eye_height=0 because the shift
@@ -206,16 +218,20 @@ if render_terrain:
     left_mon_frames = f_add_terrain_to_monitor(
         bh_data[n_dset]['terrainData'], mouse_xyz_eye, mon_l_phi, theta, cam_params,
         left_mon_frames, left_mon_depth,
-        lat_samp=num_samp, vert_samp=num_samp,
+        lat_samp=lat_samp, vert_samp=vert_samp,
         stride=terrain_stride, point_size=terrain_point_size,
         clip_len=terrain_clip_len, max_frames=max_frames,
+        terrain_mode=terrain_mode, terrain_shade=terrain_shade, gray_level=terrain_gray,
+        terrain_close_iter=terrain_close,
     )
     right_mon_frames = f_add_terrain_to_monitor(
         bh_data[n_dset]['terrainData'], mouse_xyz_eye, mon_r_phi, theta, cam_params,
         right_mon_frames, right_mon_depth,
-        lat_samp=num_samp, vert_samp=num_samp,
+        lat_samp=lat_samp, vert_samp=vert_samp,
         stride=terrain_stride, point_size=terrain_point_size,
         clip_len=terrain_clip_len, max_frames=max_frames,
+        terrain_mode=terrain_mode, terrain_shade=terrain_shade, gray_level=terrain_gray,
+        terrain_close_iter=terrain_close,
     )
 
 two_mon_frames = np.concatenate((left_mon_frames, right_mon_frames), axis=2)
@@ -229,7 +245,7 @@ if 1:
 
 
 #%% Quick-look: plot frame 0 to sanity-check orientation in a single still
-f_plot_monitor_frame(two_mon_frames, num_samp, n_fr=50)
+f_plot_monitor_frame(two_mon_frames, lat_samp, n_fr=50)
 plt.show()
 
 
@@ -274,8 +290,8 @@ f_plot_obj_terrain_heights(two_mon_frames,
                             vec_data_l, vec_data_r,
                             bh_data[n_dset]['object_data'],
                             bh_data[n_dset]['terrainData'],
-                            cam_params, num_samp,
-                            n_fr=50, terr_kw=_terr_kw)
+                            cam_params, lat_samp,
+                            n_fr=50, terr_kw=_terr_kw, vert_samp=vert_samp)
 plt.show()
 
 #%%

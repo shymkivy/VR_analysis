@@ -20,8 +20,10 @@ low-risk compute utils).
 import numpy as np
 import matplotlib.pyplot as plt
 
+from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.decomposition import PCA
-from sklearn.linear_model import Ridge, RidgeCV, LogisticRegression, LogisticRegressionCV
+from sklearn.linear_model import (Ridge, RidgeCV, ElasticNet, Lasso,
+                                   LogisticRegression, LogisticRegressionCV)
 from sklearn.neighbors import KNeighborsRegressor, KNeighborsClassifier
 from sklearn.cross_decomposition import PLSRegression, CCA
 from sklearn.metrics import r2_score, roc_auc_score
@@ -58,8 +60,64 @@ def f_resolve_n_components(n_components, n_in, n_out):
     return max(1, min(req, cap))
 
 
+class BandedRidge(BaseEstimator, RegressorMixin):
+    """Banded ridge — a SEPARATE L2 penalty α_b per feature-space (band).
+
+    With collinear banks of different dimensionality/scale (pix / gabor / meng / self_mot /
+    beh), one global λ is provably wrong: the optimal λ depends on each space's covariance,
+    dimensionality, and predictive power [Nunez-Elizalde 2019]. Banded ridge assigns one λ per
+    band and comes with a per-band variance decomposition.
+
+    Implementation: minimizing ‖y−Xw‖² + Σ_b α_b‖w_b‖² is ORDINARY ridge (α=1) on per-band-
+    rescaled columns X·diag(1/√α_b) — fit Ridge(α=1) on the scaled design, then unscale the
+    weights back to the original feature space. So it reuses sklearn's solver exactly and stays
+    a from-scratch fit inside the harness (no himalaya dependency).
+
+    Parameters
+    ----------
+    bands : (d,) int array      band id per design column (see f_encoding._band_columns).
+    band_alphas : dict{int:α}   per-band ridge penalty. Bands absent from the dict get α=1.
+    fit_intercept : bool
+
+    predict_band(X, b) → that band's ADDITIVE contribution X_b·w_b (no intercept), the seam
+    for the variance partition.
+    """
+    def __init__(self, bands, band_alphas, fit_intercept=True):
+        self.bands = bands
+        self.band_alphas = band_alphas
+        self.fit_intercept = fit_intercept
+
+    def _scales(self, d):
+        b = np.asarray(self.bands)
+        s = np.ones(d, float)
+        for k, a in self.band_alphas.items():
+            s[b == k] = 1.0 / np.sqrt(a)
+        return s
+
+    def fit(self, X, y):
+        X = np.asarray(X, float)
+        self.scale_ = self._scales(X.shape[1])
+        self._ridge = Ridge(alpha=1.0, fit_intercept=self.fit_intercept).fit(X * self.scale_, y)
+        # unscale coefs → original feature space (for predict_band / RF reads)
+        coef = np.atleast_2d(self._ridge.coef_)          # (n_out, d)
+        self.coef_ = coef * self.scale_                  # broadcast over rows
+        self.intercept_ = np.atleast_1d(self._ridge.intercept_)
+        self._1d = (np.ndim(self._ridge.coef_) == 1)
+        return self
+
+    def predict(self, X):
+        return self._ridge.predict(np.asarray(X, float) * self.scale_)
+
+    def predict_band(self, X, b):
+        """Additive contribution of band `b` (no intercept), (n, n_out) or (n,)."""
+        m = np.asarray(self.bands) == b
+        out = np.asarray(X, float)[:, m] @ self.coef_[:, m].T
+        return out[:, 0] if self._1d else out
+
+
 def make_decoder(name, ridge_alpha=1.0, k_nn=15, ridgecv_alphas=None,
-                 n_components=None, task='regression'):
+                 n_components=None, task='regression', bands=None, band_alphas=None,
+                 l1_ratio=0.5):
     """Build a decoder estimator by name — single source of truth.
 
     Mirrors the analog decoder with its classification twin when
@@ -70,8 +128,19 @@ def make_decoder(name, ridge_alpha=1.0, k_nn=15, ridgecv_alphas=None,
 
     Parameters
     ----------
-    name : {'ridge', 'ridgecv', 'knn', 'pls', 'cca'}
-    ridge_alpha : float       Ridge penalty (α). For classification, C = 1/α.
+    name : {'ridge', 'ridgecv', 'knn', 'pls', 'cca', 'banded', 'elasticnet', 'lasso',
+            'huber', 'lad'}
+            L1-LOSS (minimize |y−ŷ|, robust to outlier frames, fits the median): 'lad' (pure LAD via
+            QuantileRegressor + LP → slow) | 'huber' (|·| in the tails, faster). L1-PENALTY (sparse
+            weights — NOT the loss): 'lasso' | 'elasticnet'. huber/lad wrap MultiOutputRegressor
+            (per-neuron fit → independence kept, but no closed-form multi-output → slow at scale).
+    ridge_alpha : float       Ridge penalty (α). For classification, C = 1/α. Also elasticnet/lasso
+                              strength, L2 for huber, L1-penalty for lad (0 = pure LAD). sklearn
+                              scales these differently — re-tune per decoder.
+    l1_ratio : float          elasticnet only: 0 = pure L2 (ridge), 1 = pure L1 (lasso), between =
+                              mix. 'lasso' is elasticnet with l1_ratio=1.
+    bands, band_alphas        for name='banded' only: per-column band ids +
+                              {band_id: α} (see BandedRidge).
     k_nn : int                neighbors for the knn decoder.
     ridgecv_alphas : array    α grid for ridgecv; None → logspace(-2, 4, 13).
     n_components : int         PLS/CCA latent rank (PRE-resolved via
@@ -96,8 +165,24 @@ def make_decoder(name, ridge_alpha=1.0, k_nn=15, ridgecv_alphas=None,
         raise ValueError(f'unknown / non-classification decoder: {name!r}')
     if name == 'ridge':
         return Ridge(alpha=ridge_alpha)
+    if name == 'banded':
+        if bands is None or band_alphas is None:
+            raise ValueError("decoder='banded' requires bands + band_alphas")
+        return BandedRidge(bands=bands, band_alphas=band_alphas)
     if name == 'ridgecv':
         return RidgeCV(alphas=ridgecv_alphas)
+    if name in ('elasticnet', 'enet'):                   # L2 (ridge) + L1 penalty mix; per-target
+        return ElasticNet(alpha=ridge_alpha, l1_ratio=l1_ratio, max_iter=5000, random_state=0)
+    if name == 'lasso':                                  # pure L1 penalty (sparse); per-target
+        return Lasso(alpha=ridge_alpha, max_iter=5000, random_state=0)
+    if name == 'huber':                                  # L1-in-the-tails ROBUST loss (fast); per-target
+        from sklearn.linear_model import HuberRegressor
+        from sklearn.multioutput import MultiOutputRegressor
+        return MultiOutputRegressor(HuberRegressor(alpha=ridge_alpha, epsilon=1.35, max_iter=500))
+    if name in ('lad', 'quantile'):                      # L1 LOSS = median regression (LP; SLOW); per-target
+        from sklearn.linear_model import QuantileRegressor
+        from sklearn.multioutput import MultiOutputRegressor
+        return MultiOutputRegressor(QuantileRegressor(quantile=0.5, alpha=ridge_alpha, solver='highs'))
     if name == 'knn':
         return KNeighborsRegressor(n_neighbors=k_nn, weights='distance')
     if name == 'pls':
@@ -190,8 +275,8 @@ def f_pca_prefix(Y, n_pcs, random_state=42):
 
 
 def f_lags_from_ms(ms_list, fs):
-    """Convert a list of millisecond lags to sorted unique integer frame lags."""
-    return sorted({int(round(m * fs / 1000.0)) for m in ms_list})
+    """Convert a list (or scalar) of millisecond lags to sorted unique integer frame lags."""
+    return sorted({int(round(m * fs / 1000.0)) for m in np.atleast_1d(ms_list)})
 
 
 def f_lag_embed(X, lags, names=None):
@@ -426,7 +511,8 @@ def f_run_decode_sweep(built_blocks, Y_neu, frame_t, cfg, verbose=True):
         group_rows, groups_present, n_pcs_sweep, embargo_fr, decode_lags, fs, max_pcs,
         pca_neu_full, detrend_sigma_fr, cfg.
     """
-    blocks = cfg['sweep_target_blocks']
+    from f_feature_source import f_expand_blocks           # bank name → its `<bank>:<cell>` blocks
+    blocks = f_expand_blocks(built_blocks, cfg['sweep_target_blocks'], what='sweep_target_block')
     n_pcs_sweep = list(cfg.get('n_pcs_sweep', DEFAULT_N_PCS_SWEEP))
     detrend_blocks = cfg.get('detrend_blocks')
     detrend_sigma_sec = cfg.get('detrend_sigma_sec')
@@ -557,6 +643,365 @@ def f_run_decode_null(sweep, built_blocks, Y_neu, cfg_null, verbose=True):
             print(f'  shuffle {ns+1:2d}/{n_shuffles} done')
 
     return {'r2_mat_null': r2_mat_null, 'auc_mat_null': auc_mat_null, 'cfg_null': cfg_null}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Group 3b — decoder-params struct + generic single-axis sweep (input × target ×
+# #PCs × score). One reusable config dict, one atomic run, one axis-at-a-time
+# sweep. Structure-aware scores (RV / Procrustes / RSA) go beyond per-dim R².
+# ─────────────────────────────────────────────────────────────────────────────
+
+def f_default_decoder_params(**overrides):
+    """Shared decoder-params struct — single source of truth for the decode sweep and the
+    eventual 'best params' store. A plain dict, so it can be joblib-saved and imported by the
+    other scripts. Override any key via kwargs. Consumed by f_run_decoder / f_decoder_sweep.
+
+    Keys: input_source ('neural' | 'cebra:<name>'), n_input_pcs, neural_pca ('global' |
+    'within_fold' — leak-free but disables lags), target_block (a SINGLE-PCA block:
+    pix/gaborS/mengS/meng), n_target_pcs (None=all | int=top-k), decoder, ridge_alpha, k_nn,
+    n_components (pls/cca), ridgecv_alphas, n_folds, fold_scheme ('contiguous' | 'interleaved'
+    — the latter chops T into n_blocks small blocks round-robin'd to folds so no fold is a
+    single quiet/odd epoch; mildly leakier), n_blocks (interleaved only; None → n_folds*10),
+    embargo_sec, lags_ms, standardize, scores (subset of r2/r2_vw/rv/procrustes/rsa),
+    rsa_subsample, seed."""
+    cfg = {
+        'input_source':  'neural',
+        'n_input_pcs':   50,
+        'neural_pca':    'global',
+        'target_block':  'pix',
+        'n_target_pcs':  None,
+        'decoder':       'ridge',
+        'ridge_alpha':   1.0,
+        'k_nn':          15,
+        'n_components':  20,
+        'ridgecv_alphas': None,
+        'n_folds':       5,
+        'fold_scheme':   'contiguous',   # 'contiguous' | 'interleaved' (chop → round-robin)
+        'n_blocks':      None,           # interleaved: # small blocks (None → n_folds*10)
+        'embargo_sec':   0.0,
+        'lags_ms':       list(range(-300, 301, 100)),
+        'standardize':   True,
+        'scores':        ['r2', 'r2_vw', 'rv', 'procrustes', 'rsa'],
+        'rsa_subsample': 2000,
+        'seed':          42,
+    }
+    cfg.update(overrides)
+    return cfg
+
+
+def _rv_coefficient(A, B):
+    """RV coefficient between column-centered A, B (n×d) — a multivariate r² between two point
+    clouds. Cheap d×d form ‖AᵀB‖_F² / (‖AᵀA‖_F·‖BᵀB‖_F) (no n×n matrix). ∈ [0,1]; d==1 → r²."""
+    A = A - A.mean(axis=0); B = B - B.mean(axis=0)
+    num = float(np.sum((A.T @ B) ** 2))
+    den = float(np.linalg.norm(A.T @ A) * np.linalg.norm(B.T @ B))
+    return num / den if den > 0 else np.nan
+
+
+def _procrustes_similarity(A, B):
+    """1 − Procrustes disparity (optimal translation/rotation/scale alignment). ∈ [0,1].
+    d==1 → |Pearson r| (rotation is trivial in 1-D); degenerate/constant input → nan."""
+    if A.shape[1] == 1:
+        a = A[:, 0] - A[:, 0].mean(); b = B[:, 0] - B[:, 0].mean()
+        den = float(np.linalg.norm(a) * np.linalg.norm(b))
+        return float(abs(a @ b) / den) if den > 0 else np.nan
+    try:
+        from scipy.spatial import procrustes
+        _, _, disparity = procrustes(A, B)
+        return float(1.0 - disparity)
+    except Exception:
+        return np.nan
+
+
+def _rsa_score(A, B, subsample=2000, rng=None):
+    """Spearman corr of the timepoint RDMs (correlation distance) of A vs B — do the two
+    reconstructions preserve the same relational geometry across time? Subsamples `subsample`
+    rows (seeded) to bound the n×n pdist. d<2 or n<3 → nan."""
+    n, d = A.shape
+    if d < 2 or n < 3:
+        return np.nan
+    from scipy.spatial.distance import pdist
+    from scipy.stats import spearmanr
+    if rng is None:
+        rng = np.random.default_rng(42)
+    if subsample and n > subsample:
+        sel = np.sort(rng.choice(n, size=int(subsample), replace=False))
+        A, B = A[sel], B[sel]
+    da, db = pdist(A, metric='correlation'), pdist(B, metric='correlation')
+    m = np.isfinite(da) & np.isfinite(db)
+    if m.sum() < 3:
+        return np.nan
+    return float(spearmanr(da[m], db[m]).correlation)
+
+
+def f_structure_scores(y_true, y_pred, which=('r2', 'r2_vw', 'rv', 'procrustes', 'rsa'),
+                       rsa_subsample=2000, rng=None):
+    """Score OOF predictions (n_valid × d target) several ways — per-dim AND whole-structure:
+      r2         per-dimension R² (uniform_average) — the baseline.
+      r2_vw      variance-weighted (pooled/joint) R² — total-shape variance recovered.
+      rv         RV coefficient (multivariate r² between the two point clouds) ∈ [0,1].
+      procrustes 1 − Procrustes disparity (shape up to rotation/scale) ∈ [0,1].
+      rsa        Spearman corr of the timepoint RDMs of y_true vs y_pred ∈ [−1,1].
+    Single-column target (d==1) degrades gracefully (rv→r², procrustes→|r|, rsa→nan).
+    Returns {name: float} for the requested `which`."""
+    yt = np.asarray(y_true, float); yh = np.asarray(y_pred, float)
+    if yt.ndim == 1:
+        yt = yt[:, None]
+    if yh.ndim == 1:
+        yh = yh[:, None]
+    n = yt.shape[0]
+    out = {}
+    if 'r2' in which:
+        out['r2'] = float(r2_score(yt, yh, multioutput='uniform_average')) if n > 1 else np.nan
+    if 'r2_vw' in which:
+        out['r2_vw'] = (float(r2_score(yt, yh, multioutput='variance_weighted'))
+                        if n > 1 else np.nan)
+    if 'rv' in which:
+        out['rv'] = _rv_coefficient(yt, yh)
+    if 'procrustes' in which:
+        out['procrustes'] = _procrustes_similarity(yt, yh)
+    if 'rsa' in which:
+        out['rsa'] = _rsa_score(yt, yh, rsa_subsample, rng)
+    return out
+
+
+def f_run_decoder(config, built_blocks, Y_neu, cebra_models=None, frame_t=None, verbose=False):
+    """ONE decode under `config` (see f_default_decoder_params): resolve the decoder INPUT
+    (neural PCs or a CEBRA embedding) + the TARGET block (top-k PCs), run ONE blocked-CV fit
+    (variance-weighted, prediction-returning) via f_blocked_cv_r2, and score the OOF
+    predictions with f_structure_scores. Returns
+    {'scores': {name: val}, 'n_valid': int, 'res': <f_blocked_cv_r2 dict>}."""
+    from f_cebra_helpers import f_blocked_cv_r2      # lazy: avoids import cycle
+    fs = f_imaging_fs(frame_t) if frame_t is not None else 60.0
+    embargo = int(round(config.get('embargo_sec', 0.0) * fs))
+    lags = f_lags_from_ms(config.get('lags_ms', [0]), fs)
+
+    # ── target (decode TO) — guard grouped-PCA blocks (X[:, :k] would be invalid) ──
+    tb = config['target_block']
+    if tb not in built_blocks:
+        raise ValueError(f"target_block {tb!r} not in built_blocks: {list(built_blocks)}")
+    binfo = built_blocks[tb]
+    if isinstance(binfo.get('pca'), dict) or binfo.get('pca_groups'):
+        raise ValueError(f"target_block {tb!r} uses grouped PCA — X[:, :k] truncation invalid; "
+                         f"pick a single-PCA block (pix/gaborS/mengS/meng)")
+    Xt = np.asarray(binfo['X'], float)
+    ntp = config.get('n_target_pcs')
+    target = Xt if ntp is None else Xt[:, :int(ntp)]
+
+    # ── shared CV kwargs ──
+    cvkw = dict(n_folds=config.get('n_folds', 5), embargo=embargo,
+                standardize=config.get('standardize', True),
+                decoder=config.get('decoder', 'ridge'),
+                ridge_alpha=config.get('ridge_alpha', 1.0),
+                k_nn=config.get('k_nn', 15),
+                ridgecv_alphas=config.get('ridgecv_alphas'),
+                n_components=config.get('n_components', 20),
+                fold_scheme=config.get('fold_scheme', 'contiguous'),
+                n_blocks=config.get('n_blocks'),
+                multioutput='variance_weighted', return_predictions=True)
+
+    # ── input (decode FROM) ──
+    src = config.get('input_source', 'neural')
+    if src == 'neural':
+        if config.get('neural_pca', 'global') == 'within_fold':
+            res = f_blocked_cv_r2(None, target, Y_raw=Y_neu,        # leak-free, no lags
+                                  n_pcs=int(config.get('n_input_pcs', 50)), **cvkw)
+        else:
+            emb = f_pca_prefix(Y_neu, int(config.get('n_input_pcs', 50)))
+            res = f_blocked_cv_r2(emb, target, lags=lags, **cvkw)
+    elif src.startswith('cebra:'):
+        name = src.split(':', 1)[1]
+        if not cebra_models or name not in cebra_models:
+            raise ValueError(f"input_source {src!r}: {name!r} not in cebra_models "
+                             f"({list(cebra_models or [])})")
+        emb = np.asarray(cebra_models[name]['embedding'])
+        res = f_blocked_cv_r2(emb, target, lags=lags, **cvkw)
+    else:
+        raise ValueError(f"unknown input_source: {src!r} (use 'neural' or 'cebra:<name>')")
+
+    scores = f_structure_scores(res['y_true'], res['y_pred'],
+                                which=tuple(config.get('scores', ('r2', 'r2_vw'))),
+                                rsa_subsample=config.get('rsa_subsample', 2000),
+                                rng=np.random.default_rng(config.get('seed', 42)))
+    if verbose:
+        print(f"  [{src} → {tb}]  n_tgt={ntp}  n_in={config.get('n_input_pcs')}  "
+              + '  '.join(f'{k}={v:+.3f}' for k, v in scores.items()))
+    return {'scores': scores, 'n_valid': int(res.get('n_valid', len(res['y_true']))),
+            'res': res}
+
+
+def f_decoder_sweep(config, sweep_var, sweep_values, built_blocks, Y_neu,
+                    cebra_models=None, frame_t=None, verbose=True):
+    """Vary ONE key of `config` across `sweep_values`, run f_run_decoder at each, collect the
+    scores. `sweep_var` must be a config key (e.g. 'n_target_pcs', 'target_block', 'n_input_pcs',
+    'input_source', 'decoder'), OR the virtual axis 'lag_ms' — a SINGLE-lag tuning curve where
+    each scalar value sets lags_ms=[v] (decode at one lag; numeric x). Nonsensical combos
+    (sweeping 'n_input_pcs' with a fixed-dim CEBRA input; 'lag_ms' under neural_pca='within_fold'
+    which ignores lags) or bad targets are skipped with a printed reason. Returns tidy rows
+    [{'x': value, <score>: val, ..., 'n_valid': int}]."""
+    if sweep_var not in config and sweep_var != 'lag_ms':
+        raise ValueError(f"sweep_var {sweep_var!r} not a decoder-params key "
+                         f"({list(config)}) or the virtual axis 'lag_ms'")
+    rows = []
+    for v in sweep_values:
+        cfg = ({**config, 'lags_ms': [v]} if sweep_var == 'lag_ms'   # single-lag tuning
+               else {**config, sweep_var: v})
+        if sweep_var == 'n_input_pcs' and str(cfg.get('input_source', '')).startswith('cebra:'):
+            print(f"  skip {sweep_var}={v!r}: CEBRA input has fixed dim — n_input_pcs unused")
+            continue
+        if sweep_var == 'lag_ms' and cfg.get('neural_pca') == 'within_fold':
+            print(f"  skip lag_ms={v!r}: neural_pca='within_fold' ignores lags")
+            continue
+        try:
+            out = f_run_decoder(cfg, built_blocks, Y_neu, cebra_models, frame_t)
+        except (ValueError, KeyError) as e:
+            print(f"  skip {sweep_var}={v!r}: {e}")
+            continue
+        rows.append({'x': v, **out['scores'], 'n_valid': out['n_valid']})
+        if verbose:
+            print(f"  {sweep_var}={str(v):>12s}  "
+                  + '  '.join(f'{k}={rows[-1][k]:+.3f}' for k in out['scores']))
+    return rows
+
+
+def f_plot_decoder_sweep(rows, sweep_var, scores, dset_tag='', title=None, config=None, logx='auto'):
+    """One subplot per score from f_decoder_sweep rows: numeric sweep values → line vs x;
+    categorical (block / decoder / input names) → bars. Returns None (no Spyder Figure echo).
+    `logx`: log-scale the x-axis for numeric sweeps — True | False | 'auto' (log when all x > 0 and
+    span ≥ 2 decades, e.g. a ridge_alpha grid). If `config` (the decoder/encoder params dict) is given
+    and `title` is None, the fixed decoder / feature / input settings are appended to the title (the
+    swept key is omitted, since it's the x-axis)."""
+    if not rows:
+        print('f_plot_decoder_sweep: no rows'); return None
+    xs = [r['x'] for r in rows]
+    numeric = all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in xs)
+    _use_log = False
+    if numeric:                                          # log only makes sense for all-positive x
+        _pos = [float(x) for x in xs if x > 0]
+        _all_pos = len(_pos) == len(xs) and len(xs) > 1
+        _use_log = (logx is True and _all_pos) or (
+            logx == 'auto' and _all_pos and max(_pos) / min(_pos) >= 100)
+    _BAND = {'r_med':  ('r_p05', 'r_p25', 'r_p75', 'r_p95'),    # score → its 5/25/75/95 percentile keys
+             'r2_med': ('r2_p05', 'r2_p25', 'r2_p75', 'r2_p95')}
+    _MAXLINE = {'r_med': 'r_max', 'r2_med': 'r2_max'}           # score → its best-unit (max) key
+    _order = np.argsort([float(x) for x in xs]) if numeric else range(len(xs))
+    _xo = [xs[i] for i in _order]
+    scores = [s for s in scores if s in rows[0]]
+    n = max(1, len(scores))
+    fig, axes = plt.subplots(1, n, figsize=(3.6 * n, 3.4), squeeze=False)
+    for ax, s in zip(axes[0], scores):
+        ys = [rows[i].get(s, np.nan) for i in _order]
+        _yv = np.asarray([v for v in ys if np.isfinite(v)], float)
+        if numeric:
+            if _use_log:
+                ax.set_xscale('log')
+            ax.set_xlabel(sweep_var + (' (log)' if _use_log else ''))
+            _band = []                               # optional percentile band (e.g. r_med spread)
+            _bk = _BAND.get(s)
+            if _bk and all(k in rows[0] for k in _bk):
+                p = [[rows[i].get(k, np.nan) for i in _order] for k in _bk]
+                ax.fill_between(_xo, p[0], p[3], color='C0', alpha=0.12, label='5–95%')
+                ax.fill_between(_xo, p[1], p[2], color='C0', alpha=0.25, label='25–75%')
+                _band = [v for arr in (p[0], p[3]) for v in arr if np.isfinite(v)]
+            _mx = []                                     # best-unit (max) trace on the band panel
+            _mk = _MAXLINE.get(s)
+            if _mk and _mk in rows[0]:
+                _mx = [rows[i].get(_mk, np.nan) for i in _order]
+                ax.plot(_xo, _mx, '--^', ms=4, color='C3', label='max (best unit)')
+                _mx = [v for v in _mx if np.isfinite(v)]
+            ax.plot(_xo, ys, '-o', ms=4, color='C0', label=('median' if _band else None))
+            if _band or _mx:
+                ax.legend(fontsize=7)
+            _allv = np.asarray([*_yv, *_band, *_mx], float)
+            if _allv.size:                           # fit y-limits to curve+band (don't force in 0)
+                lo, hi = float(_allv.min()), float(_allv.max())
+                pad = 0.05 * (hi - lo) if hi > lo else (abs(hi) * 0.05 or 1.0)
+                ax.set_ylim(lo - pad, hi + pad)
+                if lo - pad <= 0 <= hi + pad:        # 0-line only when it's actually in view
+                    ax.axhline(0, color='gray', lw=0.6)
+        else:
+            ax.bar(range(len(xs)), ys, color='steelblue')
+            ax.set_xticks(range(len(xs)))
+            ax.set_xticklabels([str(x) for x in xs], rotation=30, ha='right', fontsize=8)
+            ax.axhline(0, color='gray', lw=0.6)      # bars read from a 0 baseline
+        ax.set_title(s); ax.set_ylabel(s)
+    if title is None:
+        kind = ''                                    # infer direction from the config shape
+        if config:
+            kind = ('ENCODE ' if 'feature_block' in config
+                    else 'DECODE ' if 'target_block' in config
+                    else 'DIMRED ' if 'method' in config else '')
+        title = f'{dset_tag} — {kind}sweep over {sweep_var!r}'
+        if config:                                   # append fixed decoder / feature / input / dimred
+            _map = [('decoder', 'decoder'), ('input_source', 'input'),
+                    ('target_block', 'feature'), ('feature_block', 'feature'),
+                    ('covariate_blocks', 'covars'),
+                    ('method', 'algo'), ('num_comp', 'k'), ('normalize', 'norm')]
+            info = [f'{lbl}={config[key]}' for key, lbl in _map
+                    if key in config and key != sweep_var]
+            if info:
+                title += '  |  ' + '  '.join(info)
+    fig.suptitle(title)
+    fig.tight_layout()
+    return None
+
+
+def f_plot_sweep_curves(curves, sweep_var, scores, dset_tag='', title=None, config=None):
+    """Overlay MULTIPLE sweep-row sets on one axis per score — one curve/bar-group per entry of
+    `curves` (a dict {label: rows}, e.g. from f_dimred_sweep2d: {'method=nmf': rows, 'method=svd':
+    rows}). Numeric x → one line per label; categorical x → grouped bars per label. Twin of
+    f_plot_decoder_sweep (same title logic); returns None (no Spyder Figure echo)."""
+    curves = {k: v for k, v in curves.items() if v}          # drop empty row-sets
+    if not curves:
+        print('f_plot_sweep_curves: no rows'); return None
+    scores = [s for s in scores if any(s in r for rows in curves.values() for r in rows)]
+    n = max(1, len(scores))
+    fig, axes = plt.subplots(1, n, figsize=(3.6 * n, 3.4), squeeze=False)
+    labels = list(curves)
+    # union of x values across all curves, numeric if every value is numeric
+    all_xs = [r['x'] for rows in curves.values() for r in rows]
+    numeric = all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in all_xs)
+    cat_xs = sorted({r['x'] for rows in curves.values() for r in rows},
+                    key=lambda z: str(z)) if not numeric else None
+    for ax, s in zip(axes[0], scores):
+        finite = []
+        for lbl in labels:
+            rows = curves[lbl]
+            if numeric:
+                xs = [r['x'] for r in rows]
+                ys = [r.get(s, np.nan) for r in rows]
+                ax.plot(xs, ys, '-o', ms=4, label=lbl)
+                finite += [v for v in ys if np.isfinite(v)]
+        if numeric:
+            ax.set_xlabel(sweep_var)
+            _yv = np.asarray(finite, float)
+            if _yv.size:                                     # fit y-limits to all curves
+                lo, hi = float(_yv.min()), float(_yv.max())
+                pad = 0.05 * (hi - lo) if hi > lo else (abs(hi) * 0.05 or 1.0)
+                ax.set_ylim(lo - pad, hi + pad)
+                if lo - pad <= 0 <= hi + pad:
+                    ax.axhline(0, color='gray', lw=0.6)
+        else:                                                # grouped bars per label
+            nb, w = len(labels), 0.8 / max(1, len(labels))
+            for j, lbl in enumerate(labels):
+                by = {r['x']: r.get(s, np.nan) for r in curves[lbl]}
+                ys = [by.get(x, np.nan) for x in cat_xs]
+                ax.bar(np.arange(len(cat_xs)) + (j - (nb - 1) / 2) * w, ys, width=w, label=lbl)
+            ax.set_xticks(range(len(cat_xs)))
+            ax.set_xticklabels([str(x) for x in cat_xs], rotation=30, ha='right', fontsize=8)
+            ax.axhline(0, color='gray', lw=0.6)
+        ax.set_title(s); ax.set_ylabel(s)
+        ax.legend(fontsize=7)
+    if title is None:
+        kind = ''
+        if config:
+            kind = ('ENCODE ' if 'feature_block' in config
+                    else 'DECODE ' if 'target_block' in config
+                    else 'DIMRED ' if 'method' in config else '')
+        title = f'{dset_tag} — {kind}sweep over {sweep_var!r} ({len(labels)} curves)'
+    fig.suptitle(title)
+    fig.tight_layout()
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1240,3 +1685,33 @@ def f_plot_grid_focus_lines(detrend_grid, embargo_grid, combos, grid_real,
     fig.suptitle(f'{dset_tag}\ndetrend rescue of slow targets — real vs circshift null',
                  fontsize=10)
     fig.tight_layout()
+
+
+def f_plot_emb_scatter(model, color_specs, n_rows, suptitle, dset_tag='', plot_2d=False):
+    """Grid scatter of one embedding's top dims — n_rows × n_cols panels, one per coloring in
+    `color_specs` (list of (name, values, cmap)). plot_2d → top 2 dims (2D); else top 3 (3D).
+    `model` is a dict with an 'embedding' (T, ≥dims) array. Returns None (Spyder echo)."""
+    if not plot_2d:
+        from mpl_toolkits.mplot3d import Axes3D   # noqa: F401 — registers the 3d projection
+    n_cols = (len(color_specs) + n_rows - 1) // n_rows
+    # constrained layout handles per-panel colorbars + equal-aspect/3D axes without the
+    # "margins cannot be made large enough" tight_layout warning.
+    fig = plt.figure(figsize=(4.0 * n_cols, 3.2 * n_rows), layout='constrained')
+    emb = model['embedding']
+    stride = max(1, emb.shape[0] // 10000)   # 60 Hz scatter is too dense raw
+    for i, (cname, cvals, cmap) in enumerate(color_specs):
+        if plot_2d:
+            ax = fig.add_subplot(n_rows, n_cols, i + 1)
+            sc = ax.scatter(emb[::stride, 0], emb[::stride, 1],
+                            c=cvals[::stride], cmap=cmap, s=2, alpha=0.5)
+            ax.set_xticklabels([]); ax.set_yticklabels([])
+            ax.set_aspect('equal', adjustable='datalim')
+        else:
+            ax = fig.add_subplot(n_rows, n_cols, i + 1, projection='3d')
+            sc = ax.scatter(emb[::stride, 0], emb[::stride, 1], emb[::stride, 2],
+                            c=cvals[::stride], cmap=cmap, s=2, alpha=0.5)
+            ax.set_xticklabels([]); ax.set_yticklabels([]); ax.set_zticklabels([])
+        ax.set_title(f'color: {cname}', fontsize=9)
+        fig.colorbar(sc, ax=ax, fraction=0.04, pad=0.02)
+    fig.suptitle(f'{dset_tag}\n{suptitle}', fontsize=11)
+    return None

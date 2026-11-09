@@ -1300,7 +1300,7 @@ def f_plot_obj_terrain_heights(two_mon_frames, vec_data_l, vec_data_r,
                                 show_mon_labels=True, ax=None,
                                 figsize=(12, 6),
                                 label_color='red', label_bg='yellow',
-                                label_fontsize=16):
+                                label_fontsize=16, vert_samp=None):
     # For each object visible in frame `n_fr` on either monitor, look up
     # the terrain height at the object's (ObjLocX, ObjLocZ) and overlay
     # the value as a colored label on the rendered frame. Useful for
@@ -1339,8 +1339,9 @@ def f_plot_obj_terrain_heights(two_mon_frames, vec_data_l, vec_data_r,
                 continue
             lat_a  = vec_data['obj_lat_angle'][n_fr, k]
             vert_a = vec_data['obj_vert_angle'][n_fr, k]
+            _vert = num_samp if vert_samp is None else vert_samp   # lat=num_samp (width), vert may differ
             lat_pix  = (-lat_a  + cam_params['hFOV_rad']/2) / cam_params['hFOV_rad'] * (num_samp - 1)
-            vert_pix = (-vert_a + cam_params['vFOV_rad']/2) / cam_params['vFOV_rad'] * (num_samp - 1)
+            vert_pix = (-vert_a + cam_params['vFOV_rad']/2) / cam_params['vFOV_rad'] * (_vert - 1)
             out.append((lat_pix, vert_pix, terrain_h_at_obj[glob_idx]))
         return out
 

@@ -40,7 +40,7 @@ def f_aggregate_monitor_features(vec_data, mode='raw', obj_size=None, clip_len=N
     #                     nearest changes (e.g. nearest exits FOV, another
     #                     object overtakes it). Other in-FOV objects ignored.
     #   'salience_mean' — angular-size-weighted mean across all in-FOV objects.
-    #                     weight_i = 2·arctan2(obj_size_x, dist_i) — i.e. each
+    #                     weight_i = 2·arctan2(obj_size_x/2, dist_i) — i.e. each
     #                     object weighted by how big it looks on the monitor.
     #                     Smooth across object swaps; reports the "visual
     #                     center of mass" rather than a single object's coords.
@@ -51,8 +51,8 @@ def f_aggregate_monitor_features(vec_data, mode='raw', obj_size=None, clip_len=N
     # representation gets for free via projection:
     #   'raw'              → [pres, lat, vert, dist]                 (4 dims)
     #   'angular'          → [pres, lat, vert, ang_size]             (4 dims)
-    #                        ang_size = 2·arctan2(obj_size_x, dist),
-    #                        the monitor angular subtense of the object.
+    #                        ang_size = 2·arctan2(obj_size_x/2, dist),
+    #                        the monitor angular subtense of the object (obj_size_x = FULL width).
     #   'salience'         → [pres, lat, vert, dist, salience]       (5 dims)
     #                        salience = max(0, 1 − dist/clip_len), a soft
     #                        "how prominent" channel alongside raw dist.
@@ -78,7 +78,7 @@ def f_aggregate_monitor_features(vec_data, mode='raw', obj_size=None, clip_len=N
         # angular-size weights per obj per frame; zero weight for out-of-FOV
         # objs (and clip dist to avoid div-by-zero on absent objs)
         dist_safe_all = np.maximum(obj_dist, 1e-6)
-        w = 2.0 * np.arctan2(obj_size['x'], dist_safe_all)
+        w = 2.0 * np.arctan2(obj_size['x'] / 2.0, dist_safe_all)
         w = np.where(obj_mon, w, 0.0)
         w_sum = w.sum(axis=1)
         # weighted mean of (lat, vert, dist) across in-FOV objs.
@@ -93,11 +93,11 @@ def f_aggregate_monitor_features(vec_data, mode='raw', obj_size=None, clip_len=N
     if mode in ('angular', 'angular_salience'):
         if obj_size is None:
             raise ValueError("mode '%s' requires obj_size" % mode)
-        # arctan2(obj_size_x, dist) — clip dist_raw to a small +ve so the
+        # arctan2(obj_size_x/2, dist) — clip dist_raw to a small +ve so the
         # formula stays finite where presence==0 (we zero it out below).
         dist_safe = np.where(presence, dist_raw, 1.0)
         dist_chan = np.where(presence,
-                             2.0*np.arctan2(obj_size['x'], dist_safe),
+                             2.0*np.arctan2(obj_size['x'] / 2.0, dist_safe),
                              0.0)
     else:
         dist_chan = dist_raw
@@ -160,7 +160,7 @@ def f_aggregate_monitor_features_per_obj(vec_data, mode='raw', obj_size=None, cl
         if obj_size is None:
             raise ValueError("mode '%s' requires obj_size" % mode)
         dist_safe = np.where(pres, dist_raw, 1.0)
-        dist_chan = np.where(pres, 2.0*np.arctan2(obj_size['x'], dist_safe), 0.0)
+        dist_chan = np.where(pres, 2.0*np.arctan2(obj_size['x'] / 2.0, dist_safe), 0.0)
     else:
         dist_chan = dist_raw
 
@@ -238,7 +238,7 @@ def f_motion_features(vec_data, mode='raw', obj_size=None, clip_len=None,
         if obj_size is None:
             raise ValueError("obj_collapse='salience_mean' requires obj_size")
         dist_safe_all = np.maximum(obj_dist, 1e-6)
-        w = 2.0 * np.arctan2(obj_size['x'], dist_safe_all)
+        w = 2.0 * np.arctan2(obj_size['x'] / 2.0, dist_safe_all)
         w = np.where(obj_mon, w, 0.0)
         w_sum = w.sum(axis=1)
         with np.errstate(divide='ignore', invalid='ignore'):
@@ -272,7 +272,7 @@ def f_motion_features(vec_data, mode='raw', obj_size=None, clip_len=None,
         if obj_size is None:
             raise ValueError(f"mode '{mode}' requires obj_size")
         dist_safe = np.maximum(dist_raw_s, 1e-6)
-        ang_size = 2.0 * np.arctan2(obj_size['x'], dist_safe)
+        ang_size = 2.0 * np.arctan2(obj_size['x'] / 2.0, dist_safe)
         d_ang_size = (np.gradient(ang_size, beh_t) if beh_t is not None
                       else np.gradient(ang_size) / beh_dt)
         chans.append(d_ang_size)
@@ -387,14 +387,81 @@ def f_self_motion_features(mov_data, smooth_sigma=2.0, beh_dt=0.1, beh_t=None):
     return np.stack([speed, d_phi], axis=1)   # (T_beh, 2)
 
 
-def f_resample_to_imaging(beh_t, beh_feats, frame_t, pulse_delay, kind='linear'):
+def f_self_motion_decomp(mov_data, smooth_sigma=2.0, beh_dt=0.1, beh_t=None, polar=False):
+    # Heading-projected self-motion: splits the planar velocity into forward /
+    # lateral instead of collapsing to one speed scalar (P2a-9). Closed-loop
+    # encoding needs forward (drives looming/expanding flow) separated from
+    # lateral/yaw (different flow geometry).
+    #
+    # Output (T_beh, 3):
+    #   0: self_fwd — forward speed  = dx·cosφ + dz·sinφ        (units/s, signed)
+    #   1: self_lat — lateral speed  = −dx·sinφ + dz·cosφ       (units/s, signed)
+    #   2: self_yaw — yaw ang. vel.  = dφ                       (rad/s)
+    #   polar=True → (T_beh, 3): [√(fwd²+lat²), atan2(lat,fwd), yaw] (mag/angle/yaw).
+    #
+    # fwd²+lat² == speed² (orthogonal rotation), so this is the 2-channel block's
+    # speed un-collapsed. Sign convention follows φ (heading): forward should be
+    # predominantly positive while the mouse runs — validate per session.
+    x   = np.asarray(mov_data['x_pos'], dtype=float)
+    z   = np.asarray(mov_data['z_pos'], dtype=float)
+    phi = np.asarray(mov_data['phi'],   dtype=float)
+
+    if smooth_sigma and smooth_sigma > 0:
+        x   = gaussian_filter1d(x,   smooth_sigma, mode='nearest')
+        z   = gaussian_filter1d(z,   smooth_sigma, mode='nearest')
+        phi = gaussian_filter1d(np.unwrap(phi), smooth_sigma, mode='nearest')
+    else:
+        phi = np.unwrap(phi)
+
+    if beh_t is not None:
+        dx = np.gradient(x, beh_t)
+        dz = np.gradient(z, beh_t)
+        d_phi = np.gradient(phi, beh_t)
+    else:
+        dx = np.gradient(x) / beh_dt
+        dz = np.gradient(z) / beh_dt
+        d_phi = np.gradient(phi) / beh_dt
+
+    c, s = np.cos(phi), np.sin(phi)
+    fwd =  dx * c + dz * s
+    lat = -dx * s + dz * c
+    if polar:
+        mag = np.sqrt(fwd**2 + lat**2)
+        ang = np.arctan2(lat, fwd)
+        return np.stack([mag, ang, d_phi], axis=1)   # (T_beh, 3)
+    return np.stack([fwd, lat, d_phi], axis=1)        # (T_beh, 3)
+
+
+def f_resample_to_imaging(beh_t, beh_feats, frame_t, pulse_delay, kind='linear', col_chunk=4000):
     # Map behavior clock to imaging clock and interpolate features to frame_t.
     # `beh_feats` can be (T_beh,) or (T_beh, d). Out-of-range frames get filled
     # with 0 (e.g. before first or after last behavior sample).
+    # WIDE blocks (d > col_chunk, e.g. point-sampled gabor/meng at small ds — tens of thousands of
+    # columns) are interpolated in COLUMN CHUNKS into a preallocated float32 output: scipy interp1d
+    # upcasts to float64, so a single (T_img, d) call would need 2× the memory (a 30k-col × 96k-frame
+    # block is 22 GiB float64 → OOM). Chunking + float32 caps the peak at one chunk's float64.
     beh_t_aligned = np.asarray(beh_t) - pulse_delay
-    fi = interp1d(beh_t_aligned, beh_feats, axis=0, kind=kind,
-                  bounds_error=False, fill_value=0.0, assume_sorted=False)
-    return fi(np.asarray(frame_t))
+    frame_t = np.asarray(frame_t)
+    beh_feats = np.asarray(beh_feats)
+
+    def _interp(cols):
+        return interp1d(beh_t_aligned, cols, axis=0, kind=kind, bounds_error=False,
+                        fill_value=0.0, assume_sorted=False)(frame_t)
+
+    if beh_feats.ndim == 1 or beh_feats.shape[1] <= col_chunk:
+        return _interp(beh_feats)                        # small block → unchanged (float64)
+    n_col = beh_feats.shape[1]
+    out = np.empty((frame_t.shape[0], n_col), np.float32)
+    for s in range(0, n_col, col_chunk):
+        e = min(s + col_chunk, n_col)
+        out[:, s:e] = _interp(beh_feats[:, s:e]).astype(np.float32)
+    return out
+
+
+def f_num_tag(x, sig=4):
+    # Short, stable, round-trip-safe numeric tag for names/filenames (0.010162601626 -> '0.01016').
+    # None -> 'na'. %g at `sig` significant figures.
+    return 'na' if x is None else f'{float(x):.{sig}g}'
 
 
 def f_zscore(M):
@@ -402,6 +469,67 @@ def f_zscore(M):
     s = M.std(axis=0, keepdims=True)
     s[s == 0] = 1
     return (M - M.mean(axis=0, keepdims=True)) / s
+
+
+def f_proc(X, steps, fit=None):
+    """Unified feature-processing pipeline: apply an ordered list of `(op, arg)` steps to X, return
+    (X_out, fitted_steps). ONE primitive reused at feature-grid layer 1 (per filter) / layer 2 (per cell)
+    AND within-fold on a decoder/encoder predictor. Steps (each optional, ANY order; [] = identity):
+      ('norm', 'zscore')      per-COLUMN mean 0 / std 1
+      ('norm', 'standardize') GLOBAL (single scalar) mean 0 / std 1
+      ('norm', 'total_var')   ÷ √Σ col-variance (no centering)
+      ('norm', 'first_sv')    ÷ top singular value of the centered data (no centering)
+      ('pca',  n)             PCA (CENTERED), n = int | float(0,1) variance | (frac, cap) | None
+      ('svd',  n)             UNCENTERED truncated SVD — same n forms, mean NOT subtracted
+      ('whiten', True)        scores ÷ √eigenvalue (unit-variance comps); needs a preceding pca/svd
+    'pca' vs 'svd': PCA centers, so its components describe fluctuation ABOUT the time-average and the
+    constant baseline is dropped. For a non-negative block (gabor/fft/meng magnitude) that baseline is
+    real — "nothing on screen" is 0, not the session mean — so 'svd' keeps the origin and its first
+    component usually points along the mean/energy direction. Swap one for the other to test whether
+    centering costs anything. NB `var_kept` is not comparable across the two (see _svd_fit).
+    LEAK-FREE CONTRACT: `fit=None` FITS and returns per-step fitted params; pass that back as `fit` to
+    TRANSFORM ONLY (re-apply train-fold params to a test fold). Returns (X_out float, fitted_steps)."""
+    X = np.asarray(X)                                     # preserve dtype (float32 stays f32 → no 2× RAM)
+    if fit is not None:                                   # TRANSFORM with stored params (test fold)
+        for (op, _arg), (_op, p) in zip(steps, fit):
+            if op == 'norm':
+                X = (X - p['mean']) / p['std'] if 'mean' in p else X / p['scale']
+            elif op in ('pca', 'svd'):
+                X = p['pca'].transform(np.nan_to_num(X)) if p['pca'] is not None else X
+            elif op == 'whiten' and p['eig'] is not None:
+                X = X / np.sqrt(np.where(p['eig'] > 0, p['eig'], 1.0))[:X.shape[1]]
+        return X, fit
+    from f_visual_features import _pca_fit, _svd_fit      # lazy (f_feature_helpers is the import leaf)
+    fitted, last_eig, pca_seen = [], None, False          # last_eig = most-recent pca eigenvalues (whiten)
+    for op, arg in steps:
+        if op == 'norm' and arg == 'zscore':
+            mu = X.mean(0); sd = X.std(0); sd[sd == 0] = 1.0
+            X = (X - mu) / sd; fitted.append((op, {'mean': mu, 'std': sd}))
+        elif op == 'norm' and arg == 'standardize':
+            mu = float(np.nanmean(X)); sd = float(np.nanstd(X)) or 1.0
+            X = (X - mu) / sd; fitted.append((op, {'mean': mu, 'std': sd}))
+        elif op == 'norm' and arg in ('total_var', 'std', 'rms'):
+            v = float(np.nansum(np.nanvar(X, axis=0))); s = np.sqrt(v) if v > 0 else 1.0
+            X = X / s; fitted.append((op, {'scale': s}))
+        elif op == 'norm' and arg == 'first_sv':
+            Xs = X[:: max(1, X.shape[0] // 1500)]
+            s = float(np.linalg.svd(Xs - Xs.mean(0), compute_uv=False)[0]) if Xs.size else 0.0
+            s = s or 1.0; X = X / s; fitted.append((op, {'scale': s}))
+        elif op in ('pca', 'svd'):                        # 'svd' = the same, UNCENTERED (mean kept)
+            X, pca = (_pca_fit if op == 'pca' else _svd_fit)(np.nan_to_num(X), arg)
+            last_eig = pca.explained_variance_ if pca is not None else None   # None = identity (n≥d)
+            pca_seen = True
+            fitted.append((op, {'pca': pca, 'eig': last_eig}))
+        elif op == 'whiten' and arg:
+            if not pca_seen:
+                raise ValueError("f_proc: ('whiten',True) needs a preceding ('pca',…)/('svd',…) step")
+            if last_eig is not None:                          # identity pca (n≥d) → whiten is a no-op
+                X = X / np.sqrt(np.where(last_eig > 0, last_eig, 1.0))[:X.shape[1]]
+            fitted.append((op, {'eig': last_eig}))
+        else:
+            raise ValueError(f"f_proc: unknown step {(op, arg)!r} "
+                             "(ops: norm[zscore|standardize|total_var|first_sv] / pca / svd / whiten)")
+    return X, fitted
 
 
 def f_detrend_col(y, sigma_frames):
@@ -480,17 +608,18 @@ def build_feature_blocks(
     vec_data_use, side_tags,
     beh_t, frame_t, pulse_delay,
     *,
-    # agg knobs
-    agg_mode='angular', obj_size=None, clip_len=None,
+    # agg knobs (agg block built iff build_agg=True)
+    build_agg=True, agg_mode='angular', obj_size=None, clip_len=None,
     obj_collapse='salience_mean', nan_absent=True,
-    # pix knobs
-    pix_frames=None, n_pix_pca=20,
+    # pix knobs (pix block built iff build_pix=True; needs the rendered movie)
+    build_pix=True, pix_frames=None, n_pix_pca=20, pix_pre_proc=None,
     # motion knobs (block included iff build_motion=True)
     build_motion=False, motion_smooth_sigma=2.0,
     # per-object knobs (block included iff build_per_obj=True)
     build_per_obj=False, total_n_obj=None,
     # self-motion knobs (block included iff build_self_motion=True)
     build_self_motion=False, mov_data=None, self_motion_smooth_sigma=2.0,
+    self_motion_decomp=False,
     # pix-motion knobs (block included iff build_pix_motion=True)
     build_pix_motion=False, pix_motion_smooth_sigma=2.0,
     # lick+reward knobs (block included iff build_lick_reward=True)
@@ -498,7 +627,7 @@ def build_feature_blocks(
 ):
     """Build feature blocks for one dataset, aligned to imaging-frame clock.
 
-    Always builds 'agg' and 'pix' blocks. Optionally builds 'motion' and
+    Builds 'agg' (build_agg) and 'pix' (build_pix) blocks. Optionally builds 'motion' and
     'per_obj' (gated by build_motion / build_per_obj flags).
 
     Parameters
@@ -541,58 +670,71 @@ def build_feature_blocks(
     T_img = np.asarray(frame_t).shape[0]
 
     # ─── 'agg' block ──────────────────────────────────────────────────────
-    aggs = [f_aggregate_monitor_features(v, mode=agg_mode, obj_size=obj_size,
-                                          clip_len=clip_len, obj_collapse=obj_collapse)
-            for v in vec_data_use]
-    n_per_side = aggs[0].shape[1]
-    agg_beh = np.concatenate(aggs, axis=1)
-    pres_cols = [s * n_per_side for s in range(n_sides)]
-    cont_cols = [c for c in range(agg_beh.shape[1]) if c not in pres_cols]
+    # computed when requested OR when motion needs its presence columns (nan_absent masking)
+    if build_agg or build_motion:
+        aggs = [f_aggregate_monitor_features(v, mode=agg_mode, obj_size=obj_size,
+                                              clip_len=clip_len, obj_collapse=obj_collapse)
+                for v in vec_data_use]
+        n_per_side = aggs[0].shape[1]
+        agg_beh = np.concatenate(aggs, axis=1)
+        pres_cols = [s * n_per_side for s in range(n_sides)]
+        cont_cols = [c for c in range(agg_beh.shape[1]) if c not in pres_cols]
 
-    pres_at_img = f_resample_to_imaging(beh_t, agg_beh[:, pres_cols], frame_t, pulse_delay, kind='nearest')
-    cont_at_img = f_resample_to_imaging(beh_t, agg_beh[:, cont_cols], frame_t, pulse_delay, kind='linear')
-    X_agg = np.empty((T_img, agg_beh.shape[1]), dtype=np.float32)
-    X_agg[:, pres_cols] = pres_at_img
-    X_agg[:, cont_cols] = cont_at_img
+        pres_at_img = f_resample_to_imaging(beh_t, agg_beh[:, pres_cols], frame_t, pulse_delay, kind='nearest')
+        cont_at_img = f_resample_to_imaging(beh_t, agg_beh[:, cont_cols], frame_t, pulse_delay, kind='linear')
+        X_agg = np.empty((T_img, agg_beh.shape[1]), dtype=np.float32)
+        X_agg[:, pres_cols] = pres_at_img
+        X_agg[:, cont_cols] = cont_at_img
 
-    if nan_absent:
-        for s, p_col in enumerate(pres_cols):
-            absent = X_agg[:, p_col] == 0
-            for c in range(s*n_per_side + 1, (s+1)*n_per_side):
-                X_agg[absent, c] = np.nan
+        if nan_absent:
+            for s, p_col in enumerate(pres_cols):
+                absent = X_agg[:, p_col] == 0
+                for c in range(s*n_per_side + 1, (s+1)*n_per_side):
+                    X_agg[absent, c] = np.nan
 
-    side_feat_names_single = ['pres', 'lat', 'vert',
-                              ('ang_size' if agg_mode in ('angular', 'angular_salience') else 'dist')]
-    if n_per_side == 5:
-        side_feat_names_single.append('salience')
-    agg_feat_names = [f'{nm}_{tag}' for tag in side_tags for nm in side_feat_names_single]
+        side_feat_names_single = ['pres', 'lat', 'vert',
+                                  ('ang_size' if agg_mode in ('angular', 'angular_salience') else 'dist')]
+        if n_per_side == 5:
+            side_feat_names_single.append('salience')
+        agg_feat_names = [f'{nm}_{tag}' for tag in side_tags for nm in side_feat_names_single]
+    if build_agg:
+        blocks['agg'] = {
+            'X':                       X_agg,
+            'names':                   list(agg_feat_names),
+            'side_layout':             True,
+            'kind':                    'agg',
+            'n_per_side':              n_per_side,
+            'pres_cols':               list(pres_cols),
+            'side_feat_names_single':  list(side_feat_names_single),
+        }
 
-    blocks['agg'] = {
-        'X':                       X_agg,
-        'names':                   list(agg_feat_names),
-        'side_layout':             True,
-        'kind':                    'agg',
-        'n_per_side':              n_per_side,
-        'pres_cols':               list(pres_cols),
-        'side_feat_names_single':  list(side_feat_names_single),
-    }
+    # ─── 'pix' block (needs the rendered movie; skip with build_pix=False) ──
+    if build_pix:
+        if pix_frames is None:
+            raise ValueError('build_feature_blocks: pix_frames is required for the pix block '
+                             '(pass build_pix=False to skip pix when no movie is available)')
+        pix_frames = np.asarray(pix_frames)                      # real pixels (renders a lazy movie)
+        pix = pix_frames.reshape(pix_frames.shape[0], -1).astype(np.float32)
+        if pix_pre_proc:                          # ordered norm steps on the RAW pixels (before PCA)
+            pix, _ = f_proc(pix, pix_pre_proc)
+        if n_pix_pca is None:                     # raw pixel block (no reduction)
+            pca_pix, pix_pc = None, pix
+            pix_names = [f'pix_px{i}' for i in range(pix.shape[1])]
+        else:
+            pca_pix = PCA(n_components=n_pix_pca, svd_solver='randomized', random_state=42)
+            pix_pc = pca_pix.fit_transform(pix)
+            pix_names = [f'pix_PC{i+1}' for i in range(pix_pc.shape[1])]
+        X_pix = f_resample_to_imaging(beh_t, pix_pc, frame_t, pulse_delay, kind='linear').astype(np.float32)
 
-    # ─── 'pix' block ──────────────────────────────────────────────────────
-    if pix_frames is None:
-        raise ValueError('build_feature_blocks: pix_frames is required for the pix block')
-    pix = pix_frames.reshape(pix_frames.shape[0], -1).astype(np.float32)
-    pca_pix = PCA(n_components=n_pix_pca, svd_solver='randomized', random_state=42)
-    pix_pc = pca_pix.fit_transform(pix)
-    X_pix = f_resample_to_imaging(beh_t, pix_pc, frame_t, pulse_delay, kind='linear').astype(np.float32)
-
-    blocks['pix'] = {
-        'X':                            X_pix,
-        'names':                        [f'pix_PC{i+1}' for i in range(X_pix.shape[1])],
-        'side_layout':                  False,
-        'kind':                         'pix',
-        'pca_pix':                      pca_pix,
-        'explained_variance_ratio_cum': float(np.cumsum(pca_pix.explained_variance_ratio_)[-1]),
-    }
+        blocks['pix'] = {
+            'X':                            X_pix,
+            'names':                        pix_names,
+            'side_layout':                  False,
+            'kind':                         'pix',
+            'pca_pix':                      pca_pix,
+            'explained_variance_ratio_cum': (float(np.cumsum(pca_pix.explained_variance_ratio_)[-1])
+                                             if pca_pix is not None else 1.0),
+        }
 
     # ─── 'pix_mot' block (optional) ───────────────────────────────────────
     # Time derivative of each pix-PC trace. The natural parallel to the
@@ -601,6 +743,8 @@ def build_feature_blocks(
     # ≈ "rate of change of overall on-screen content"; d_pix_PC2 ≈ "rate of
     # lateral motion across the monitor"; etc.
     if build_pix_motion:
+        if not build_pix:
+            raise ValueError('build_pix_motion=True requires build_pix=True (needs the pix-PCA)')
         beh_dt = float(np.median(np.diff(beh_t)))
         if pix_motion_smooth_sigma and pix_motion_smooth_sigma > 0:
             pix_pc_s = gaussian_filter1d(pix_pc, pix_motion_smooth_sigma,
@@ -708,17 +852,24 @@ def build_feature_blocks(
         if mov_data is None:
             raise ValueError('build_self_motion=True requires mov_data')
         beh_dt = float(np.median(np.diff(beh_t)))
-        sm = f_self_motion_features(mov_data, smooth_sigma=self_motion_smooth_sigma,
-                                    beh_dt=beh_dt, beh_t=beh_t)
+        if self_motion_decomp:                             # fwd/lat/yaw (P2a-9)
+            sm = f_self_motion_decomp(mov_data, smooth_sigma=self_motion_smooth_sigma,
+                                      beh_dt=beh_dt, beh_t=beh_t)
+            sm_names = ['self_fwd', 'self_lat', 'self_yaw']
+        else:                                              # collapsed speed + yaw
+            sm = f_self_motion_features(mov_data, smooth_sigma=self_motion_smooth_sigma,
+                                        beh_dt=beh_dt, beh_t=beh_t)
+            sm_names = ['self_d_dist', 'self_d_phi']
         X_self_mot = f_resample_to_imaging(beh_t, sm, frame_t, pulse_delay,
                                             kind='linear').astype(np.float32)
         blocks['self_mot'] = {
             'X':            X_self_mot,
-            'names':        ['self_d_dist', 'self_d_phi'],
+            'names':        sm_names,
             'side_layout':  False,
             'kind':         'self_mot',
             'beh_dt':       beh_dt,
             'smooth_sigma': self_motion_smooth_sigma,
+            'decomp':       self_motion_decomp,
         }
 
     # ─── 'beh' block (optional) — lick + reward events ────────────────────

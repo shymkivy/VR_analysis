@@ -1,5 +1,12 @@
 # -*- coding: utf-8 -*-
 """
+VR_ca_encoding.py
+
+PURPOSE: Predicts each neuron's activity from the chosen visual features plus the mouse's own
+movement, then measures which cells are significantly driven, by what, at what lag, and with what
+receptive field.
+PIPELINE: step 2 of 3 — VR_feature_search → VR_ca_encoding → VR_ca_cebra. See SCRIPTS.md.
+
 Encoding arm (TODO #57) — predict each neuron's deconvolved firing-rate proxy
 from stimulus + self-motion features. v1 = minimal validation pass: per-neuron
 blocked-CV ridge with a short causal FIR, vs a per-cell circular-shift null.
@@ -44,8 +51,10 @@ from f_functions import (f_load_bh_data_all, f_proc_movement, f_proc_lick_rew,
                          f_comp_FOV_adj, f_add_phase, f_get_monitor_coords,
                          f_angles_to_movie_v2)
 from f_pipeline import f_load_session, f_acquire_features, f_build_features
+import f_feature_source as fsrc
 from f_feature_helpers import build_feature_blocks
-from f_visual_features import build_visual_blocks, f_gabor_bank, f_gabor_features
+from f_visual_features import (build_visual_blocks, f_gabor_bank, f_gabor_features,
+                               f_grid_bounds)
 from f_decoding import (f_imaging_fs, f_plot_pred_scatter, f_plot_pred_traces,
                         f_shuffle_neural)
 from f_encoding import (f_lags_from_ms, f_encode_per_neuron, f_encode_null,
@@ -55,24 +64,28 @@ from f_encoding import (f_lags_from_ms, f_encode_per_neuron, f_encode_null,
 
 #%% Config — mouse, paths, object size
 mouse_id = 'L'
-n_dset   = 4        # ← pick a DARK-condition session (index into do_proc==1 rows)
+n_dset   = 2        # ← pick a DARK-condition session (index into do_proc==1 rows)
 data_dir = 'F:/VR/data_proc/' + mouse_id
 data_dir_bh = 'F:/VR/Bh_data/mice_gcamp/'
 vr_data_xlsx = 'F:/VR/data_proc/VR_data.xlsx'   # dataset table (f_load_session reads it)
 
 obj_size = {'x': 5, 'y': 20, 'z': 5, 'height': 2}
 
-# --- Feature source: BUILD (render + extract) or LOAD a cached features file ---
-# Gates the render + build below (f_acquire_features). Neural (Y_enc) always from
-# data_ca. mov_data / vec_data stay live (f_load_session) either way.
-load_cached_features = False     # True = load a cache instead of render + build
-features_dir = 'F:/VR/features/' + mouse_id
-feature_file = None     # exact/substring cache filename; None → fall through
-feature_tag  = None     # filename containing this unique tag string; None → index
-feature_idx  = 0        # position in the dataset's sorted file list
-save_features = False    # write the built features to a cache
-save_movie    = False    # also store raw two_mon_frames (large; for the viz cells)
-save_tag      = 'v1'     # unique tag baked into the saved filename
+# --- Feature source: WHERE blocks come from (f_resolve_features handles build vs load per block) ---
+# Neural (Y_enc) always from data_ca; mov_data / vec_data stay live (f_load_session) either way.
+# Override any key: cache_tag / cache_name / cache_idx / save / save_tag / save_movie.
+src = fsrc.f_default_source(mouse_id=mouse_id)
+features_dir = src['features_dir']       # kept top-level for the conv_repo cell below
+
+# OLD (pre-2026-08 f_acquire_features junction — superseded by f_resolve_features in the build cell):
+# load_cached_features = False     # True = load a cache instead of render + build
+# features_dir = 'F:/VR/features/' + mouse_id
+# feature_file = None     # exact/substring cache filename; None → fall through
+# feature_tag  = None     # filename containing this unique tag string; None → index
+# feature_idx  = 0        # position in the dataset's sorted file list
+# save_features = False    # write the built features to a cache
+# save_movie    = False    # also store raw two_mon_frames (large; for the viz cells)
+# save_tag      = 'v1'     # unique tag baked into the saved filename
 
 #%% Load calcium + behavior + cheap vectorization (f_load_session)
 # Shared prelude: calcium + behavior, est1, mov_data/lr_data/vec_data_l/r, clock.
@@ -115,54 +128,120 @@ Y_enc = Y_enc_full[:, enc_cell_ids]                  # columns = enc_cell_ids (o
 print(f'{dset_tag}: Y_enc {Y_enc.shape}  (T, n_cells)'
       + ('' if enc_cell_subset is None else f'   [SUBSET of {Y_enc_full.shape[1]}]'))
 
-#%% Build feature blocks (agg + self_mot + beh + motion + pix) — or load a cache
-# The render (f_angles_to_movie_v2) now lives in f_pipeline.f_build_features, called
-# from the junction below; these knobs feed it via cfg.
-num_samp         = 101
-side             = 'both'        # 'L' | 'R' | 'both'
-agg_mode         = 'angular'
-obj_collapse     = 'salience_mean'
-nan_absent       = True
-n_pix_pca        = 50
-motion_smooth_sigma      = 2.0
-self_motion_smooth_sigma = 2.0
-lick_reward_smooth_sigma = 0.0
-# visual-cortex feature banks (Tier 1 grid / 2 flow / 3 gabor / 4a meng); merged in.
-# gabor stats: magnitude + phase (cos/sin φ). n_pca as a DICT → SEPARATE PCA per
-# channel group (so phase's small [-1,1] scale isn't washed out by magnitude):
-# prefix 'gabM' = magnitude, 'gabP' = both phase channels. Each value = int #comps
-# OR float in (0,1) = variance fraction (e.g. 'gabP': 0.9).
-# meng = direction+speed motion energy (opponent). Add 'grid'/'flow' entries to taste.
-visual_specs = {
-    'gabor': {'grid': (6, 6), 'n_orient': 4, 'wavelengths': (6, 12),
-              'stats': ('magnitude', 'phase'),
-              'n_pca': {'gabM': 20, 'gabP': 10}},
-    'meng':  {'grid': (6, 6), 'n_orient': 4, 'wavelengths': (8,),
-              'temporal_freqs': (0.15,), 'output': 'opponent', 'n_pca': 20},
+#%% Feature plan — non-visual blocks by NAME + visual banks via `vis_sets`
+# SAME structure as VR_ca_cebra.py and VR_feature_search.py, so a representation that wins the search
+# pastes here unchanged. All three read the dict through the one canonical reader
+# (f_feature_source.f_resolve_feat_sets), so it cannot mean different things in different scripts.
+# NON-VISUAL / legacy blocks — selected by name. They resolve in the SAME f_resolve_features call as
+# the visual banks (one render shared; the cheap blocks need none), so mix freely.
+feature_list = [
+                'agg',                     # per-side object POSITION (cheap, no render)
+                'pix',                     # pixel-movie PCA — needs the RENDER
+                'self_mot', 'beh',         # mouse locomotion + lick/reward
+                # 'motion', 'pix_mot',     # per-side object / pix-PC screen velocity
+                # 'grid', 'flow',          # Tier 1 / Tier 2 visual
+                ]
+
+# VISUAL BANKS. '_common' = knobs every set inherits; an entry repeating a knob OVERRIDES it.
+#   kind        'gabor' | 'fft' | 'meng' | 'fftglobal' | 'wavelet' | 'pix'  (VALIDATED — an unknown
+#               kind, or a knob the kind ignores like tf_hz on gabor / stats on meng, RAISES)
+#   cyc_fov     cycles per FOV → a PYRAMID (one level per SF; patch/support scale with λ)
+#   stats       gabor/fft: ('magnitude',) | ('quadrature',) = signed even/odd re,ro (#74). meng: `output`
+#   marginalize axes to POOL ⊆ {'ori','sf'/'wl','tf'}: () → per FILTER, ('ori',) → per SF level,
+#               'all' → one block. Each entry expands to `<name>:<cell>` blocks.
+#   layer1_proc per-filter f_proc step-list | layer2_proc per-cell
+# enc_blocks below addresses a bank by NAME — f_encode_per_neuron expands it to all its cells.
+vis_sets = {
+    '_common': dict(cyc_fov=(1, 2, 4, 8, 16), odegs=(0, 45, 90), marginalize='all',
+                    layer1_proc=None, layer2_proc=[('pca', 50)]),
+    'gabmag':  dict(kind='gabor', stats=('magnitude',)),
+    # 'gabquad': dict(kind='gabor', stats=('quadrature',)),
+    # 'fftmag':  dict(kind='fft',   stats=('magnitude',)),
+    'mengopp': dict(kind='meng', tf_hz=(0.25, 0.5, 1.0, 2), output='opponent',
+                    transform='signed_sqrt'),
 }
 
-# cfg = render+build config (gen_config provenance AND f_build_features input).
-cfg = {
-    'side': side, 'agg_mode': agg_mode, 'obj_collapse': obj_collapse,
-    'nan_absent': nan_absent, 'n_pix_pca': n_pix_pca,
-    'build_motion': True, 'motion_smooth_sigma': motion_smooth_sigma,
-    'build_self_motion': True, 'self_motion_smooth_sigma': self_motion_smooth_sigma,
-    'build_lick_reward': True, 'lick_reward_smooth_sigma': lick_reward_smooth_sigma,
-    'build_visual': True, 'visual_specs': visual_specs,
-    'cam_params': cam_params, 'obj_size': obj_size, 'num_samp': num_samp,
-}
-_meta = {'n_dset': n_dset, 'dset_name': est1['dset_name'],
-         'n_cells': int(Y_enc_full.shape[1]), 'n_frames': int(frame_t.size)}
+side               = 'both'   # 'L' | 'R' | 'both'
+render_lat_samp    = 150      # WIDTH  (columns)
+render_vert_samp   = 101      # HEIGHT (rows)
+num_samp           = render_lat_samp   # legacy square fallback (kept for downstream refs)
+max_frames         = None     # cap render length for debugging; None = full session
+render_verbose     = False
+render_terrain     = False    # heightmap ground plane behind objects (Z-composited)
+terrain_mode       = 'surface'
+terrain_shade      = 'none'   # 'none' = invisible occluder | 'gray' | 'depth'
+terrain_stride     = 0.5
+conv_backend       = 'gpu'    # gabor/meng/fft build convolutions: 'gpu' (torch) | 'cpu' (scipy)
+conv_device        = 'cuda'
+feat_whiten        = False    # whiten loaded PCA feature blocks
+feat_pca_variant   = None     # None | 'pcacomb' | 'pcasep' | 'pcaraw' — pca_feat GEN cache variant
 
-# The junction: build (render+extract via f_build_features, +optional save) OR load
-# a cache by file/tag/index.
-built_blocks, frame_t, side_tags, _movie = f_acquire_features(
-    'cache' if load_cached_features else 'build', est1['dset_name'],
-    build_fn=lambda: f_build_features(session, cfg),
-    features_dir=features_dir, mouse_id=mouse_id,
-    cache_name=feature_file, cache_tag=feature_tag, cache_idx=feature_idx,
-    save=save_features, save_tag=save_tag, save_movie=save_movie,
-    gen_config=cfg, meta=_meta)
+# Per-block processing is an ordered f_proc step-list applied GLOBALLY at build, before any CV:
+# block `proc` (== grid layer2) + optional per-input `input_proc` (== layer1). Ops:
+# ('norm', zscore|standardize|total_var|first_sv) | ('pca', n|frac|(frac,cap)) | ('whiten', True).
+feature_plan = fsrc.f_proc_feature_plan()
+# Merge the vis_sets banks in and select them. The PLAN keys are the source of truth for the names —
+# '_common' is a defaults entry, not a block, so reading them back off the plan keeps it out of the list.
+_vis_plan = fsrc.f_vis_sets_to_plan(vis_sets)
+feature_plan.update(_vis_plan)
+feature_list = feature_list + [n for n in _vis_plan if n not in feature_list]
+
+build_cfg = fsrc.f_default_build_cfg(side=side, num_samp=num_samp,
+                                     lat_samp=render_lat_samp, vert_samp=render_vert_samp,
+                                     max_frames=max_frames, obj_size=obj_size,
+                                     render_terrain=render_terrain, terrain_mode=terrain_mode,
+                                     terrain_shade=terrain_shade, terrain_stride=terrain_stride,
+                                     conv_backend=conv_backend, conv_device=conv_device)
+n_pix_pca = build_cfg['n_pix_pca']          # kept top-level for downstream plot cells
+# SSD reuse of the CONVOLVED+POOLED gabor/meng/fft blocks, cached PRE-PCA/proc on the resolved
+# extractor params — so a bank already convolved by VR_feature_search / VR_ca_cebra reloads here.
+build_cfg['conv_autosave']     = True
+build_cfg['conv_autosave_tag'] = 'auto1'
+# Drop point-samples keeping less than this fraction of their filter window on screen (rest is zero
+# pad). MUST MATCH the other scripts — it changes the columns a bank emits AND is part of the
+# autosave key, so a mismatch silently rebuilds instead of reloading.
+build_cfg['edge_min_frac'] = 0.45
+
+
+#%% Build / load features (f_resolve_features)
+# Groups blocks by origin and runs each shared op once (one render for build blocks, one cache load,
+# one repo open); only `feature_list` is resolved.
+_src = ({**src, 'cache_tag': f"{src['cache_tag']}_{feat_pca_variant}"} if feat_pca_variant else src)
+built_blocks, frame_t, side_tags, _movie = fsrc.f_resolve_features(
+    session, feature_plan, build_cfg, dset_name=est1['dset_name'], only=feature_list,
+    render_verbose=render_verbose, whiten=feat_whiten, **_src)
+
+# OLD build path (pre-2026-08): inline visual_specs + cfg dict + the f_acquire_features junction.
+# Superseded by the feature_plan / vis_sets structure above; kept for reference.
+# visual_specs = {
+#     'gabor': {'grid': (6, 6), 'n_orient': 4, 'wavelengths': (6, 12),
+#               'stats': ('magnitude', 'phase'),
+#               'n_pca': {'gabM': 20, 'gabP': 10}},
+#     'meng':  {'grid': (6, 6), 'n_orient': 4, 'wavelengths': (8,),
+#               'temporal_freqs': (0.15,), 'output': 'opponent', 'n_pca': 20},
+# }
+# cfg = {
+#     'side': side, 'agg_mode': agg_mode, 'obj_collapse': obj_collapse,
+#     'nan_absent': nan_absent, 'n_pix_pca': n_pix_pca,
+#     'build_motion': True, 'motion_smooth_sigma': motion_smooth_sigma,
+#     'build_self_motion': True, 'self_motion_smooth_sigma': self_motion_smooth_sigma,
+#     'build_lick_reward': True, 'lick_reward_smooth_sigma': lick_reward_smooth_sigma,
+#     'build_visual': True, 'visual_specs': visual_specs,
+#     'cam_params': cam_params, 'obj_size': obj_size, 'num_samp': num_samp,
+#     'lat_samp': 150, 'vert_samp': 101,
+#     'render_terrain': False, 'terrain_mode': 'surface', 'terrain_shade': 'none',
+#     'terrain_stride': 0.5, 'terrain_point_size': 1, 'terrain_clip_len': None,
+#     'terrain_gray_level': 128, 'terrain_close_iter': 2,
+# }
+# _meta = {'n_dset': n_dset, 'dset_name': est1['dset_name'],
+#          'n_cells': int(Y_enc_full.shape[1]), 'n_frames': int(frame_t.size)}
+# built_blocks, frame_t, side_tags, _movie = f_acquire_features(
+#     'cache' if load_cached_features else 'build', est1['dset_name'],
+#     build_fn=lambda: f_build_features(session, cfg),
+#     features_dir=features_dir, mouse_id=mouse_id,
+#     cache_name=feature_file, cache_tag=feature_tag, cache_idx=feature_idx,
+#     save=save_features, save_tag=save_tag, save_movie=save_movie,
+#     gen_config=cfg, meta=_meta)
 
 fs_img = f_imaging_fs(frame_t)
 print(f'imaging fs ≈ {fs_img:.1f} Hz')
@@ -176,6 +255,26 @@ if _movie is not None:
     mon_movies = [{'L': left_mon_frames, 'R': right_mon_frames}[t] for t in side_tags]
 
 print('blocks:', {k: built_blocks[k]['X'].shape for k in built_blocks})
+
+#%% (optional) Merge CONV_REPO sampled features into built_blocks — encode neurons from them
+# Loads dense per-filter maps from a conv_repo (VR_feature_gen GEN_MODE='conv_repo'), point-samples
+# → gaborS_ds*/mengS_ds* blocks merged into built_blocks. Add those names to enc_blocks below to fit
+# the per-neuron encoder from the point-sampled features (no re-extraction). Needs a conv_repo built
+# for this dataset. LIMIT what's loaded with smp_kinds/smp_wl/smp_odegs/smp_tfreqs (None = all).
+if 0:
+    from f_conv_repo import f_conv_repo_dir, f_load_conv_blocks
+    smp_repo_tag = 'gen_7_11_26'      # conv_repo GEN_TAG (folder <dset>_<tag>); NOT feature_tag
+    smp_ds_list  = [8]                # sampling stride(s) → gaborS_ds*/mengS_ds*
+    smp_n_pca    = 50                 # PCs kept per sampled block (None = raw)
+    smp_kinds    = ('gabor', 'meng')  # ('gabor',) | ('meng',) | both
+    smp_wl = smp_odegs = smp_tfreqs = None   # e.g. (6,) / (0,90) / (0.15,) to limit
+    _repo = f_conv_repo_dir(features_dir, est1['dset_name'], smp_repo_tag)
+    _blocks, _ = f_load_conv_blocks(_repo, smp_ds_list, n_pca=smp_n_pca, side_tags=side_tags,
+                                    kinds=smp_kinds, wavelengths=smp_wl, odegs=smp_odegs,
+                                    tfreqs=smp_tfreqs)
+    built_blocks.update(_blocks)
+    print('merged conv_repo blocks:', {b: built_blocks[b]['X'].shape for b in _blocks})
+    print('→ add to enc_blocks to encode from them:', list(_blocks))
 
 #%% Gabor bank sanity — kernels + one frame's pooled magnitude map
 if 1:
@@ -209,14 +308,40 @@ if 1:
     fig.suptitle(f'{dset_tag}  —  Gabor magnitude (SF {gb_wav[0]}px) pooled {gb_grid}')
     fig.tight_layout()
 
+    # kernels TO SCALE on the monitor frame + grid — see gabor size vs cell / monitor by eye
+    H, Wpx = mv[t0].shape
+    ys, xs = f_grid_bounds(H, Wpx, gb_grid)
+    io_show = gb_nori // 2                                 # one mid orientation
+    kerns = [k for k in bank if k['io'] == io_show]        # one kernel per wavelength
+    fig, axm = plt.subplots(figsize=(6.5, 6.5 * H / Wpx + 0.6))
+    axm.imshow(mv[t0], cmap='gray', origin='upper')
+    for y in ys: axm.axhline(y - 0.5, color='cyan', lw=0.6)
+    for x in xs: axm.axvline(x - 0.5, color='cyan', lw=0.6)
+    for isf, k in enumerate(kerns):                        # place each SF in its own cell
+        ev = k['even']; kh, kw = ev.shape
+        iy = 1; ix = min(1 + 2 * isf, gb_grid[1] - 1)
+        cx = 0.5 * (xs[ix] + xs[ix+1]); cy = 0.5 * (ys[iy] + ys[iy+1])
+        a = np.clip(np.abs(ev) / np.abs(ev).max(), 0, 1)   # per-pixel alpha = lobe strength
+        axm.imshow(ev, cmap='bwr', origin='upper', alpha=a, zorder=3,
+                   extent=[cx - kw/2, cx + kw/2, cy + kh/2, cy - kh/2])
+        axm.text(cx, ys[iy] - 2, f"λ={k['wavelength']:.0f}px  ({kw}px)",
+                 color='yellow', fontsize=8, ha='center', va='bottom')
+    axm.set_xlim(-0.5, Wpx - 0.5); axm.set_ylim(H - 0.5, -0.5)
+    axm.set_xticks([]); axm.set_yticks([])
+    axm.set_title(f'{dset_tag} — Gabor kernels to scale on {side_tags[0]} monitor  '
+                  f'(θ={180*io_show/gb_nori:.0f}°)\ngrid {gb_grid} → cell ≈ '
+                  f'{Wpx/gb_grid[1]:.0f}×{H/gb_grid[0]:.0f} px,  monitor {Wpx}×{H} px')
+    fig.tight_layout()
+
 #%% Encode — per-neuron CV ridge (real) vs per-cell circshift null
 # Short causal FIR: features over a small lag window predict the rate proxy.
-enc_blocks      = ['self_mot', 'beh', 'agg', 'pix', 'gabor', 'meng']
-# 'gabor' = V1 oriented-edge energy; 'meng' = motion energy (direction+speed).
-# Both built in the build cell's visual_specs (add 'phase' to gabor stats for
-# velocity-via-FIR; add 'grid'/'flow' specs for the cheaper tiers).
-# available now: 'agg' 'pix' 'motion' 'self_mot' 'beh' + visual 'gabor' 'meng'
-# need build flag: 'pix_mot' 'per_obj' (enable in build_feature_blocks above)
+enc_blocks      = ['self_mot', 'beh', 'agg', 'pix', 'gabmag', 'mengopp']
+# A vis_sets BANK name expands to ALL its `<bank>:<cell>` blocks (concatenated) via f_expand_blocks;
+# an explicit cell scores ONE level, e.g. 'gabmag:all' or 'gabmag:sf0.01016'. Legacy names still work
+# verbatim, so a list can mix them.
+# available now: whatever is in feature_list — 'agg' 'pix' 'self_mot' 'beh' + the vis_sets bank names
+# (add 'motion' / 'pix_mot' / 'grid' / 'flow' to feature_list in the plan cell to use them)
+# OLD: ['self_mot', 'beh', 'agg', 'pix', 'gabor', 'meng']  (inline visual_specs banks)
 enc_lags_ms     = [0, 100, 200, 300]           # → frames via fs (rise→peak window)
 enc_embargo_sec = 0.5
 enc_decoder     = 'ridge'      # 'ridge' | 'ridgecv' | 'knn' | 'pls' | 'cca'
@@ -640,7 +765,7 @@ if 1:
 # D2). Each reshapes to a monitor frame per lag = spatiotemporal RF. Rank by the feature-model
 # OOF r (`real`) to pick responsive cells. Needs the raw movie in memory (build mode / a
 # save_movie cache). Any session (all luminance pooled).
-if 0:
+if 1:
     from f_encoding import f_encode_fit_weights, f_encode_sta
     from f_encoding_plots import f_plot_rf_cells
 
@@ -676,7 +801,7 @@ if 0:
 #%% P2·D2 — SMOOTHNESS-regularized pixel RF (legible vs the ridge/STA above), fixed λ
 # Generalized Tikhonov: couples neighboring pixels + adjacent lags → a clean RF where plain
 # ridge is salt-and-pepper. RUN THE D1 CELL FIRST (defines _Xpix, pix_lags, _Hd/_Wd, _cidx, _lbls).
-if 0:
+if 1:
     from f_encoding import f_encode_fit_smooth
     from f_encoding_plots import f_plot_rf_cells
     sm_lam_space, sm_lam_lag, sm_lam_ridge = 50.0, 20.0, 1e-2
@@ -688,8 +813,10 @@ if 0:
 
 #%% P2·D2 — JOINT deconv-σ × smoothness-λ CV → best (encoding OOF r), refit + view at best
 # σ (target smoothing) and lags/smoothness are partly redundant → ONE search (§2d). Re-smooths
-# the RAW deconvolved S per σ. RUN THE D1 CELL FIRST (uses _Xpix, pix_lags, _Hd/_Wd, _cidx, _lbls).
-if 0:
+# the RAW deconvolved S per σ. (σ,λ) SELECTED on the leading (1-report_frac) of time; the
+# winner's r is REPORTED on the held-out tail (nested guard, P2 §7 — no selection optimism).
+# RUN THE D1 CELL FIRST (uses _Xpix, pix_lags, _Hd/_Wd, _cidx, _lbls).
+if 1:
     from f_encoding import f_encode_tune_sigma_lambda, f_encode_fit_smooth
     from f_encoding_plots import f_plot_rf_cells
     from f_utils import f_gauss_smooth
@@ -699,8 +826,9 @@ if 0:
     _Sraw = est1['S'][enc_cell_ids]                # raw deconvolved, aligned to Y_enc cells
     rows, best = f_encode_tune_sigma_lambda(_Sraw, _Xpix, pix_lags, (_Hd, _Wd),
                                             sigma_list, lam_list, n_folds=enc_n_folds,
-                                            embargo=embargo_fr)
-    print('best σ/λ (max median OOF r):', best)
+                                            embargo=embargo_fr, report_frac=0.25)
+    print(f'best σ={best["sigma_frames"]}fr λ=({best["lam_space"]:g},{best["lam_lag"]:g})  '
+          f'select r={best["sel_r"]:+.3f}  held-out report r={best["report_r"]:+.3f}')
     _Ssm = f_gauss_smooth(_Sraw, sigma_frames=best['sigma_frames'])
     _rm = np.max(_Ssm, axis=1, keepdims=True)
     _Yb = (_Ssm / np.where(_rm == 0, 1.0, _rm)).T
@@ -724,3 +852,29 @@ if 1:
         _rb = f_encode_per_neuron(built_blocks, [b], Y_enc, lags, **_mkw)['r_per_cell']
         _frac = f_encode_ceiling_fraction(_rb, r_full)
         print(f'  {b:12s}  {np.nanmedian(_rb):+.3f}      {np.nanmedian(_frac):.2f}')
+
+#%% P2·D3 — banded ridge (per-band λ) → visual-unique / behavior-unique / shared variance
+# Groups blocks into a VISUAL band and a BEHAVIOR band, tunes one λ per band on a selection
+# split (held-out report), then decomposes each cell's OOF R² into per-band unique + shared
+# (P2b-1/P2b-5). For the honest closed-loop read, self_mot should be the fwd/lat/yaw block
+# (build with self_motion_decomp=True). shared = the visual↔self-motion overlap the closed loop
+# can't disentangle from pooled data — read visual-unique on decoupled epochs later (P2b-5c).
+if 1:
+    from f_encoding import f_encode_tune_bands, f_encode_variance_partition
+    _vis = [b for b in ['agg', 'pix', 'gabor', 'meng'] if b in built_blocks]
+    _beh = [b for b in ['self_mot', 'beh'] if b in built_blocks]
+    band_groups = [('visual', _vis), ('behavior', _beh)]
+    print('bands:', band_groups)
+
+    _rows, _best = f_encode_tune_bands(built_blocks, band_groups, Y_enc, lags,
+                                       alpha_grid=[0.1, 1.0, 10.0, 100.0],
+                                       embargo=embargo_fr, n_folds=enc_n_folds,
+                                       report_frac=0.25)
+    part = f_encode_variance_partition(built_blocks, band_groups, Y_enc, lags,
+                                       _best['band_alphas'], embargo=embargo_fr,
+                                       n_folds=enc_n_folds)
+    _u = np.nanmedian(part['unique'], axis=0)
+    print(f'median r2_full = {np.nanmedian(part["r2_full"]):+.3f}')
+    for bi, nm in enumerate(part['band_names']):
+        print(f'  {nm:9s} unique R²  {_u[bi]:+.3f}')
+    print(f'  shared    R²  {np.nanmedian(part["shared"]):+.3f}')

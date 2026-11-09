@@ -538,6 +538,35 @@ def f_meng_configs(banks, grids=None, n_orient_list=None, wl_subsets=None, tf_su
                     yield meta, bank['X'][:, cols]
 
 
+def f_conv_configs(repo_dir, ds_list, kind='gabor', side_tags=None, n_frames=None,
+                   wl_subsets=None, odeg_subsets=None, tf_subsets=None, verbose=False):
+    """CONV_REPO ADAPTER for the sweep engine — POINT-SAMPLE the repo's dense maps (gaborS/mengS
+    style, NO grid pooling, NO re-conv) → (meta, raw_X) configs for f_sweep_recon. One config per
+    (ds × wavelength-subset × orientation-subset × tf-subset); raw_X is the sampled columns of ALL
+    matching filters (both sides), truncated to `n_frames` to align with the rendered target. Sweep
+    `n_pca` downstream (nested truncation, free) to OPTIMIZE the number of PCs. `wl_subsets` /
+    `odeg_subsets` / `tf_subsets` = lists of value-tuples (None → the repo's full set, one config).
+    Requires a conv_repo (VR_feature_gen GEN_MODE='conv_repo')."""
+    from f_conv_repo import f_sample_conv_to_block, _conv_filter
+    for ds in ds_list:
+        for wls in (wl_subsets or [None]):
+            for odegs in (odeg_subsets or [None]):
+                for tfs in (tf_subsets or [None]):
+                    sel = _conv_filter(kinds=(kind,), wavelengths=wls, odegs=odegs, tfreqs=tfs)
+                    X, names = f_sample_conv_to_block(repo_dir, ds, select=sel,
+                                                      side_tags=side_tags, verbose=verbose)
+                    if n_frames is not None and X.shape[0] > n_frames:
+                        X = X[:n_frames]
+                    if X.shape[1] == 0:
+                        continue
+                    meta = {'kind': kind, 'grid': f'ds{ds}', 'grid_cells': X.shape[1], 'ds': ds,
+                            'n_orient': (len(odegs) if odegs else 0),
+                            'n_sf': (len(wls) if wls else 0),
+                            'wavelengths': tuple(wls) if wls else (),
+                            'temporal_freqs': tuple(tfs) if tfs else (), 'stat': kind}
+                    yield meta, np.ascontiguousarray(X)
+
+
 def f_sweep_recon(configs, target, cv_kw, fs, n_pca_list=(20,), lags_list=([0, 100, 200],),
                   decoder_list=(('ridge', 1.0),), motion=None, verbose=True):
     """Feature-AGNOSTIC sweep engine. `configs` = iterable of (meta_dict, raw_X). For each:

@@ -164,6 +164,16 @@ def f_load_caim_data(data_dir, dset_names, caiman_tag = 'results_cnmf', cuts_tag
         A_data = f_h5_load_group(f['estimates']['A'])
         est1['A'] = csr_matrix((A_data['data'], A_data['indices'], A_data['indptr']), shape=(A_data['shape'][1], A_data['shape'][0]))
         est1['dims'] = dims
+
+        # spatial/temporal BACKGROUND (b, f) — for a structural/vessel reference image (b@mean(f)).
+        # Optional (not in every file); loaded as-is (NOT component-filtered). Guarded so a missing
+        # key never breaks loading.
+        for _bg in ('b', 'f'):
+            try:
+                _o = f['estimates'][_bg]
+                est1[_bg] = np.asarray(_o[()]) if isinstance(_o, h5py.Dataset) else f_h5_load_group(_o)
+            except Exception:
+                pass
         
         bool_components = np.ones(est1['C'].shape[0], dtype=bool)
         
@@ -310,6 +320,20 @@ def f_gauss_smooth(firing_rates, sigma_frames=1):
         firing_rates_sm = firing_rates
     
     return firing_rates_sm
+
+
+def f_neural_rate(S, sigma_frames=6, peak_norm=True):
+    """Deconvolved spikes (n_cells, T) → rate proxy: drop silent cells → Gaussian smooth (σ frames,
+    0 = none) → optional per-cell peak-normalize. The ONE recipe behind the encoding target
+    (f_encoding.f_enc_target), the ensemble input (f_ensemble_pipeline.f_ens_neural_input) and
+    f_feature_search.f_make_neural_target. Returns (R (n_active, T) float64, active bool (n_cells,))."""
+    S = np.asarray(S, dtype=float)
+    active = S.sum(axis=1) > 0
+    R = f_gauss_smooth(S[active], sigma_frames=sigma_frames)
+    if peak_norm:
+        mx = np.max(R, axis=1, keepdims=True)
+        R = R / np.where(mx > 0, mx, 1.0)
+    return R, active
 
 
 def f_get_frames(trial_win = [-0.05, .95], frame_rate = 30):

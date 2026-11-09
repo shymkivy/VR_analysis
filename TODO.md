@@ -7,6 +7,56 @@ Status legend: `[ ]` pending · `[~]` in progress · `[x]` completed · `[!]` bl
 
 ---
 
+## NEXT UP (2026-11-06)
+
+- [ ] **#78** — ONE feature builder + one interface for VR_feature_search and VR_ca_cebra/encoding
+      (modular pipeline, piece 3). Plan: `PLAN_feature_builder_merge.md`. Two parallel stacks today
+      (f_feature_configs→f_iter_grid_cells vs f_vis_sets_to_plan→_build_grid_block). CONFIRMED silent bug:
+      a single-SF entry builds 8 ori / Nyquist in the search but 4 ori / ds=4 in cebra. Also exact vs
+      randomized layer-1 SVD, cebra holds all raw inputs in RAM. Steps: fix single-SF → move the streaming
+      builder to f_feature_source (pluggable raw source) → cebra's builder wraps it → one spec builder
+      `f_feature_plan` → f_feature_search one path + tidy (legacy builders to f_feature_legacy.py) → cebra
+      feature cell → lazy render. Decisions open (old-scorer knobs, legacy, vis_sets→feat_sets, pix).
+
+- [x] **#77** — ONE encoder config + ONE encoding sweep wrapper (modular pipeline, piece 2). Plan:
+      `PLAN_encoding_config.md`. Defaults = VR_ca_cebra's enc_params (ridge α 1e3, lags 0–500 ms,
+      interleaved 5-fold, 150 joint feature PCs, standardize, target σ=6 frames). Config defaults at the
+      top of f_encoding.py with every option documented + unknown keys raise + tag; `f_enc_target`;
+      `f_encode_sweep` (axes: encoder keys / feature sets & procs / targets; 1-D + 2-D; tidy table + line
+      plot); feature search + VR_encode_scan encode through f_run_encoder. Today the three scorers differ
+      (search: α 1, 200 ms only, σ 0, contiguous folds). Open: double reduction (n_feature_pcs on top of
+      feat_sets procs), embargo 0 vs 0.5 s.
+
+- [x] **#76** — ONE ensemble-generation config reused by every script (first piece of the modular
+      pipeline, TARGETS). Plan: `PLAN_ensemble_config.md`. `f_default_ens_config(**overrides)` (stages
+      neural/dimred/apply/stats/select, defaults = cebra's tuned values, unknown keys raise) +
+      `f_ens_neural_input` + `f_ensembles_from_config` (stats-only re-run via `prior`) + `f_ens_targets` +
+      optional per-dataset cache keyed by config hash. Parity first (each script's current settings →
+      identical ens_table), then port cebra / VR_encode_scan / VR_tuning_scan / VR_feature_tuning and add
+      ensembles as encode targets in the feature search. Defaults = VR_ca_cebra's current values
+      (z_thresh membership, NMF input σ=6, sparse NMF l1 0.5 / alpha_W 1e-4, seed 42, hclust sort).
+      + NEW SCRIPT `VR_ensembles.py`: load one dataset (calcium only) → ensembles from the config →
+      cebra's ensemble plots (scores, overview raster, LNO ECDF, CV trace, FOV map; opt-in dim-red sweep
+      + NMF consensus) → optional save to the ensemble cache. Cell map in the plan file.
+      DONE 2026-11-06: config + cache + VR_ensembles.py; parity exact; ported VR_ca_cebra (old cells and
+      duplicate plots removed), VR_feature_search (Cell 1b targets), VR_encode_scan, VR_tuning_scan,
+      VR_feature_tuning. Real default config built for L/11_2_25 (10/15 sig).
+
+- [ ] **#75** — Cross-dataset FEATURE SCAN: score ONE feature config (from VR_feature_search's
+      `feat_sets`) for encoding across ALL datasets. Plan A (recommended): new thin driver
+      `VR_feature_scan.py` looping datasets → `fsearch.f_feature_search(session, configs, …)` so scoring
+      is IDENTICAL to the single-dataset search. Needs: (1) `f_score_representations` option to return
+      per-cell r/R² (currently computed then discarded, f_dataset_scan.py ~247) for cortex maps;
+      (2) resumable store keyed (mouse, dset, config), mirroring f_encode_scan `_save_atomic`;
+      (3) `f_render_clear` between datasets. Plan B (alt): port VR_encode_scan.py to the vis_sets plan
+      path — keeps its store/models/ensembles/plots but scores differently (within-fold proc, 0–500 ms
+      FIR vs search's proc_before_cv + 200 ms), so results won't line up with the search.
+      Cost: conv_autosave only covers L_11_2_25 → every other dataset re-renders + convolves (gabor GPU
+      ~3 min/bank; fft CPU ~3–14 min per SF level). Open: which feature, encode-only vs +decode, which
+      mice/datasets. Old-feature store `encode_scan/enc_7_18_26` is not comparable.
+
+---
+
 ## Approaches roadmap (2026-05-18, see `notes.txt`)
 
 - [ ] **#1** — Encoding model: monitor → neural
@@ -386,9 +436,23 @@ P-numbers mapped to real IDs below. Verify-checklist results recorded in
         **D2 built + gated** (2026-07-03): `f_encode_fit_smooth` (Tikhonov/Laplacian smoothness),
         `f_encode_smooth_cv`, `f_encode_tune_sigma_lambda` (σ×λ joint CV). Gate step 3 passes
         (smooth beats ridge at low N: corr 0.57 vs 0.17). D2 driver cells in `VR_ca_encoding.py`.
+        **D2 nested guard added** (2026-07-03, P2 §7): `f_encode_tune_sigma_lambda` now SELECTS
+        (σ,λ) on a leading time split and REPORTS the winner on a held-out tail (`report_frac`,
+        `sel_r`/`report_r`) — no hyperparameter-selection optimism; synthetic-verified.
+        **self_mot fwd/lat/yaw decomposition added** (2026-07-03, P2a-9): `f_self_motion_decomp`
+        (heading projection: fwd=dx·cosφ+dz·sinφ, lat=−dx·sinφ+dz·cosφ, yaw=dφ) wired via the
+        `self_motion_decomp` knob in `build_feature_blocks`/`f_pipeline` (default off = old 2-ch);
+        synthetic-verified (mag preserved, lat≈0 forward-only). Required precursor to the P2b-5 partition.
+        **D3 banded ridge + variance partition built + gated** (2026-07-03, P2a-5/P2b-1): `BandedRidge`
+        (per-band λ via per-band column-rescaled Ridge; `predict_band`) in f_decoding + `decoder='banded'`
+        threaded through `make_decoder`/`f_blocked_cv_r2`; `f_encode_banded`/`f_encode_tune_bands`
+        (per-band α joint-grid, nested select/held-out-report)/`f_encode_variance_partition` (drop-one
+        on JOINT model → visual-unique/behavior-unique/shared R²). Gate step 4 passes (noise band
+        unique≈0, correct vis>beh ordering, shared≈0 for independent bands; penalty == closed-form
+        banded solve). D3 driver cell in `VR_ca_encoding.py`.
         Audit → `../reserrch_repo/AUDIT_P2_findings.md` (flags: self_mot=speed+yaw; #62 CEBRA leak).
-        NEXT: view real RFs (build mode); then D3 banded+variance-partition. Deferred: D3/D4
-        behavior bands (fwd/lat/yaw + capture-offset)/D6 per-cell lags/D7 dual-readout (→P5)/D8/D9.
+        NEXT: view real RFs (build mode); run D3 partition on real data (self_mot decomp on). Deferred:
+        D4 task-event band + capture-offset regressor/D6 per-cell lags/D7 dual-readout (→P5)/D8/D9.
       *Working ceiling stance (2026-06-13, supersedes #58):* use the FULL-feature
       model r (predict each cell from ALL blocks, best model) as the per-cell
       RELATIVE ceiling — judge a feature/model by how much of r_full it recovers.
@@ -449,6 +513,14 @@ P-numbers mapped to real IDs below. Verify-checklist results recorded in
       Run enc/dec quality over ALL do_proc datasets; compare by brain REGION and
       separate region effects from per-session quality (some sessions just
       perform better). Plot SUMMARY scores only, not per-dataset figures.
+  - [~] **Fast across-dataset TRIAGE** `VR_dataset_scan.py` + `functions/f_dataset_scan.py`
+        (2026-07-11): loops mice × do_proc datasets, loads calcium + CHEAP behavior
+        vectorization (NO render, NO feature cache) → per-dataset decode R² (neural→self_mot,
+        neural→agg) + encode r (agg+self_mot→neural) + covariates (n_cells/T/participation-
+        ratio/agg-coverage) → ranked table + bars. Leak-free within-fold PCA; NaN target rows
+        drop. Purpose = pick which datasets deserve the full feature build + sweep. Core metric
+        wiring synthetic-verified; NOT yet run on real data. Ranks by stimulus/self-motion
+        coupling (triage proxy, not the gabor/meng result). Region metadata into the table = TODO.
       *Architecture — precompute-and-cache features (decouple render from analysis):*
   - [~] **Feature-generation script** `VR_feature_gen.py` + helper
         `functions/f_feature_cache.py` (`f_save_features` / `f_load_features` /
@@ -513,25 +585,141 @@ P-numbers mapped to real IDs below. Verify-checklist results recorded in
         (mag / phase / meng / mag+meng / all / pix) via blocked-CV ridge → OOF
         variance-weighted R², motion-stratified + example frames. Compiles +
         synthetic-tested; NOT yet run on real data.
-  - [ ] **Run Chain-1** on a real (ideally dark-condition) session: does meng add over
-        gabor magnitude, and where (motion-stratified)? Sweep the acuity cutoff (σ≈0.3–0.5
-        px at 0.5 cpd — render already ≈ acuity, so also try coarser toward the grid scale).
-        Reconstruct vs LAGGED mag so meng's motion isn't double-counted.
+  - [~] **Run Chain-1** on a real session (2026-07-03 progress): gabor MAGNITUDE and
+        PHASE both reconstruct the acuity-lowpass movie WELL; MENG stays at very low R²
+        so far. Next = keep optimizing meng (via the sweep harness below) to get a usable
+        motion feature representation — the target is meng good enough to serve as a
+        DECODING TARGET for the neuronal (Chain-2) plans, not just Chain-1 fidelity.
+        Still TODO: sweep the acuity cutoff (σ≈0.3–0.5 px at 0.5 cpd — render already ≈
+        acuity, so also try coarser toward the grid scale); reconstruct vs LAGGED mag so
+        meng's motion isn't double-counted; dark-condition session.
   - [ ] **Test A** (neural, Chain-2): phase unique Δr given mag+meng via
         `f_encode_block_importance` — if ≈0, drop phase.
   - [ ] **Test B** (duality): coarse-grid+phase vs fine-grid-no-phase — same encoding r?
         → keep whichever is fewer features.
   - [ ] Match meng speed bands (`tf`/`λ`) to the MEASURED on-screen object/optic-flow
         velocity distribution rather than guessing.
-  - [ ] Later: the feature-PARAMETER × score sweep (grid density / #orient / #SF / #PCs)
-        using the PARKED `functions/f_feature_optim.py` (extract superset once, subset
-        cheaply), scored through the existing encoder/decoder on a frame subset.
+  - [~] The feature-PARAMETER × score sweep (grid density / #orient / #SF / #PCs / lags /
+        decoder) — HARNESS BUILT in `functions/f_feature_optim.py` + `VR_feature_optim.py`
+        (2026-07-02): extract superset once (`f_extract_gabor_multigrid` /
+        `f_extract_meng_multigrid`, conv ONCE → pool all grids), subset cheaply, score
+        through Chain-1 recon (`f_sweep_recon`/`f_sweep_marginal`). Gabor + meng cells
+        share the feature-agnostic engine; meng judged on HIGH-motion R². Use this to push
+        meng R² up (target-quality for Chain-2).
+  - [~] **NEURAL-scored feature-param search** (2026-07-18): the Chain-2 sibling of the recon
+        sweep above. `functions/f_feature_search.py` + `VR_feature_search.py`: on ONE dataset, loop
+        candidate feature `configs` (plan-based → f_resolve_features, cache-backed — no reconvolution)
+        and score each by ENCODE + DECODE (f_score_representations: decode R² neural→feature + encode r
+        feature→neural) → ranked scorecard. `f_variant_configs` = the separate/combined/raw-PCA
+        comparison from the pca_feat caches; combinations = derived gaborS+mengS; fresh ds/n_pca/filter
+        sweeps = plan overrides. `enc_n_jobs` caps encode cores (CPU/crash guard). Compiles; NOT yet
+        run on real data. NEXT: run on 1 dataset, pick the best feature repr for encode+decode, then
+        extend to a joint encode+decode objective / marginal-axis sweep.
+  - [ ] **Optimize meng** (own task; low R² as of 2026-07-03). Goal = a motion feature
+        set good enough to be a Chain-2 DECODING TARGET, not just Chain-1 fidelity. Sweep
+        via the meng cell of `VR_feature_optim.py`: `tf` (temporal-freq / speed bands),
+        `λ`/#SF, #orient, grid, #PCs, decoder — scored on HIGH-motion R². Match speed bands
+        to the MEASURED on-screen object/optic-flow velocity distribution (see item below)
+        rather than guessing. Check meng vs LAGGED-mag so mag's Δ over time isn't stealing
+        meng's motion variance. Compare meng against the flow tier (#49) once flow exists.
+  - [~] **Sampled (point-sampling) extraction method** (2026-07-11): a SECOND gabor/meng method
+        that POINT-samples the dense response on a lattice every `sample_ds` px (vs grid mean-pool;
+        ds=1 → full conv) + optional `presmooth_sigma`. In `f_visual_features` (`pool='sample'`,
+        `f_subsample_grid_block` for conv-once/derive-coarser, `build_visual_blocks` `type` override);
+        `f_dataset_scan.f_score_representations` gives one decode R² + encode r per method (compact
+        format); driver cells in `VR_ca_cebra.py` (build + compare gabor/meng-sampled vs pix), viz
+        panel cell in `VR_feature_viz.py`. Compiles + synthetic-gated; NOT yet run on real data.
+        GOAL: does point-sampled gabor/meng beat straight pixel-PCA (both directions)?
+  - [~] **Convolved-feature repository** (2026-07-11): persist the DENSE per-filter convolved maps
+        ONCE per dataset so resolution/param sweeps LOAD+subsample instead of re-convolving (the slow
+        part). `functions/f_conv_repo.py` (uint16-quantized per-filter .npy + manifest, INCREMENTAL —
+        add orientations/wavelengths/TFs without recomputing; mmap+subsample loader → block).
+        `VR_feature_gen.py` `GEN_MODE='conv_repo'` (+ `conv_specs`) builds the repo; `VR_ca_cebra.py`
+        sampled-methods cell `methods_source='conv_repo'` loads+samples+scores (no re-conv). gabor mag
+        + meng opponent. Compiles + synthetic-gated end-to-end; NOT yet run on real data. Deferred:
+        gabor phase in repo, percentile quant, standalone optimize script.
+  - [ ] **Optic flow (#49) NOT yet touched** — the flow tier (`f_flow_features`, block
+        `'flow'`, Farneback → per-cell speed/dir/divergence) is registered but has never
+        been run/extracted or scored through Chain-1. Bring it into the sweep alongside meng
+        as the second motion representation; the two are the candidates for a motion target.
 
 REVIEW items folded into existing tasks (no new ID):
 - P1-2 (object target definedness / presence-location hurdle model) → **#12**.
   Presence already AUC-scored; presence-in-R² leak fixed 2026-06-12.
 - P1-3 (motion-energy over flow; flow degenerate on silhouettes) → amends
   `PLAN_monitor_features.md` + reorders **#50/#51** ahead of **#49**.
+
+---
+
+## Gabor / visual-feature representation comparison (2026-07-23)
+
+Goal: find the LEANEST visual feature set that maximizes encode+decode, not RF fidelity — all scored
+through `f_feature_search` / `f_score_representations` (decode R² neural→feature + encode r feature→neural).
+Two established constraints frame the sweeps: (a) MAGNITUDE features need ≥3 orientations (0°/90° give
+IDENTICAL responses to 45° vs 135° → unlearnable by any regressor; squaring makes orientation tuning
+order-2 → ~3-4 is the Nyquist floor, 8+ is redundant/PCA-collapsed); (b) PHASE may need only ~2 (test);
+(c) DECODE is per-static-frame so motion/speed likely unneeded — motion matters mainly for ENCODE.
+
+- [ ] **#69** — Gabor baseline "up to speed". Validate the recent fixes end-to-end on real video:
+  quadrature magnitude √(even²+odd²) (already correct), luminance DC channel, centered Nyquist sampling
+  (`_sample_idx`), `samp_factor`, and the obj_size WIDTH fix (x now full width — REGENERATE all caches).
+  Verify with `VR_feature_kernel_plot.py` (kernel sizes/sampling to scale). Establishes the magnitude
+  baseline. Sweep `n_orient` (2/3/4/8) → find the encode/decode plateau (expect 2≪4≈8).
+- [ ] **#74** — SIGNED QUADRATURE gabors (`stats=('quadrature',)` → gabQe + gabQo), added 2026-07-25.
+  The even/odd filter responses themselves — no magnitude taken, no normalization. Since re = |R|cosφ
+  and ro = |R|sinφ this carries magnitude AND phase JOINTLY (|R| = √(re²+ro²) recoverable), so it is a
+  strict superset of #69's magnitude and #70/#71's phase, in 2 channels instead of 3. Three reasons it
+  should be the reference point for the whole #69–#71 comparison:
+    (a) INFORMATION — {re,ro} and {mag,cosφ,sinφ} are the same information (bijection away from mag=0),
+        so nothing is lost; quadrature just uses the better-conditioned basis.
+    (b) LINEAR MODELS — the combination a ridge would need from mag+phase is the PRODUCT mag·cosφ, which
+        a linear model cannot form; mag·cosφ IS re. So for ridge encode/decode, mag+phase is strictly
+        worse-conditioned than quadrature while carrying identical information. mag+phase is only a
+        genuinely DIFFERENT hypothesis under a nonlinear decoder (`make_decoder` knn/pls/cca).
+    (c) CONDITIONING — no division, so empty screen regions contribute ~0 rather than a full-amplitude
+        arbitrary unit vector. Also means the FFT conv path applies at full parity (see f_conv_gpu
+        FFT_WITH_PHASE, which has to stay off for gabPc/gabPs).
+  Also the natural LINEAR gabor stage for the encoding arm (#57): a ridge on signed (re,ro) can
+  represent a phase-sensitive oriented RF; magnitude cannot, and normalized phase is contrast-blind.
+  Not phase-invariant → keep Nyquist λ/2 sampling, don't coarsen. Implemented in f_gabor_features +
+  f_conv_gpu._gab_stat_torch (no new conv — re/ro already computed). NOT yet in f_feature_optim's
+  separate bank builder (`f_build_gabor_banks`, `if 'phase' in stats`) — add if that path is used.
+- [ ] **#70** — magnitude + NORMALIZED phase. `stats=('magnitude','phase')` → gabM + gabPc + gabPs.
+  Test whether adding phase (position/polarity) lifts encode/decode over magnitude alone. NOTE: phase
+  here is UNIT-modulus (re/mag, ro/mag) — magnitude divided out. Pair it WITH gabM (never phase alone
+  for a linear model, see #71). Given #74(b), expect this to match or trail quadrature under ridge; run
+  it against a NONLINEAR decoder if you want it to test something quadrature doesn't.
+- [ ] **#71** — phase-only gabors. gabPc/gabPs without magnitude; sweep orientations (test the "phase needs
+  only 2" hypothesis). Probes whether position/phase alone carries the decodable signal. CAUTION
+  (measured 2026-07-24): re/mag EXPLODES as |R|→0 and the gate is an absolute `mag > 1e-6`, so over an
+  empty screen these channels emit unit-magnitude values driven by float rounding rather than stimulus —
+  two conv engines that both shipped disagree at corr 0.9917, and gpu-direct vs gpu-fft at 0.86. So a
+  chunk of phase-only "signal" is engine noise. Fix the gate (scale-RELATIVE threshold) before trusting
+  this result, or read it via #74 instead.
+- [ ] **#72** — optical flow / motion, ENCODE-focused (decode likely needs no speed). The `flow` feature
+  (Lucas-Kanade) exists but is degenerate on filled silhouettes (uniform interiors → only edge normal-flow).
+  Compare `flow` vs `meng` vs phase-at-lags. NOTE: a LINEAR (ridge) decoder can't extract Δφ from cos/sin
+  phase (needs the bilinear product across lags — exactly what meng precomputes); so phase+lags→motion needs
+  a NONLINEAR decoder (`make_decoder` knn/pls/cca) or unwrapped phase. Test both.
+- [ ] **#73** — FFT-spectrum features. IMPLEMENTED 2026-07-26 as `f_visual_features.f_fft_features`
+  (`kind='fft'`, driven by `fsearch.f_pyramid_grid('fft', …)` / `fft_pyr_sets` in VR_feature_search);
+  NOT yet run on a real session. A gabor response at (x₀,y₀,θ,λ) IS one Fourier coefficient of the
+  Gaussian-windowed patch at frequency (cosθ/λ, sinθ/λ) — so the bank is a lossy subsample of the patch
+  FFT, and this extractor keeps the whole lattice instead. Constant-Q preserved by ONE PATCH SIZE PER
+  LEVEL (patch tied to λ), so it is a pyramid, not a single constant-bandwidth FFT.
+  Same window (`sigma_scale·λ`), same support (`ceil(3σ)`, capped per axis at H−1/W−1 — exact), same
+  centres (`_sample_idx`) as the gabor bank, and binned back onto the bank's (ori × SF) sectors with
+  gabor naming (`fftM`/`fftQe`/`fftQo`_o{io}sf{isf}_r{iy}c{ix}) → at `n_sf_sub=n_ori_sub=1` the columns
+  align index-for-index with the gabor pyramid, so any fft-over-gabor gap is exactly the intra-sector
+  frequency spread the bank discards. `n_sf_sub`/`n_ori_sub` > 1 subdivide sectors = strictly richer.
+  MEASURED: the equivalence holds to **corr 0.9998** when the target frequency lands on a lattice point,
+  and the dominant error is LATTICE QUANTIZATION, not the DC-removal/broadband effect first assumed —
+  `frac = |N/λ − round(N/λ)|` vs agreement gives **corr −0.88** (frac<0.15 → 0.96, frac>0.35 → 0.39).
+  Hence `patch_snap=True` (default): nudge the patch ±15% so the target lands on a lattice point, which
+  lifted mean agreement 0.961 → **0.985** with every config at frac<0.15. Requires gamma=1 (an
+  anisotropic window is orientation-dependent, so one patch FFT cannot serve the bank) and
+  `reduce='sample'`. Remaining: run against the gabor pyramid in one scorecard (#69/#74), and a GPU
+  backend only if profiling calls for it.
 
 ---
 

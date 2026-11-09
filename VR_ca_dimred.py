@@ -922,7 +922,7 @@ if 0:
     # Minimal call — bh_data, est1, vec_data_l/r from f_load_session; two_mon_frames
     # needs a render (passed None here).
     built = build_feature_blocks(
-        bh_data[n_dset], est1, vec_data_l, vec_data_r,
+        session['bh'], est1, vec_data_l, vec_data_r,
         two_mon_frames=None, n_pix_pca=10,
         build_agg=True, build_motion=True, build_self_motion=True,
     )
