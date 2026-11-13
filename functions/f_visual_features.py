@@ -1090,7 +1090,7 @@ def f_motion_energy_features(movie, grid=(6, 6), n_orient=4, wavelengths=(8,),
 #   2. f_feature_source._VISUAL_SOURCES          route via build_visual_blocks (not the cheap agg/pix
 #                                                path) and force the monitor render (_RENDER_SOURCES)
 #   3. f_feature_source.NO_TF_KINDS              no temporal axis -> carries `stats`, one spec per SF
-#   4. f_feature_source.PYRAMID_KINDS            buildable by f_pyramid_grid (has an SF axis)
+#   4. f_feature_source.PYRAMID_KINDS            buildable by f_feature_plan (has an SF axis)
 #   5. f_feature_source.KIND_KNOBS               kind-specific knobs, for the strict validation
 #   6. f_feature_source._normalize_spec          which extra keys pass through to the extractor
 #   7. f_feature_source._visual_spec_from_input  `reduce` -> pool/sample_ds/grid (only lattice kinds)

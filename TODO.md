@@ -9,7 +9,7 @@ Status legend: `[ ]` pending · `[~]` in progress · `[x]` completed · `[!]` bl
 
 ## NEXT UP (2026-11-06)
 
-- [ ] **#78** — ONE feature builder + one interface for VR_feature_search and VR_ca_cebra/encoding
+- [x] **#78** — ONE feature builder + one interface for VR_feature_search and VR_ca_cebra/encoding
       (modular pipeline, piece 3). Plan: `PLAN_feature_builder_merge.md`. Two parallel stacks today
       (f_feature_configs→f_iter_grid_cells vs f_vis_sets_to_plan→_build_grid_block). CONFIRMED silent bug:
       a single-SF entry builds 8 ori / Nyquist in the search but 4 ori / ds=4 in cebra. Also exact vs

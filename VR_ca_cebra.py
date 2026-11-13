@@ -264,15 +264,12 @@ feature_list     = [
                     'self_mot', 'beh',         # mouse locomotion (speed+yaw / fwd-lat-yaw) + behavior
                     #'grid', 'flow',
                     # 'gabor', 'meng',              # grid-averaged visual (proc block)
-                    # 'gaborG', 'mengG',            # OLD inline grid banks (superseded by vis_sets below)
                     # 'gaborS', 'mengS', 'gaborS+mengS',   # OLD sampled/derived blocks (pre-grid design)
                     ]
 
-# VISUAL BANKS — the SAME self-contained dict form as VR_feature_search.py's `feat_sets`, so a config
-# that wins the search PASTES HERE UNCHANGED. Both sides read it through the one canonical reader
-# (f_feature_source.f_resolve_feat_sets), so a dict cannot mean two different things: same reserved
-# '_common' defaults, same per-entry overrides, same `kind` validation, same cell names (f_num_tag).
-# f_vis_sets_to_plan is the plan-side twin of fsearch.f_feature_configs.
+# VISUAL BANKS — `feat_sets`, the SAME dict as VR_feature_search.py / VR_ca_encoding.py, so a config that
+# wins the search PASTES HERE UNCHANGED. Every script builds it through the same code
+# (f_feature_source.f_feature_plan → f_iter_feature_cells), so a dict cannot mean two different things.
 #   '_common'   the knobs EVERY set inherits; an entry repeating a knob OVERRIDES it (that is all a
 #               variant needs — e.g. layer2_proc=[] next to a pca default is the raw twin).
 #   kind        'gabor' | 'fft' | 'meng' | 'fftglobal' | 'wavelet' | 'pix'   (VALIDATED — an unknown
@@ -294,7 +291,7 @@ feature_list     = [
 # marginalize='all' pools ori+sf(+tf) → each bank is ONE block '<name>:all' at 50 dims, head-to-head.
 # CAVEAT on raw width (equal AFTER the pca-50, unequal before it): gabor/fft magnitude = 1 channel per
 # filter, quadrature = 2 (Qe+Qo), meng = 1 per (filter × tf) so its tf axis multiplies the bank.
-vis_sets = {
+feat_sets = {
     '_common': dict(cyc_fov=(1, 2, 4, 8, 16), odegs=(0, 45, 90), marginalize='all',
                     layer1_proc=None, layer2_proc=[('pca', 50)]),
     'gabmag':  dict(kind='gabor', stats=('magnitude',)),    # == the search's gabmag
@@ -342,13 +339,11 @@ feat_pca_variant   = None    # None | 'pcacomb' | 'pcasep' | 'pcaraw' — load a
 # NB cache-loaded gaborS/mengS carry gen-time PCA — a 'pca' step in their proc is skipped on load.
 feature_plan = fsrc.f_proc_feature_plan()
 # feature_plan = fsrc.f_default_feature_plan()   # OLD design (n_pca/input_norm/zscore_joint per block)
-# Merge the vis_sets banks into the plan and select them. Names collide-safe: a vis_sets key overrides
-# a same-named plan block. Comment out to fall back to the inline gaborG/mengG entries in feature_list.
-# The plan keys are the source of truth for the names — '_common' is a defaults entry, not a block, so
-# reading them back off the plan (not off vis_sets) keeps it out of feature_list.
-_vis_plan = fsrc.f_vis_sets_to_plan(vis_sets)
-feature_plan.update(_vis_plan)
-feature_list = feature_list + [n for n in _vis_plan if n not in feature_list]
+# Merge the feat_sets banks into the plan and select them (a feat_sets key overrides a same-named plan
+# block). The plan keys are the source of truth for the names — '_common' is a defaults entry, not a block.
+_feat_plan = fsrc.f_feature_plan(feat_sets)
+feature_plan.update(_feat_plan)
+feature_list = feature_list + [n for n in _feat_plan if n not in feature_list]
 # Pyramid / spec-list block (add 'pyr' to feature_list to use). f_pyramid_specs = param generator;
 # f_specs_block = build a plan block from a list of feature dicts + level-2 marginalize/layer2_proc:
 # feature_plan['pyr'] = fsrc.f_specs_block(fsrc.f_pyramid_specs('gabor', cyc_fov=(1, 2, 4, 8, 16)),
@@ -389,10 +384,7 @@ _src = ({**src, 'cache_tag': f"{src['cache_tag']}_{feat_pca_variant}"} if feat_p
 built_blocks, frame_t, side_tags, _movie = fsrc.f_resolve_features(
     session, feature_plan, build_cfg, dset_name=est1['dset_name'], only=feature_list,
     render_verbose=render_verbose, whiten=feat_whiten, **_src)
-if _movie is not None:        # restore movies for recon/flow viz
-    two_mon_frames = _movie
-    _W = two_mon_frames.shape[2] // 2
-    left_mon_frames, right_mon_frames = two_mon_frames[:, :, :_W], two_mon_frames[:, :, _W:]
+two_mon_frames = _movie   # LAZY when every convolution was cached (pixels render only if a cell uses them)
 
 # Legacy aliases — downstream cells (raster, near-distance filter, CEBRA
 # supervision, etc.) reference these names. Keep them in sync with the
@@ -847,7 +839,7 @@ if 0:
 #   scores            per-neuron r_med / frac_sig / r2_med  +  population r2_vw / rv / procrustes / rsa
 #   r_sig             float                                 frac_sig = fraction of cells with r > r_sig
 enc_params = enc.f_default_encoder_params(
-    feature_block    = ['gabmag'],  # a vis_sets BANK name → expands to ALL its `<bank>:<cell>` blocks
+    feature_block    = ['gabmag'],  # a feat_sets BANK name → expands to ALL its `<bank>:<cell>` blocks
                                     #   (concatenated). An explicit cell scores ONE level, e.g.
                                     #   ['gabmag:sf0.01016']. Legacy names still work verbatim
                                     #   (pix | gaborS | mengS | meng | gaborS+mengS), and a LIST mixes
@@ -971,7 +963,7 @@ if 0:
 #   sweep_var, sweep_values = 'n_feature_pcs', [1, 2, 3, 5, 8, 12, 16, 24, 32, 50]  # #feature-PCs
 #   sweep_var, sweep_values = 'feature_block', ['pix', 'gaborS', 'mengS', ['gaborS','mengS']] # combos
 #   sweep_var, sweep_values = 'feature_block', ['gabmag','gabquad','fftmag','fftquad','mengopp']
-#                                              # vis_sets BANKS head-to-head (each expands to its cells)
+#                                              # feat_sets BANKS head-to-head (each expands to its cells)
 #   sweep_var, sweep_values = 'lag_ms', list(range(0, 501, 100))                    # SINGLE-lag tuning
 #   sweep_var, sweep_values = 'lags_ms', [[0],[0,100],[0,100,200],[0,100,200,300]]  # COMBINED lag SETS
 #   sweep_var, sweep_values = 'feature_pca', ['per_block','joint','joint_postlag']  # PCA scoping
@@ -1554,7 +1546,7 @@ if 1:
     decode_lags_ms = list(range(-300, 301, 100))
     decode_lags    = dec.f_lags_from_ms(decode_lags_ms, fs_img)
     sweep_target_blocks = ['agg', 'pix', 'motion', 'pix_mot', 'beh', 'self_mot', 'grid', 'flow', 'gabor', 'meng']    # sweep over these ('gabor'=edge energy, 'meng'=motion energy)
-    # Keep only loaded blocks. A vis_sets BANK is stored as `<bank>:<cell>` keys, so match those too —
+    # Keep only loaded blocks. A feat_sets BANK is stored as `<bank>:<cell>` keys, so match those too —
     # f_run_decode_sweep expands the bank name itself (f_expand_blocks); a plain `in built_blocks`
     # test drops it here before that can happen.
     sweep_target_blocks = [b for b in sweep_target_blocks

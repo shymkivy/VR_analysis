@@ -368,7 +368,8 @@ def f_scan_dataset_params(session, dec_params=None, enc_params=None, *, plan=Non
     if decode and dec_params is not None:
         need.add(dec_params['target_block'])
     if encode and enc_params is not None:
-        need.add(enc_params['feature_block'])
+        fb = enc_params['feature_block']
+        need |= {fb} if isinstance(fb, str) else set(fb)
         need |= set(enc_params.get('covariate_blocks', []))
     built, frame_t, _side, _mov = f_resolve_features(
         session, plan, build_cfg, dset_name=session['dset_name'],

@@ -39,7 +39,8 @@ warnings.filterwarnings('ignore', message=r'Some metric_kwargs have been passed'
 
 from f_pipeline import f_load_session
 from f_dataset_scan import f_scan_dataset, f_count_dsets, f_plot_scan, f_scan_dataset_params
-from f_feature_source import f_default_feature_plan, f_default_build_cfg, f_default_source
+from f_feature_source import (f_default_feature_plan, f_default_build_cfg, f_default_source,
+                              f_proc_feature_plan, f_feature_plan)
 from f_decoding import f_default_decoder_params, f_plot_decoder_sweep
 from f_encoding import f_default_encoder_params
 
@@ -112,22 +113,21 @@ if 0:
 #%% FULL-PARAM cross-dataset scan — the SAME dec/enc structs as VR_ca_cebra, dataset = axis
 # =============================================================================
 # SECTION 2 · FULL-PARAM SCAN — run the exact f_run_decoder / f_run_encoder used in the
-#             per-dataset script across datasets, on the real feature blocks (loaded from
-#             cache / conv_repo per dataset). Dataset is the sweep axis.
+#             per-dataset script across datasets, on the real feature blocks (feat_sets banks,
+#             reloaded from the shared conv store or built on miss). Dataset is the sweep axis.
 # =============================================================================
 # Edit dec_params / enc_params to MATCH the cebra script (same feature_block, decoder, n_pcs,
-# lags, fold_scheme, scores). Features are LOADED (not built) per dataset via f_resolve_features
-# under the plan; a dataset with no cache/repo for the needed block is skipped + logged.
+# lags, fold_scheme, scores). Bank names (feat_sets keys) are accepted by both decoder and encoder.
 dec_params = f_default_decoder_params(
     input_source = 'neural',       # keep 'neural' — no CEBRA models are fit in the scan
     n_input_pcs  = 50,
-    target_block = 'mengS',        # the feature under test (must exist in each dataset's cache/repo)
+    target_block = 'mengopp',      # the feature under test (a feat_sets bank or any plan block)
     decoder      = 'ridge',
     fold_scheme  = 'interleaved',
     scores       = ['r2', 'r2_vw', 'rv', 'procrustes', 'rsa'],
 )
 enc_params = f_default_encoder_params(
-    feature_block    = 'mengS',
+    feature_block    = 'mengopp',
     covariate_blocks = [],         # e.g. ['self_mot'] to regress in locomotion
     decoder          = 'ridge',
     fold_scheme      = 'interleaved',
@@ -136,15 +136,31 @@ enc_params = f_default_encoder_params(
     n_feature_pcs    = None, feature_pca = 'per_block', ridge_alpha = 1.0, l1_ratio = 0.5,
     lags_ms          = [0, 100, 200, 300],
 )
-# Load-only: force the scanned visual blocks to the conv_repo so a dataset missing it RAISES →
-# the loop skips + logs it (instead of silently rebuilding/rendering). Set _load_origin='cache'
-# if you generated joblib caches instead of repos; 'auto' to allow build-on-miss.
-_load_origin = 'repo'
-_repo_kinds  = {'gaborS', 'mengS', 'gabor', 'meng', 'grid', 'flow'}
-_need = {dec_params['target_block'], enc_params['feature_block'], *enc_params['covariate_blocks']}
-feature_plan  = f_default_feature_plan(**{b: {'origin': _load_origin}
-                                          for b in _need if b in _repo_kinds})
-build_cfg     = f_default_build_cfg(side='R')            # only used if a block must be built
+# VISUAL BANKS — `feat_sets`, the SAME dict as VR_feature_search / VR_ca_cebra / VR_encode_scan.
+feat_sets = {
+    '_common': dict(cyc_fov=(1, 2, 4, 8, 16), odegs=(0, 45, 90), marginalize='all',
+                    layer1_proc=None, layer2_proc=[('pca', 50)]),
+    'gabmag':  dict(kind='gabor', stats=('magnitude',)),
+    'mengopp': dict(kind='meng', tf_hz=(0.25, 0.5, 1.0, 2), output='opponent', transform='signed_sqrt'),
+}
+feature_plan = f_proc_feature_plan()
+feature_plan.update(f_feature_plan(feat_sets))
+build_cfg    = f_default_build_cfg(side='both', conv_backend='gpu', conv_device='cuda')
+# shared conv store — MUST match VR_feature_search / VR_ca_cebra (part of the autosave key)
+build_cfg['conv_autosave']     = True
+build_cfg['conv_autosave_tag'] = 'auto1'
+build_cfg['edge_min_frac']     = 0.45
+
+# OLD: mengS loaded from the conv_repo (right monitor only) — kept for reference
+# # Load-only: force the scanned visual blocks to the conv_repo so a dataset missing it RAISES →
+# # the loop skips + logs it (instead of silently rebuilding/rendering). Set _load_origin='cache'
+# # if you generated joblib caches instead of repos; 'auto' to allow build-on-miss.
+# _load_origin = 'repo'
+# _repo_kinds  = {'gaborS', 'mengS', 'gabor', 'meng', 'grid', 'flow'}
+# _need = {dec_params['target_block'], enc_params['feature_block'], *enc_params['covariate_blocks']}
+# feature_plan  = f_default_feature_plan(**{b: {'origin': _load_origin}
+#                                           for b in _need if b in _repo_kinds})
+# build_cfg     = f_default_build_cfg(side='R')            # only used if a block must be built
 scan_sigma_frames = 6                                    # matches the cebra Y_neu smoothing
 run_decode, run_encode = True, True
 

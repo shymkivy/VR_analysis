@@ -777,15 +777,19 @@ def f_run_decoder(config, built_blocks, Y_neu, cebra_models=None, frame_t=None, 
     lags = f_lags_from_ms(config.get('lags_ms', [0]), fs)
 
     # ── target (decode TO) — guard grouped-PCA blocks (X[:, :k] would be invalid) ──
+    from f_feature_source import f_expand_blocks
     tb = config['target_block']
-    if tb not in built_blocks:
-        raise ValueError(f"target_block {tb!r} not in built_blocks: {list(built_blocks)}")
-    binfo = built_blocks[tb]
-    if isinstance(binfo.get('pca'), dict) or binfo.get('pca_groups'):
-        raise ValueError(f"target_block {tb!r} uses grouped PCA — X[:, :k] truncation invalid; "
-                         f"pick a single-PCA block (pix/gaborS/mengS/meng)")
-    Xt = np.asarray(binfo['X'], float)
+    tbs = f_expand_blocks(built_blocks, tb, what='target_block')   # bank name → its cells
     ntp = config.get('n_target_pcs')
+    if len(tbs) > 1 and ntp is not None:
+        raise ValueError(f"target_block {tb!r} expands to {len(tbs)} cells — top-k truncation invalid "
+                         f"across cells; set n_target_pcs=None or name one cell")
+    for b in tbs:
+        binfo = built_blocks[b]
+        if isinstance(binfo.get('pca'), dict) or binfo.get('pca_groups'):
+            raise ValueError(f"target_block {b!r} uses grouped PCA — X[:, :k] truncation invalid; "
+                             f"pick a single-PCA block (pix/gaborS/mengS/meng)")
+    Xt = np.concatenate([np.asarray(built_blocks[b]['X'], float) for b in tbs], axis=1)
     target = Xt if ntp is None else Xt[:, :int(ntp)]
 
     # ── shared CV kwargs ──

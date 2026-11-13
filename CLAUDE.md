@@ -57,6 +57,27 @@ ca_encoding → ca_cebra). Keep it updated when adding a script.
   point-samples), and it is PART OF THE AUTOSAVE KEY — MEASURED, off vs 0.45 gives
   `..._1161497c.npz` vs `..._22eeaba9.npz`, so a mismatched script silently re-convolves the whole bank
   instead of reloading. It was set only in VR_feature_search until 2026-08-05.
+  FEAT_SETS EVERYWHERE (2026-11-12): VR_ca_cebra / VR_ca_encoding call their dict `feat_sets` (was vis_sets)
+  and build it with fsrc.f_feature_plan; their build cells keep the movie lazy (encoding: f_side_movie(t)
+  slices per cell). 'pix' in feature_list still forces a render. #78 complete.
+  VR_encode_scan too (2026-11-12): feat_sets gabmag/mengopp (cebra's params) + shared conv store; blocks
+  take bank names and 'a+b' joins (f_encode_prepare resolves the parts, f_encode_one_cfg concatenates).
+  Old pca_feat-cache plumbing commented. Store tag enc_11_12_26 (VR_encode_scan_plots updated).
+  VR_dataset_scan full-param section too: target/feature block 'mengopp' (feat_sets, side 'both', shared
+  store; was mengS from the R-only conv_repo, builds on miss now). f_run_decoder's target_block expands
+  bank names via f_expand_blocks (cells concatenated; n_target_pcs must be None for a multi-cell bank).
+  TIDY (2026-11-12): legacy config builders removed (f_feature_grid, f_feature_specs, f_pyramid_grid,
+  f_granularity_configs, f_variant_configs, f_prep_configs, f_build_grid; plan-side f_grid_block,
+  f_pyramid_block, gaborG/mengG) — last in commit 3e5b405. f_feature_search = grid path + single raw
+  block (pix), lazy render by default; base_plan / force_build=False / feat_prep raise.
+  ONE SPEC BUILDER (2026-11-09): `f_feature_source.f_feature_plan(feat_sets, …)` (alias f_vis_sets_to_plan) →
+  plan blocks; f_feature_search.f_feature_configs wraps them as configs (byte-identical to before).
+  PER-UNIT GRID BUILD (2026-11-09): f_resolve_features builds origin='build' grid blocks one conv-unit at a
+  time with a LAZY movie (f_render_once, shapes in <features_dir>/render_shapes.json) → cached banks need no
+  render: cebra-style build 139 s / 4.6 GB → 15.8 s / 0.3 GB, blocks identical.
+  ONE GRID ENGINE (2026-11-09): `f_feature_source.f_iter_feature_cells` (streaming, exact cached layer-1)
+  is behind BOTH f_feature_search.f_iter_grid_cells and _build_grid_block (cebra/encoding) — fix there once.
+  CAVEAT: layer1 `whiten` then a layer2 `pca` is ill-posed (all variances 1 → top-k arbitrary).
   SINGLE-SF FIX (2026-11-09): f_vis_sets_to_plan now sends single-SF entries through f_pyramid_specs too (they
   used f_grid_block → 4 ori / ds=4 vs the search's 8 / Nyquist, silently). Pyramid entries unchanged.
   `f_feature_source.DEFAULT_MARGINALIZE = ('ori',)` is the canonical fallback when an entry names no

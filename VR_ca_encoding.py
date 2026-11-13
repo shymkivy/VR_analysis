@@ -128,10 +128,10 @@ Y_enc = Y_enc_full[:, enc_cell_ids]                  # columns = enc_cell_ids (o
 print(f'{dset_tag}: Y_enc {Y_enc.shape}  (T, n_cells)'
       + ('' if enc_cell_subset is None else f'   [SUBSET of {Y_enc_full.shape[1]}]'))
 
-#%% Feature plan — non-visual blocks by NAME + visual banks via `vis_sets`
+#%% Feature plan — non-visual blocks by NAME + visual banks via `feat_sets`
 # SAME structure as VR_ca_cebra.py and VR_feature_search.py, so a representation that wins the search
-# pastes here unchanged. All three read the dict through the one canonical reader
-# (f_feature_source.f_resolve_feat_sets), so it cannot mean different things in different scripts.
+# pastes here unchanged. All three build it through the same code (f_feature_source.f_feature_plan →
+# f_iter_feature_cells), so it cannot mean different things in different scripts.
 # NON-VISUAL / legacy blocks — selected by name. They resolve in the SAME f_resolve_features call as
 # the visual banks (one render shared; the cheap blocks need none), so mix freely.
 feature_list = [
@@ -151,7 +151,7 @@ feature_list = [
 #               'all' → one block. Each entry expands to `<name>:<cell>` blocks.
 #   layer1_proc per-filter f_proc step-list | layer2_proc per-cell
 # enc_blocks below addresses a bank by NAME — f_encode_per_neuron expands it to all its cells.
-vis_sets = {
+feat_sets = {
     '_common': dict(cyc_fov=(1, 2, 4, 8, 16), odegs=(0, 45, 90), marginalize='all',
                     layer1_proc=None, layer2_proc=[('pca', 50)]),
     'gabmag':  dict(kind='gabor', stats=('magnitude',)),
@@ -180,11 +180,11 @@ feat_pca_variant   = None     # None | 'pcacomb' | 'pcasep' | 'pcaraw' — pca_f
 # block `proc` (== grid layer2) + optional per-input `input_proc` (== layer1). Ops:
 # ('norm', zscore|standardize|total_var|first_sv) | ('pca', n|frac|(frac,cap)) | ('whiten', True).
 feature_plan = fsrc.f_proc_feature_plan()
-# Merge the vis_sets banks in and select them. The PLAN keys are the source of truth for the names —
+# Merge the feat_sets banks in and select them. The PLAN keys are the source of truth for the names —
 # '_common' is a defaults entry, not a block, so reading them back off the plan keeps it out of the list.
-_vis_plan = fsrc.f_vis_sets_to_plan(vis_sets)
-feature_plan.update(_vis_plan)
-feature_list = feature_list + [n for n in _vis_plan if n not in feature_list]
+_feat_plan = fsrc.f_feature_plan(feat_sets)
+feature_plan.update(_feat_plan)
+feature_list = feature_list + [n for n in _feat_plan if n not in feature_list]
 
 build_cfg = fsrc.f_default_build_cfg(side=side, num_samp=num_samp,
                                      lat_samp=render_lat_samp, vert_samp=render_vert_samp,
@@ -212,7 +212,7 @@ built_blocks, frame_t, side_tags, _movie = fsrc.f_resolve_features(
     render_verbose=render_verbose, whiten=feat_whiten, **_src)
 
 # OLD build path (pre-2026-08): inline visual_specs + cfg dict + the f_acquire_features junction.
-# Superseded by the feature_plan / vis_sets structure above; kept for reference.
+# Superseded by the feature_plan / feat_sets structure above; kept for reference.
 # visual_specs = {
 #     'gabor': {'grid': (6, 6), 'n_orient': 4, 'wavelengths': (6, 12),
 #               'stats': ('magnitude', 'phase'),
@@ -246,13 +246,15 @@ built_blocks, frame_t, side_tags, _movie = fsrc.f_resolve_features(
 fs_img = f_imaging_fs(frame_t)
 print(f'imaging fs ≈ {fs_img:.1f} Hz')
 
-# Reconstruct the per-side movies for the viz cells (None in load mode w/o save_movie).
-mon_movies = None
-if _movie is not None:
-    two_mon_frames = _movie
+# The movie for the viz / pixel-RF cells — LAZY when every convolution was cached: its pixels render only
+# when one of those cells slices it (None in load mode w/o save_movie).
+two_mon_frames = _movie
+
+
+def f_side_movie(t):
+    """One monitor's movie ('L' | 'R') from two_mon_frames (renders a lazy movie on first use)."""
     _W = two_mon_frames.shape[2] // 2
-    left_mon_frames, right_mon_frames = two_mon_frames[:, :, :_W], two_mon_frames[:, :, _W:]
-    mon_movies = [{'L': left_mon_frames, 'R': right_mon_frames}[t] for t in side_tags]
+    return two_mon_frames[:, :, :_W] if t == 'L' else two_mon_frames[:, :, _W:]
 
 print('blocks:', {k: built_blocks[k]['X'].shape for k in built_blocks})
 
@@ -289,11 +291,11 @@ if 1:
     fig.suptitle('Gabor bank (even/cos kernels)'); fig.tight_layout()
 
     # raw frame vs per-orientation pooled magnitude at one time
-    if mon_movies is None:
+    if two_mon_frames is None:
         raise RuntimeError('raw monitor movie not in memory — this sanity cell needs '
                            'the rendered frames. Run in build mode, or load a cache '
                            'written with save_movie=True.')
-    mv = mon_movies[0]
+    mv = f_side_movie(side_tags[0])
     t0 = mv.shape[0] // 2
     Xg, ng = f_gabor_features(mv[max(0, t0-1):t0+1], grid=gb_grid, n_orient=gb_nori,
                               wavelengths=gb_wav)
@@ -336,10 +338,10 @@ if 1:
 #%% Encode — per-neuron CV ridge (real) vs per-cell circshift null
 # Short causal FIR: features over a small lag window predict the rate proxy.
 enc_blocks      = ['self_mot', 'beh', 'agg', 'pix', 'gabmag', 'mengopp']
-# A vis_sets BANK name expands to ALL its `<bank>:<cell>` blocks (concatenated) via f_expand_blocks;
+# A feat_sets BANK name expands to ALL its `<bank>:<cell>` blocks (concatenated) via f_expand_blocks;
 # an explicit cell scores ONE level, e.g. 'gabmag:all' or 'gabmag:sf0.01016'. Legacy names still work
 # verbatim, so a list can mix them.
-# available now: whatever is in feature_list — 'agg' 'pix' 'self_mot' 'beh' + the vis_sets bank names
+# available now: whatever is in feature_list — 'agg' 'pix' 'self_mot' 'beh' + the feat_sets bank names
 # (add 'motion' / 'pix_mot' / 'grid' / 'flow' to feature_list in the plan cell to use them)
 # OLD: ['self_mot', 'beh', 'agg', 'pix', 'gabor', 'meng']  (inline visual_specs banks)
 enc_lags_ms     = [0, 100, 200, 300]           # → frames via fs (rise→peak window)
@@ -769,7 +771,7 @@ if 1:
     from f_encoding import f_encode_fit_weights, f_encode_sta
     from f_encoding_plots import f_plot_rf_cells
 
-    if mon_movies is None:
+    if two_mon_frames is None:
         raise RuntimeError('pixel RF needs the raw movie — run in build mode or load a cache '
                            'written with save_movie=True.')
     pix_ds       = 4          # spatial downsample so the pixel design stays fittable

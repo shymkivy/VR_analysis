@@ -2,54 +2,25 @@
 """
 f_feature_search.py — feature-PARAMETER search on ONE dataset, scored by ENCODE + DECODE.
 
-The neural-scored sibling of f_feature_optim.py (which scores feature params by MOVIE
-reconstruction, ignoring neurons). Here each candidate feature config is resolved on ONE
-loaded session through the plan grammar (f_default_feature_plan / f_resolve_features — so
-separate/combined/raw PCA, sampling ds, filter subset, and feature COMBINATIONS are all
-expressible). By DEFAULT (force_build=True) every feature is REGENERATED fresh on the GPU
-— the cache is bypassed so the search spans the full parameter space, not the few cached
-settings. The monitor render runs ONCE (shared across configs) and each unique RAW extraction
-is CONVOLVED ONCE and memoized, so comb/sep/raw (and prep variants) of one extraction reuse a
-single conv — only the PCA + prep re-run. (Derived combos / cache loads use the full resolve
-and rebuild their deps.) Each config is then scored by f_dataset_scan.f_score_representations:
-    decode_r2      neural PCs → feature block (leak-free within-fold PCA, variance-weighted)
-    encode_r_med   feature block → neural (per-neuron blocked-CV, f_encode_per_neuron)
-    encode_frac_sig  fraction of cells with encode r > r_sig
-Returns a tidy ranked table (config × block × decode/encode/n_dim). Compute-only; the driver
-+ the inline candidate-config list live in VR_feature_search.py.
+A `feat_sets` dict (the same format VR_ca_cebra / VR_ca_encoding use) → f_feature_configs → one config per
+set → f_feature_search builds each set's feature cells and scores them:
+    decode   neural → feature (f_dataset_scan.f_score_representations, procs applied before CV)
+    encode   feature → neural, with the SHARED encoder config (enc_cfg → f_encoding.f_run_encoder)
+             [or the older f_score_representations encode when enc_cfg is None]
+Returns a tidy table (config × cell × target → scores + sizes). Driver: VR_feature_search.py.
 
-Feature preprocessing (normalize / whiten) is the `feat_prep` axis (per-config or global; expand with
-f_prep_configs): None | 'zscore' (unit-variance columns) | 'whiten' (PCs ÷ √eigenvalue). The search
-scores with proc_before_cv=True — no within-fold standardization of the predictor — so feat_prep moves
-ENCODE (ridge penalty depends on column scale) as well as DECODE (features = target, variance-weighted
-R²: raw/combined weights the top PCs, whiten/zscore equal-weights all PCs).
+Build: specs come from f_feature_source.f_feature_plan (ONE spec builder) and cells from
+f_feature_source.f_iter_feature_cells (ONE streaming grid engine, exact cached layer-1), both shared with
+cebra / encoding. Raw per conv-unit = _raw_block (fresh build + conv_autosave; memoized in the call). The
+movie is LAZY (f_render_once): it renders only when a convolution is not cached or a pix block needs
+pixels. Two config kinds: GRID (every bank kind) and a single raw BLOCK (pix: raw pixels → its `proc`).
+A grid cell byte-identical to one already scored in the call reuses that score.
 
-A "config" is a dict:
-    {'name':   str,                    # label for this candidate (shown in the table/plot)
-     'blocks': [block names to SCORE], # subset of the plan (deps auto-pulled; e.g. 'gaborS+mengS')
-     'plan':   {block: override} | None,   # f_default_feature_plan overrides (origin/inputs/n_pca/…)
-     'source': {cache_tag: ...} | None}    # per-config f_resolve_features source overrides
-The plan's per-block `n_pca` IS the separate/combined/raw switch on a FRESH build (dict = per-filter
-separate, int = whole-block combined, None = raw); for CACHE loads the granularity is baked at
-gen time and picked by `source['cache_tag']` (…_pcasep / …_pcacomb / …_pcaraw) — see f_variant_configs.
-
-FEATURE-GRID instructions (2026-07-20, ONE param builder — replaced the 3 two-layer builders): a config
-with a `'grid'` key uses `f_build_grid`, a memory-safe streaming builder. The bank = kind's orientation ×
-wavelength(SF) × temporal-freq grid. `f_feature_grid(kind, marginalize=(...), ...)` picks which axes to
-MARGINALIZE (pool); the REMAINING axes form a param matrix — one scored CELL per remaining-axis-value
-combo, each pooling the marginalized axes → a matrix of decode/encode scores. marginalize=() → per filter,
-{'ori'} → per (sf,tf), {'ori','wl'} → per tf, {'ori','wl','tf'} → whole bank. `layer1_proc` (per individual
-filter) and `layer2_proc` (per cell) are UNIFIED f_proc step-lists (f_feature_helpers.f_proc: ordered
-[('norm',…),('pca',n),('whiten',True)], each optional). f_build_grid streams: conv ONE (sf,tf) at a time
-(orientation always batched), apply layer1_proc per filter, FREE the raw, route filters to cells by the
-non-marginalized axes, apply layer2_proc per cell. Peak RAM ≈ one conv's raw + Σ reduced.
-`f_score_grid(res,metric)` pivots the cell scores into the ori×sf×tf matrix.
-
-UNIFIED PROCESSING (2026-07-20): the same `f_proc` step-list is used everywhere — grid layer1/layer2
-(global, build-time), AND within-fold on the decode/encode predictor (leak-free) via `neural_proc`/
-`feature_proc` passed to f_score_representations → f_blocked_cv_r2's optional `pred_proc` (default None =
-byte-identical to the old standardize+PCA, so cebra/encoding/decoding are untouched). Render-once /
-memoization / scoring unchanged.
+Sweeps: f_proc_sweep (layer1 / layer2 sizes, pre/post steps, pca / svd). Plots: f_plot_feature_search
+(scorecard), f_plot_comp_sweep (score vs components), f_plot_pca_sweep, f_plot_feature_dist. Sizes / RAM:
+f_feature_sizes. Removed 2026-11-12 (last in commit 3e5b405): f_feature_grid, f_feature_specs,
+f_pyramid_grid, f_granularity_configs, f_variant_configs, f_prep_configs, f_build_grid and the
+cache-load / derived-combo / feat_prep paths.
 
 Created 2026-07-18.
 """
@@ -60,29 +31,12 @@ import time
 import numpy as np
 import pandas as pd
 
-from f_utils import f_gauss_smooth
-from f_feature_helpers import f_zscore, f_proc, f_num_tag
-from f_feature_source import (f_default_feature_plan, f_resolve_features, _whiten_block, _layer1_names,
-                              _normalize_spec, f_pyramid_specs, NO_TF_KINDS, f_marg_axes,
-                              DEFAULT_MARGINALIZE,
-                              f_marg_spec, f_resolve_feat_sets)
-from f_visual_features import f_apply_block_pca, f_combine_blocks_pca, f_pca_group_cols
+from f_feature_helpers import f_proc, f_num_tag
+from f_feature_source import (f_default_feature_plan, f_resolve_features, _layer1_names, f_feature_plan,
+                              f_iter_feature_cells, _NestedFit, _l1_decomp, _l1_nested, NO_TF_KINDS,
+                              f_marg_axes, f_resolve_feat_sets)
 from f_dataset_scan import f_score_representations, f_nan_metrics
 from f_decoding import f_imaging_fs
-
-_VAR_SUFFIX = {'combined': '_pcacomb', 'separate': '_pcasep', 'raw': '_pcaraw'}
-_FEAT_PREPS = (None, 'zscore', 'whiten')   # feature preprocessing before scoring (see f_prep_configs)
-
-
-def _apply_feat_prep(X, prep):
-    """Feature preprocessing applied to a block's X before scoring. 'zscore' = unit-variance columns
-    (f_zscore); 'whiten' is done at resolve time via _whiten_block (PCs ÷ √eigenvalue) so here it's a
-    no-op; None = as-is. Affects mainly DECODE (feature = target, variance-weighted R²); the encode
-    scorer standardizes features internally, so prep is ~a no-op there."""
-    if prep == 'zscore':
-        return f_zscore(np.asarray(X, float))
-    return X   # None / 'whiten' (whiten applied to PCs by _reduce_raw / f_resolve_features)
-
 
 def _extraction_sig(name, inputs):
     """Hashable signature of a RAW extraction (the render→conv→sample recipe, PCA/prep-independent).
@@ -109,164 +63,7 @@ def _raw_block(session, build_cfg, name, inputs, prerendered, cache, verbose, ti
     return cache[sig]
 
 
-def _reduce_raw(raw, name, n_pca, prep, pre_pca_zscore=False):
-    """Apply the feature-normalization chain to a memoized RAW block → a scorable block:
-    [pre_pca_zscore: z-score raw cols] → [PCA: n_pca granularity] → [prep: post-PCA zscore/whiten].
-    Does NOT mutate the cached raw (a fresh dict/array is returned)."""
-    rn = raw.get('raw_names') or raw['names']
-    X = raw['X']
-    if pre_pca_zscore:
-        X = f_zscore(np.asarray(X, float))            # z-score raw feature columns BEFORE PCA
-    Xp, names, pca, pg = f_apply_block_pca(np.asarray(X), rn, name, n_pca)
-    out = {**raw, 'X': Xp, 'names': names, 'pca': pca, 'pca_groups': pg, 'raw_names': rn,
-           'raw_dim': int(np.asarray(raw['X']).shape[1])}
-    out.pop('whitened', None)
-    if prep == 'whiten':
-        _whiten_block(out)          # PCs ÷ √eigenvalue (no-op when pca is None, i.e. raw granularity)
-    else:
-        out['X'] = _apply_feat_prep(out['X'], prep)
-    return out
-
-
-class _NestedFit:
-    """Prefix of an exact eigen-decomposition — the fields consumers read from a sklearn PCA/TruncatedSVD."""
-    def __init__(self, V, ratio, var, mean):
-        self.components_ = V.T                            # (k, d)
-        self.explained_variance_ratio_ = ratio
-        self.explained_variance_ = var
-        self.mean_ = mean                                 # None for svd (uncentered)
-        self.n_components = V.shape[1]
-
-    def transform(self, X):
-        X = np.asarray(X, np.float32)
-        if self.mean_ is not None:
-            X = X - self.mean_.astype(np.float32)
-        return X @ self.components_.T.astype(np.float32)
-
-
-def _l1_decomp(X, op, chunk=20000):
-    """Exact full decomposition of one filter's columns, fit ONCE and sliced per sweep value.
-    pca: eigh of the covariance. svd: eigh of XᵀX (uncentered), ratios = projected variance ÷ total
-    variance (sklearn TruncatedSVD's definition). Returns (V desc-sorted (d,d), ratio, var, mean)."""
-    T, d = X.shape
-    G = np.zeros((d, d)); mu = np.zeros(d)
-    for i in range(0, T, chunk):                          # float64 accumulation in row chunks
-        Xc = np.asarray(X[i:i + chunk], np.float64)
-        G += Xc.T @ Xc; mu += Xc.sum(0)
-    mu /= T
-    C = G / T - np.outer(mu, mu)                          # covariance (ddof 0)
-    tot = float(np.trace(C)) or 1.0
-    w, V = np.linalg.eigh(C if op == 'pca' else G)
-    V = V[:, ::-1]
-    var = np.einsum('ij,jk,ki->i', V.T, C, V)             # variance of each projection
-    return V, var / tot, var, (mu if op == 'pca' else None)
-
-
-def _l1_nested(X, op, n, dec):
-    """Apply one ('pca'|'svd', n) step from a cached decomposition with the SAME k / identity rules as
-    _pca_fit / _svd_fit. Returns (scores, fit_or_None)."""
-    V, ratio, var, mu = dec
-    d = X.shape[1]
-    cum = np.cumsum(ratio)
-    if isinstance(n, (tuple, list)) and len(n) == 2:     # (variance-fraction, cap)
-        cap = min(int(n[1]), d if op == 'pca' else d - 1)
-        k = min(max(int(np.searchsorted(cum[:cap], float(n[0])) + 1), 1), cap)
-        if op == 'pca' and k >= d:
-            return X, None
-    elif isinstance(n, float) and 0 < n < 1:              # variance fraction
-        if op == 'pca':
-            k = min(int(np.searchsorted(cum, n, side='right') + 1), d)
-        else:
-            cap = d - 1
-            if cum[cap - 1] < n:                          # d-1 comps miss the fraction → keep all d
-                return X, None
-            k = min(max(int(np.searchsorted(cum[:cap], n) + 1), 1), cap)
-    else:
-        k = int(n)
-        if k >= d:
-            return X, None
-    fit = _NestedFit(V[:, :k], ratio[:k], var[:k], mu)
-    return fit.transform(X), fit
-
-
 # ── Feature-grid builder (ONE param builder; memory-safe streaming: conv (sf,tf) → PCA → free raw) ──
-
-def f_feature_grid(kind, marginalize=(), *, sf_cyc_deg=(0.13,), tf_hz=(1.0, 2.0, 3.0),
-                   n_orient=4, odegs=None, ds=4, ds_factor=None, layer1_proc=None, layer2_proc=None,
-                   tag=None, transform='signed_sqrt', output='opponent', stats=('magnitude',),
-                   reduce='sample', n_pca_layer1=None, n_pca_layer2=None, input_norm=None, prep=None):
-    """THE feature-grid builder. The bank = kind's orientation × wavelength(SF) × temporal-freq grid
-    (gabor: ori × sf, no tf). `marginalize` ⊆ {'ori','wl'/'sf','tf'} = axes to POOL/collapse; the
-    REMAINING axes form a PARAM MATRIX — one scored CELL per remaining-axis-value combo, each pooling the
-    marginalized axes. marginalize=() → per filter; {'ori'} → per (sf,tf); {'ori','wl'} → per tf;
-    {'ori','wl','tf'} → whole bank.
-    Orientation: `odegs` = explicit angles in DEGREES (e.g. (0, 90)) → those exact orientations; when
-    None, `n_orient` evenly-spaced angles in [0, 180). Cell names carry the angle either way.
-    `layer1_proc` (applied per INDIVIDUAL filter) and `layer2_proc` (applied per CELL) are f_proc
-    step-lists — ordered [(op,arg),…] of ('norm',…)/('pca',n)/('whiten',True); None/[] = identity. LEGACY
-    kwargs n_pca_layer1 / n_pca_layer2 / input_norm / prep are still accepted and folded into the procs.
-    `tag` suffixes the config name (':<tag>') so a PROC sweep — same kind+marginalize, different
-    layer1/layer2 procs — gets distinct config names (else they collide in the scorecard / f_score_grid).
-    Returns [ONE config]; a marginalize sweep = sum([f_feature_grid(kind, marginalize=m, ...) for m], []);
-    a proc sweep = sum([f_feature_grid(..., layer2_proc=p, tag=nm) for nm, p in proc_sets], [])."""
-    kname = kind if isinstance(kind, str) else '+'.join(kind)
-    marg = f_marg_spec(marginalize)                      # bare 'all' is ONE axis, not ('a','l','l')
-    odegs = tuple(float(a) for a in np.atleast_1d(odegs)) if odegs is not None else None
-    if odegs is not None:                                # explicit angles → n_orient follows
-        n_orient = len(odegs)
-    if layer1_proc is None:                              # fold legacy kwargs → step-list
-        layer1_proc = [('pca', n_pca_layer1)] if n_pca_layer1 else []
-    if layer2_proc is None:
-        layer2_proc = (([('norm', input_norm)] if input_norm else [])
-                       + ([('pca', n_pca_layer2)] if n_pca_layer2 else [])
-                       + ([('whiten', True)] if prep in ('whiten', 'zscore') else []))
-    sf_cyc_deg = tuple(float(s) for s in np.atleast_1d(sf_cyc_deg))    # tolerate a scalar (e.g. 0.13)
-    tf_hz = tuple(float(t) for t in np.atleast_1d(tf_hz))              # tolerate a scalar (e.g. 1.0)
-    return [{'name': f'{kname}:marg={"+".join(marg) or "none"}' + (f':{tag}' if tag else ''),
-             'grid': {'kind': kind, 'marginalize': marg, 'sf_cyc_deg': sf_cyc_deg,
-                      'tf_hz': tf_hz, 'n_orient': n_orient, 'odegs': odegs, 'ds': ds,
-                      'ds_factor': ds_factor,
-                      'reduce': reduce, 'transform': transform, 'output': output, 'stats': tuple(stats),
-                      'layer1_proc': list(layer1_proc), 'layer2_proc': list(layer2_proc)},
-             'feat_prep': None}]
-
-
-def f_feature_specs(specs, *, marginalize=(), layer1_proc=None, layer2_proc=None, tag=None):
-    """FEATURE-CREATOR: a LIST of level-1 feature spec dicts (+ optional LEVEL-2) → [ONE grid config] for
-    f_feature_search. Each spec = one feature with its own sf/tf/ds/ori (see f_feature_source._normalize_
-    spec; omitted keys → defaults; aliases sf/tf/samp/ori). `layer1_proc` = per-filter LEVEL-1 proc;
-    `marginalize` (⊆ {'ori','sf','tf'}) + `layer2_proc` = the optional LEVEL-2 (pool feature subsets).
-    Generators (f_pyramid_specs) PRODUCE `specs`; hand-written lists (even mixed kinds) work too. Streams
-    via f_iter_grid_cells over the explicit inputs."""
-    inputs = [_normalize_spec(s) for s in specs]
-    kinds = {i['source'] for i in inputs}
-    kname = next(iter(kinds)) if len(kinds) == 1 else 'mixed'
-    marg = f_marg_spec(marginalize)                      # bare 'all' is ONE axis, not ('a','l','l')
-    return [{'name': f'{kname}:specs' + (f':{tag}' if tag else ''),
-             'grid': {'kind': kname, 'inputs': inputs, 'marginalize': marg,
-                      'layer1_proc': list(layer1_proc or []), 'layer2_proc': list(layer2_proc or [])},
-             'feat_prep': None}]
-
-
-def f_pyramid_grid(kind='gabor', *, sf_cyc_deg=None, sf_range=None, n_sf=5, cyc_fov=None,
-                   hFOV_deg=98.4, n_orient=8, odegs=None, ds='nyquist', samp_factor=1.0,
-                   marginalize=DEFAULT_MARGINALIZE, tag=None, transform=None, output='opponent',
-                   stats=('magnitude',), layer1_proc=None, layer2_proc=None, tf_hz=(1.0,),
-                   n_sf_sub=None, n_ori_sub=None, patch_snap=None, **kind_kw):
-    """Kay/Gallant WAVELET-PYRAMID search config (compare a gabor pyramid vs meng). Builds the SF
-    param-space from a RANGE (f_pyramid_specs) and Nyquist-samples per SF, recombined via layer1/layer2
-    (f_feature_specs). SF list: sf_cyc_deg | cyc_fov/hFOV_deg | geomspace(sf_range, n_sf).
-    marginalize=('ori',) → one cell per SF (a pyramid level); () = per filter. Add 'luminance' to `stats`
-    for the DC wavelet. `**kind_kw` forwards kind-specific knobs (wavelet family/decimate/levels, …);
-    f_pyramid_specs validates them against that kind's KIND_KNOBS."""
-    specs = f_pyramid_specs(kind, sf_cyc_deg=sf_cyc_deg, sf_range=sf_range, n_sf=n_sf, cyc_fov=cyc_fov,
-                            hFOV_deg=hFOV_deg, n_orient=n_orient, odegs=odegs, ds=ds, samp_factor=samp_factor,
-                            transform=transform, output=output, stats=stats, tf_hz=tf_hz,
-                            n_sf_sub=n_sf_sub, n_ori_sub=n_ori_sub, patch_snap=patch_snap,
-                            **kind_kw)
-    return f_feature_specs(specs, marginalize=marginalize, layer1_proc=layer1_proc,
-                           layer2_proc=layer2_proc, tag=tag)
-
 
 def f_pca_tag(n, op='pca'):
     """Short DISTINCT tag for one ('pca', n) / ('svd', n) spec — for naming a component-sweep pass.
@@ -332,9 +129,8 @@ def f_feature_configs(feat_sets, strict=True, tag_suffix=None, **common):
         configs = f_feature_configs(feat_sets)
 
     The dict KEY becomes the config `tag` → scorecard label '<kind>:specs:<name>' (pix → 'pix:<name>').
-    Dispatch: 'pix' → f_pix_config; every other kind → f_pyramid_grid(kind, tag=name, **knobs), a plain
-    pass-through, so anything f_pyramid_grid accepts still works and hand-building a config list stays
-    available. pix takes the SAME layer1_proc / layer2_proc as every other kind — it is one block with
+    Built by f_feature_source.f_feature_plan (the ONE spec builder, shared with cebra / encoding); each
+    grid block becomes a config here, pix → f_pix_config. pix takes the SAME layer1_proc / layer2_proc as every other kind — it is one block with
     no filter axis, so the two simply run back-to-back on it and there is no pix-specific reduction
     stage. Only the AXIS knobs (cyc_fov / odegs / marginalize / stats / …) are withheld from pix, since
     the raw movie has no ori/sf/tf axes to place or pool. So one '_common' entry drives every kind.
@@ -350,21 +146,23 @@ def f_feature_configs(feat_sets, strict=True, tag_suffix=None, **common):
     `strict` (default) raises on an unknown `kind`, and on a per-entry knob the chosen kind IGNORES
     (tf_hz/output on gabor or fft, stats/n_sf_sub on meng). Knobs inherited from `'_common'` or a kwarg
     are exempt — a shared default need not apply to every kind. This is the guard for the silent failure
-    where a set of 'fft'/'meng' entries was built through f_pyramid_grid('gabor', …): the kind never
+    where a set of 'fft'/'meng' entries was built as gabor (old builder chain): the kind never
     reached the builder, so gabor banks were scored under fft/meng names with no error anywhere.
 
     The dict is READ by f_feature_source.f_resolve_feat_sets — the same canonical reader the plan side
     (f_vis_sets_to_plan → VR_ca_cebra) uses, so one dict cannot mean two different things."""
+    # ONE spec builder (f_feature_source.f_feature_plan, also used by cebra / encoding); here each plan
+    # block is wrapped as a search config. pix: layer1 then layer2 back-to-back on the one block.
     out = []
-    for name, tag, kind, knobs in f_resolve_feat_sets(feat_sets, strict=strict,
-                                                      tag_suffix=tag_suffix, **common):
-        if kind == 'pix':
-            # pix is ONE block, so there is no per-filter/per-cell distinction: layer1 then layer2 run
-            # back-to-back on it, in list order, via the ordinary block-proc path. No pix-specific stage.
-            out += [f_pix_config(proc=list(knobs.get('layer1_proc') or [])
-                                 + list(knobs.get('layer2_proc') or []), name=f'pix:{tag}')]
-        else:
-            out += f_pyramid_grid(kind, tag=tag, **knobs)
+    for tag, blk in f_feature_plan(feat_sets, strict=strict, tag_suffix=tag_suffix, **common).items():
+        if 'grid' not in blk:                                   # pix
+            out.append(f_pix_config(proc=list(blk.get('proc') or []), name=f'pix:{tag}'))
+            continue
+        g = blk['grid']
+        out.append({'name': f"{g['kind']}:specs:{tag}",
+                    'grid': {'kind': g['kind'], 'inputs': blk['inputs'], 'marginalize': g['marginalize'],
+                             'layer1_proc': list(g['layer1_proc']), 'layer2_proc': list(g['layer2_proc'])},
+                    'feat_prep': None})
     return out
 
 
@@ -645,197 +443,49 @@ def _marg_axes(marginalize):
 
 
 def f_grid_shape(g):
-    """(#cells, #conv-units) for a grid spec `g`. cells = # distinct NON-marginalized axis-value combos;
-    conv-units = the extraction count. Handles an explicit `inputs` spec list (heterogeneous / pyramid) OR
-    a homogeneous sf×tf bank (orientation batched in the conv, never a conv-unit axis)."""
+    """(#cells, #conv-units) for a grid config `g` (explicit `inputs`): cells = distinct combos of the
+    NON-marginalized axes; conv-units = one per input (orientation batched inside a unit)."""
     marg = _marg_axes(g['marginalize'])
-    if g.get('inputs') is not None:                          # explicit level-1 spec list
-        keys = set()
-        for inp in g['inputs']:
-            isg = inp.get('source') == 'gabor'
-            sfv = float(np.atleast_1d(inp['sf_cyc_deg'])[0]) if inp.get('sf_cyc_deg') is not None else None
-            tfv = float(np.atleast_1d(inp['tf_hz'])[0]) if inp.get('tf_hz') is not None else None
-            no = len(inp['odegs']) if inp.get('odegs') else (inp.get('n_orient') or 1)
-            for o in ([None] if 'ori' in marg else range(no)):
-                k = []
-                if 'ori' not in marg:
-                    k.append(('o', o))
-                if 'sf' not in marg:
-                    k.append(('sf', sfv))
-                if not isg and 'tf' not in marg:
-                    k.append(('tf', tfv))
-                keys.add(tuple(k))
-        return len(keys), len(g['inputs'])
-    is_gabor = (g['kind'] == 'gabor')
-    dims = {'o': g['n_orient'], 'sf': len(g['sf_cyc_deg'])}
-    if not is_gabor:
-        dims['tf'] = len(g['tf_hz'])
-    n_cells = 1
-    for ax, n in dims.items():
-        if ax not in marg:
-            n_cells *= n
-    return n_cells, len(g['sf_cyc_deg']) * (1 if is_gabor else len(g['tf_hz']))
+    keys = set()
+    for inp in g['inputs']:
+        sfv = float(np.atleast_1d(inp['sf_cyc_deg'])[0]) if inp.get('sf_cyc_deg') is not None else None
+        tfv = float(np.atleast_1d(inp['tf_hz'])[0]) if inp.get('tf_hz') is not None else None
+        no = len(inp['odegs']) if inp.get('odegs') else (inp.get('n_orient') or 1)
+        for o in ([None] if 'ori' in marg else range(no)):
+            k = []
+            if 'ori' not in marg:
+                k.append(('o', o))
+            if 'sf' not in marg and sfv is not None:
+                k.append(('sf', sfv))
+            if 'tf' not in marg and tfv is not None:
+                k.append(('tf', tfv))
+            keys.add(tuple(k))
+    return len(keys), len(g['inputs'])
 
 
 def f_iter_grid_cells(session, build_cfg, cfg, prerendered, raw_cache, verbose=True, timing=False,
                       keep_raw=False):
-    """STREAMING feature-grid build as a GENERATOR — yields (cell_name, block) the instant each cell
-    FINALIZES (its LAST contributing conv-unit is done), freeing the conv raw per unit and dropping each
-    finalized cell from the accumulator. Convolve ONE (sf,tf) at a time (orientation batched), apply
-    `layer1_proc` per filter, route to cells by the NON-marginalized axes, apply `layer2_proc` per cell.
-    Peak RAM ≈ one conv's raw + the currently-OPEN cells (conv-local marginalize → one conv-unit's cells;
-    pooled sf/tf → until the last contributor). Lets the caller score+free each cell as it comes.
-
-    `keep_raw=True` KEEPS each pooled raw in `raw_cache` instead of freeing it after its conv-unit. For
-    a PROC SWEEP (many configs over the SAME bank, differing only in layer1/layer2) that is the whole
-    cost: the default frees the raw, so every later config re-acquires it — a conv_autosave disk read +
-    uint16 dequant per conv-unit, per config. Trades RAM for that: the pooled raw is n_col·T·4 B, e.g.
-    the cyc_fov=(1,2,4,8,16) × 3-orientation magnitude pyramid is 5178 cols ≈ 2.0 GB at T=96k. Leave it
-    off when configs span DIFFERENT banks (nothing to reuse, RAM grows with every one)."""
-    import re
-    from collections import OrderedDict
+    """STREAMING feature-grid build for the search → yields (cell_name, block). Thin wrapper over the shared
+    engine f_feature_source.f_iter_feature_cells (also behind cebra / encoding): raw per conv-unit from
+    _raw_block (fresh build + conv_autosave), freed after its unit unless `keep_raw` (then a PROC SWEEP over
+    one bank reuses it; costs n_col·T·4 B RAM per unit). Layer-1 decompositions are cached in `raw_cache`."""
     g = cfg['grid']
-    marg = _marg_axes(g['marginalize'])
-    l1, l2 = g.get('layer1_proc') or [], g.get('layer2_proc') or []
+    inputs = g['inputs']
 
-    # UNITS = extraction inputs. Explicit level-1 spec list (heterogeneous / pyramid) OR the sf×tf product
-    # of a homogeneous bank (f_feature_grid). Each unit = (label, extraction spec, sfv, tfv, is_gabor).
-    units = []
-    if g.get('inputs') is not None:
-        for s in g['inputs']:
-            s = dict(s)
-            isg = (s.get('source') in NO_TF_KINDS)          # spatial-only kind → no tf in the label/key
-            sfv = float(np.atleast_1d(s['sf_cyc_deg'])[0]) if s.get('sf_cyc_deg') is not None else None
-            tfv = float(np.atleast_1d(s['tf_hz'])[0]) if s.get('tf_hz') is not None else None
-            units.append((f"{s.get('source')}_sf{f_num_tag(sfv)}"
-                          + ('' if isg else f'tf{f_num_tag(tfv)}'), s, sfv, tfv, isg))
-    else:
-        kind = g['kind']; is_gabor = (kind in NO_TF_KINDS)   # 'gabor'/'fft' → spatial only, no tf axis
-        for sfv in g['sf_cyc_deg']:
-            for tfv in ([None] if is_gabor else list(g['tf_hz'])):
-                s = {'source': kind, 'reduce': g['reduce'], 'ds': g['ds'], 'n_orient': g['n_orient'],
-                     'odegs': g.get('odegs'), 'sf_cyc_deg': (sfv,)}
-                if g.get('ds_factor') is not None:           # per-SF Nyquist stride (ds='nyquist')
-                    s['ds_factor'] = g['ds_factor']
-                if is_gabor:
-                    s['stats'] = tuple(g['stats'])
-                    for _k in ('n_sf_sub', 'n_ori_sub', 'patch_snap'):   # fft-only extras
-                        if g.get(_k) is not None:
-                            s[_k] = g[_k]
-                else:
-                    s['tf_hz'], s['output'] = (tfv,), g['output']
-                    if g.get('transform') is not None:
-                        s['transform'] = g['transform']
-                units.append((f'{kind}_sf{f_num_tag(sfv)}'
-                              + ('' if is_gabor else f'tf{f_num_tag(tfv)}'), s, sfv, tfv, is_gabor))
+    def get_raw(i, inp, label):
+        raw, _ft = _raw_block(session, build_cfg, label, [inp], prerendered, raw_cache, False, timing=timing)
+        return raw['X'], (raw.get('raw_names') or raw['names'])
 
-    def _has_later_contributor(key, u):                    # any unit AFTER u feeding this cell key?
-        kd = dict(key)
-        fsf, ftf = kd.get('sf'), kd.get('tf')
-        for (_l, _s, sfv2, tfv2, _g) in units[u + 1:]:
-            if (fsf is None or sfv2 == fsf) and (ftf is None or tfv2 == ftf):
-                return True
-        return False
+    def release(i, inp, label):
+        if not keep_raw:
+            raw_cache.pop(_extraction_sig(label, [inp]), None)
 
-    def _finalize(key, members):                           # concat cell members → layer2 → standard block
-        cell_name = '_'.join(                              # format numeric sf/tf; 'o' is already a string
-            f'{ax}{f_num_tag(val) if isinstance(val, (int, float)) else val}' for ax, val in key) or 'all'
-        Xcat = np.nan_to_num(np.concatenate([X for _, X, _, _, _ in members], axis=1))
-        raw_names = [f'{lbl}:{nm}' for lbl, _, nms, _, _ in members for nm in nms]
-        Xp, fit = f_proc(Xcat, l2)
-        _pca = next((p['pca'] for op, p in fit if op in ('pca', 'svd') and p.get('pca') is not None), None)
-        names = ([f'{cell_name}_PC{i + 1}' for i in range(Xp.shape[1])] if _pca is not None
-                 else list(raw_names))
-        # LAYER-1 variance kept, pooled over this cell's filters: variance-WEIGHTED by each filter's
-        # input width, so it reads as "fraction of the cell's raw variance surviving layer1".
-        l1v = [(w_in, w_in * v) for _, _, _, w_in, v in members if v == v]      # skip NaN (no l1 pca)
-        return cell_name, {'X': np.asarray(Xp, np.float32), 'names': names, 'pca': _pca,
-                           'pca_groups': None, 'raw_names': raw_names, 'raw_dim': Xcat.shape[1],
-                           'source_blocks': [lbl for lbl, _, _, _, _ in members], 'proc_fit': fit,
-                           'l1_var_kept': (sum(v for _, v in l1v) / sum(w for w, _ in l1v)
-                                           if l1v else np.nan),
-                           'l1_dim_in': sum(w_in for _, _, _, w_in, _ in members),
-                           'kind': cell_name}
-
-    cells = OrderedDict()
-    for u, (label, spec, sfv, tfv, is_gabor) in enumerate(units):
-        if timing:
-            print(f'      [{time.strftime("%H:%M:%S")}] → conv {label} [{u + 1}/{len(units)}]', flush=True)
-        _tconv = time.perf_counter()
-        raw, _ft = _raw_block(session, build_cfg, label, [spec], prerendered, raw_cache, False,
-                              timing=timing)
-        if timing:
-            print(f'      [{time.strftime("%H:%M:%S")}] ✓ conv {label} '
-                  f'{time.perf_counter() - _tconv:.1f}s (raw {np.asarray(raw["X"]).shape[1]} col)',
-                  flush=True)
-        rn = raw.get('raw_names') or raw['names']
-        Xraw = np.asarray(raw['X'])
-        _od, _no = spec.get('odegs'), (spec.get('n_orient') or 1)
-        for glabel, info in f_pca_group_cols(rn, 'none', None).items():   # one group per filter (o,sf,tf)
-            cols = info['cols']
-            # nested path: norm-only pre steps, then a pca/svd fit ONCE per (filter, pre) and sliced
-            _ir = next((i for i, st in enumerate(l1) if st[0] in ('pca', 'svd')), None)
-            _lead = l1[_ir] if _ir is not None else None
-            if (_lead and _lead[1] and len(cols) >= 2
-                    and all(st[0] == 'norm' for st in l1[:_ir])):
-                _pre = l1[:_ir]
-                _Xin = f_proc(Xraw[:, cols], _pre)[0] if _pre else Xraw[:, cols]
-                _dk = ('l1fit', _extraction_sig(label, [spec]), glabel, _lead[0], repr(_pre))
-                if _dk not in raw_cache:                   # ONE decomposition per filter per call
-                    raw_cache[_dk] = _l1_decomp(_Xin, _lead[0])
-                Xp, _p = _l1_nested(_Xin, _lead[0], _lead[1], raw_cache[_dk])
-                _f1 = [(_lead[0], {'pca': _p, 'eig': None if _p is None else _p.explained_variance_})]
-                for _st in l1[_ir + 1:]:                   # trailing steps
-                    if _st[0] == 'whiten':                 # ÷ √variance of each kept component
-                        if _p is not None:
-                            _ev = _p.explained_variance_
-                            Xp = Xp / np.sqrt(np.where(_ev > 0, _ev, 1.0)).astype(np.float32)
-                        _f1.append(('whiten', {'eig': None if _p is None else _p.explained_variance_}))
-                    else:
-                        Xp, _rest = f_proc(Xp, [_st])
-                        _f1 += _rest
-            else:
-                Xp, _f1 = f_proc(Xraw[:, cols], l1)        # LAYER-1 proc per individual filter
-            _p1 = next((p['pca'] for op, p in _f1 if op in ('pca', 'svd') and p.get('pca') is not None), None)
-            _v1 = (float(np.sum(_p1.explained_variance_ratio_)) if _p1 is not None
-                   else (1.0 if l1 else np.nan))           # no pca fired → nothing dropped
-            mo = re.search(r'_o(\d+)', glabel)               # orientation INDEX in the raw name (build path)
-            key = []
-            if 'ori' not in marg:                            # name the cell by DEGREES
-                io = int(mo.group(1)) if mo else 0
-                odeg = _od[io] if _od else io * 180.0 / _no
-                key.append(('o', f'{odeg:g}'))
-            if 'sf' not in marg:                             # RAW float in the key (contributor match);
-                key.append(('sf', sfv))                      # formatted at the _finalize name join
-            if not is_gabor and 'tf' not in marg:
-                key.append(('tf', tfv))
-            cells.setdefault(tuple(key), []).append(
-                (f'{label}:{glabel}', Xp, _layer1_names(Xp, [rn[c] for c in cols], glabel), len(cols), _v1))
-        if not keep_raw:                                       # FREE the conv raw NOW (default)
-            raw_cache.pop(_extraction_sig(label, [spec]), None)
-        del raw, Xraw
-        for key in [k for k in cells if not _has_later_contributor(k, u)]:   # finalize + yield complete cells
-            if timing:
-                _kn = '_'.join(f'{a}{f_num_tag(v) if isinstance(v, (int, float)) else v}'
-                               for a, v in key) or 'all'
-                print(f'      [{time.strftime("%H:%M:%S")}] → finalize/PCA cell {_kn}', flush=True)
-            _tfin = time.perf_counter()
-            out = _finalize(key, cells.pop(key))
-            if timing:
-                print(f'      [{time.strftime("%H:%M:%S")}] ✓ finalize/PCA {out[0]} '
-                      f'{time.perf_counter() - _tfin:.1f}s ({np.asarray(out[1]["X"]).shape[1]} dim)',
-                      flush=True)
-            yield out
-
-
-def f_build_grid(session, build_cfg, cfg, prerendered, raw_cache, verbose=True, keep_raw=False):
-    """Materialize f_iter_grid_cells into a {cell_name: block} dict (non-interleaved use / tests)."""
-    return dict(f_iter_grid_cells(session, build_cfg, cfg, prerendered, raw_cache, verbose,
-                                  keep_raw=keep_raw))
+    yield from f_iter_feature_cells(inputs, g, get_raw, origin='build', cache=raw_cache, release=release,
+                                    timing=timing)
 
 
 def f_score_grid(res, metric='decode_r2'):
-    """Parse a feature-grid result (f_feature_grid) into a tidy long DataFrame with `ori` (DEGREES),
+    """Parse a feature-grid result (f_feature_search on grid configs) into a tidy long DataFrame with `ori` (DEGREES),
     `sf`, `tf` columns + the chosen `metric` — ready to pivot into the grid, e.g.
     `f_score_grid(res).pivot_table(metric, 'ori', ['sf','tf'])`. Reads the o/sf/tf VALUES straight off
     each cell's block name (e.g. 'o45_sf0.13_tf2.0'); an axis absent from the name (marginalized) → NaN."""
@@ -853,21 +503,6 @@ def f_score_grid(res, metric='decode_r2'):
     return pd.DataFrame(rows)
 
 
-def f_prep_configs(base_configs, preps=(None, 'whiten')):
-    """Expand each base config across feature-PREPROCESSING modes → test normalize/whiten before
-    scoring. `preps` ⊆ {None (as-is), 'zscore' (unit-variance columns), 'whiten' (PCs ÷ √eigenvalue via
-    the block's fitted PCA)}. Each expanded config sets `feat_prep` + a '|<prep>' name suffix. NOTE: the
-    search scores with proc_before_cv=True (no within-fold standardization), so feat_prep moves ENCODE as
-    well as DECODE — raw/combined weights top PCs, whiten/zscore equal-weights all PCs."""
-    out = []
-    for c in base_configs:
-        for p in preps:
-            if p not in _FEAT_PREPS:
-                raise ValueError(f"prep {p!r} not in {_FEAT_PREPS}")
-            out.append({**c, 'feat_prep': p, 'name': f"{c.get('name', 'cfg')}|{p or 'raw'}"})
-    return out
-
-
 def f_make_neural_target(est1, sigma_frames=6, peak_norm=True):
     """Neural rate proxy (T, n_active) matching VR_ca_cebra's Y_neu: drop silent cells, Gaussian-
     smooth, optional per-cell peak-normalize. Cell ORDER is irrelevant for scoring (cells are treated
@@ -876,42 +511,6 @@ def f_make_neural_target(est1, sigma_frames=6, peak_norm=True):
     from f_utils import f_neural_rate
     R, active = f_neural_rate(est1['S'], sigma_frames=sigma_frames, peak_norm=peak_norm)
     return R.T.astype(np.float32), active
-
-
-_GRAN_NPCA = {'combined': (lambda k: k), 'separate': (lambda k: ('filter', k)),
-              'raw': (lambda k: None)}   # granularity → block n_pca spec (see f_apply_block_pca)
-
-
-def f_granularity_configs(block, inputs, granularities=('combined', 'separate', 'raw'), n_pca=300):
-    """FRESH-BUILD configs comparing PCA granularity for ONE block + extraction (the separate / combined
-    / raw question, generated on GPU — NO cache). Each config forces origin='build' with `inputs` (the
-    extraction spec list, e.g. [{'source':'gabor','reduce':'sample','ds':4,'sf_cyc_deg':(0.13,),
-    'odegs':None}]); the render happens once in f_feature_search and only the conv re-runs. The block's
-    n_pca per granularity: 'combined' → n_pca (whole-block PCA); 'separate' → ('filter', n_pca)
-    (per-filter grouped PCA); 'raw' → None (no PCA). One config per granularity, named '<block>:<gran>'."""
-    out = []
-    for g in granularities:
-        if g not in _GRAN_NPCA:
-            raise ValueError(f"granularity {g!r} not in {list(_GRAN_NPCA)}")
-        out.append({'name': f'{block}:{g}', 'blocks': [block],
-                    'plan': {block: {'origin': 'build', 'n_pca': _GRAN_NPCA[g](n_pca),
-                                     'inputs': list(inputs)}}})
-    return out
-
-
-def f_variant_configs(blocks, variants=('combined', 'separate'), base_tag='gen_7_16_26'):
-    """CACHE-load variant of f_granularity_configs (use only with f_feature_search(force_build=False)):
-    score each block loaded from each pca_feat cache variant with NO reconvolution. `variants` ⊆
-    {'combined','separate','raw'} → cache_tag base_tag+{_pcacomb,_pcasep,_pcaraw}. 'raw' needs a
-    _pcaraw cache (VR_feature_gen SAVE_RAW=True). Prefer f_granularity_configs for a real search."""
-    out = []
-    for b in blocks:
-        for v in variants:
-            if v not in _VAR_SUFFIX:
-                raise ValueError(f"variant {v!r} not in {list(_VAR_SUFFIX)}")
-            out.append({'name': f'{b}:{v}', 'blocks': [b],
-                        'source': {'cache_tag': base_tag + _VAR_SUFFIX[v]}})
-    return out
 
 
 def _encode_cfg_cols(built, name, Y, frame_t, enc_cfg):
@@ -948,75 +547,36 @@ def f_feature_search(session, configs, Y_neu, base_source, build_cfg=None, base_
                      feature_proc=None, neural_proc=None, encode_neural_proc=None, verbose=True,
                      timing=False, keep_raw=False, scores=('decode', 'encode'), targets=None,
                      enc_cfg=None):
-    """Score a list of candidate feature `configs` on ONE dataset by encode + decode → tidy table.
+    """Score a list of candidate feature `configs` (f_feature_configs / f_proc_sweep) on ONE dataset.
 
-    session      : f_load_session output (ONE dataset; provides est1/bh/frame_t/cam_params).
-    configs      : list of config dicts (see module docstring).
-    Y_neu        : (T, n_active) neural rate proxy (f_make_neural_target). Dead cells dropped in scorer.
-    base_source  : f_default_source(...) — features_dir / mouse_id / cache_tag / conv_tag; a config's
-                   'source' overrides these (only used when force_build=False).
-    build_cfg    : f_default_build_cfg(...) shared render/side config (conv_backend='gpu' recommended).
-    base_plan    : dict of plan overrides applied to EVERY config before its own 'plan' (default {}).
-    force_build  : True (default) → REGENERATE every feature fresh on GPU (each block forced to
-                   origin='build'), never touching the cache — the render runs ONCE (shared across
-                   configs), only the conv re-runs per config. False → honor each config's origin
-                   ('auto'/'cache') and load from the caches (the f_variant_configs path).
-    prerendered  : (left, right, two) movie to reuse; None + force_build → rendered once here. Pass
-                   `f_render_once(session, build_cfg, cache)` to share ONE render across SEVERAL calls
-                   (the scorecard cell + each sweep cell), else each call re-renders the same movie.
-    keep_raw     : keep each pooled conv raw in the in-run cache instead of freeing it per conv-unit.
-                   For a PROC SWEEP over ONE bank this is the difference between convolving/reading it
-                   once and re-reading it from the conv_autosave store for every config; costs
-                   n_col·T·4 B of RAM (see f_iter_grid_cells). Leave off across different banks.
-    Feature-normalization chain (each stage an explicit knob; applied per config in order):
-      feat_pre_pca_zscore : z-score RAW feature columns BEFORE the (combined/separate) PCA. Memoized
-                            (single-block) path only; derived combos ignore it (set zscore_joint in the
-                            config plan instead).
-      feat_prep           : AFTER PCA — None (as-is) | 'zscore' (unit-var cols) | 'whiten' (PCs ÷
-                            √eigenvalue). A config's own 'feat_prep' overrides this global default.
-      scorer_standardize  : the scorer's within-fold z-score of the PREDICTOR (encode: feature cols;
-                            decode: neural PCs). Set False to test feat_prep WITHOUT the scorer
-                            re-normalizing (else encode features are effectively whitened regardless).
-      neural_zscore       : per-cell z-score the neural → sets which directions the decode neural-PCA
-                            picks (amplitude-dominated off / cell-balanced on). Decode-only (encode
-                            uses the non-z-scored per-cell target; its r/R² are scale-invariant).
-    (Peak-normalize the neural target is a knob on f_make_neural_target — `peak_norm` — in the script.)
-    n_pcs/lags_ms/embargo_sec/n_folds/r_sig : passed to f_score_representations.
-    scores  : which fits to run, ('decode', 'encode'); a skipped one leaves its columns NaN.
-    enc_cfg : encoder config (f_encoding.f_default_encoder_params) → ENCODE with f_run_encoder under
-              that config (the model shared with VR_ca_cebra; feature_block = the scored block,
-              n_feature_pcs=None). Fills the same encode_* columns + encode_r2_vw/rv/procrustes/rsa +
-              enc_tag. None → the older f_score_representations encode (lags_ms/r_sig/… above).
-    targets : {name: (T, n) array} neural targets, each block scored against every one (built once);
-              rows carry a `target` column. None → {'cells': Y_neu}. E.g. cells + ensemble traces
-              from f_ensemble_pipeline.f_ens_targets.
-    A grid cell whose block is byte-identical to one already scored in this call (e.g. a sweep value
-    past a set's full width) reuses that score instead of refitting.
-    (Encode CPU is bounded by the OMP/MKL BLAS thread env vars atop the script — f_encode_per_neuron
-     is serial.)
-    verbose : the standard per-config / per-cell summary lines.
-    timing  : EXTENDED log (additive) — flushed timestamped START + duration markers for each major
-              step (render, per conv-unit, decode, encode) so progress is readable live while
-              monitoring CPU. Default False = compact (verbose-only) output.
-
-    Returns a DataFrame: config / block / decode_r2 / decode_validfrac / encode_r_med /
-    encode_frac_sig / n_dim / status (ok | FAIL:<Err>), sorted most-decodable first.
-    """
+    session      : f_load_session output (ONE dataset).
+    configs      : GRID configs ({'name', 'grid': {kind, inputs, marginalize, layer1_proc, layer2_proc}}) or a
+                   single raw BLOCK config (pix: {'name', 'blocks', 'plan', 'proc'}).
+    Y_neu        : (T, n_active) neural target (f_encoding.f_enc_target); also the decode predictor.
+    base_source  : f_default_source(...) — features_dir (conv_autosave root + render-shape file).
+    build_cfg    : f_default_build_cfg(...) render / conv config.
+    prerendered  : movie to reuse; None → f_render_once (LAZY: renders only if pixels are needed).
+    keep_raw     : keep each conv-unit's raw in the call cache (a sweep over ONE bank reuses it).
+    scores       : ('decode', 'encode'); a skipped one leaves its columns NaN.
+    enc_cfg      : encoder config → encode with f_run_encoder (shared with VR_ca_cebra); None → the older
+                   f_score_representations encode (lags_ms / r_sig / feature_proc / encode_neural_proc).
+    targets      : {name: (T, n)} → every cell scored against each (built once); None → {'cells': Y_neu}.
+    n_pcs / embargo_sec / n_folds / scorer_standardize / neural_zscore / neural_proc : decode scorer.
+    verbose / timing : per-config summary / timestamped per-step log.
+    Removed 2026-11-12 (raise if used): base_plan, force_build=False, feat_prep, feat_pre_pca_zscore.
+    Returns a DataFrame: config / block / target / decode_* / encode_* / sizes / status (ok | FAIL:<Err>)."""
+    if base_plan or not force_build or feat_prep is not None or feat_pre_pca_zscore:
+        raise ValueError('base_plan / force_build=False / feat_prep / feat_pre_pca_zscore were removed '
+                         '2026-11-12 (last in commit 3e5b405); use feat_sets layer procs / sweep_pre / '
+                         'sweep_post instead')
     fs = f_imaging_fs(session['frame_t'])
     embargo = int(round(embargo_sec * fs))
-    base_plan = base_plan or {}
     if build_cfg and build_cfg.get('conv_autosave'):     # thread the store root (from base_source) into
         build_cfg = {**build_cfg,                        # build_cfg so _raw_block can locate the store
                      'conv_autosave_root': base_source.get('features_dir')}
-    _needs_render = force_build or any(c.get('grid') for c in configs)
-    if _needs_render and prerendered is None:            # render the movie ONCE — identical across configs
-        from f_pipeline import f_render_session
-        if timing:
-            print(f'[{time.strftime("%H:%M:%S")}] → render monitor movie once', flush=True)
-        _tr = time.perf_counter()
-        prerendered = f_render_session(session, build_cfg or {}, render_verbose=False, verbose=False)
-        if verbose:
-            print(f'[render] monitor movie once … {time.perf_counter() - _tr:.1f}s', flush=True)
+    if prerendered is None:                              # LAZY: renders only if a conv-unit / pix needs pixels
+        prerendered = f_render_once(session, build_cfg or {}, verbose=verbose,
+                                    shape_dir=base_source.get('features_dir'))
     frames = []
     raw_cache = {}                                       # memoize RAW extractions across configs (conv once)
     score_memo = {}                                      # (block hash, target) → scored row
@@ -1030,33 +590,13 @@ def f_feature_search(session, configs, Y_neu, base_source, build_cfg=None, base_
     for i, cfg in enumerate(configs):
         _tc = time.perf_counter()
         name = cfg.get('name', f'cfg{i}')
-        is_grid = bool(cfg.get('grid'))                  # feature-grid instruction (f_feature_grid)
+        is_grid = bool(cfg.get('grid'))                  # GRID config (every bank kind) | raw BLOCK (pix)
         blocks = list(cfg.get('blocks') or [name])
-        prep = cfg.get('feat_prep', feat_prep)
-        if is_grid:
-            plan, src, memoizable = None, {}, False
-        else:
-            plan = f_default_feature_plan(**{**base_plan, **(cfg.get('plan') or {})})
-            if force_build:                              # force fresh GPU build (no cache) for every block
-                for n in plan:
-                    if plan[n].get('origin') != 'derived':   # derived reuses already-built blocks
-                        plan[n] = {**plan[n], 'origin': 'build'}
-            src = {**base_source, **(cfg.get('source') or {})}
-            # Memoized path: every scored block is a single-input FRESH build → build each raw extraction
-            # ONCE (cached across configs), then apply this config's PCA granularity + prep. Derived
-            # combos / cache loads use the full resolve.
-            memoizable = force_build and all(
-                plan[b].get('origin') != 'derived' and len(plan[b].get('inputs') or []) == 1
-                and not plan[b].get('zscore_joint') for b in blocks)
-        if verbose:                                      # clean per-config header + bank/blocks descriptor
+        prep = None                                      # feat_prep removed; column kept for old tables
+        if verbose:                                      # per-config header + descriptor
             if is_grid:
                 g = cfg['grid']
-                if g.get('inputs') is not None:          # explicit level-1 spec list
-                    desc = f"{g['kind']} · {len(g['inputs'])} specs · marg={'+'.join(g['marginalize']) or 'none'}"
-                else:
-                    _tf = '' if g['kind'] == 'gabor' else f" × {len(g['tf_hz'])} tf"
-                    desc = (f"{g['kind']} · {g['n_orient']} ori × {len(g['sf_cyc_deg'])} sf{_tf} · "
-                            f"marg={'+'.join(g['marginalize']) or 'none'}")
+                desc = f"{g['kind']} · {len(g['inputs'])} specs · marg={'+'.join(g['marginalize']) or 'none'}"
             else:
                 desc = f'blocks={blocks}'
             print(f'[{i + 1}/{len(configs)}] {name}   {desc}')
@@ -1070,9 +610,6 @@ def f_feature_search(session, configs, Y_neu, base_source, build_cfg=None, base_
                                                           raw_cache, verbose, timing=timing,
                                                           keep_raw=keep_raw):
                     j += 1
-                    _tcell = time.perf_counter()
-                    if prep:
-                        block = {**block, 'X': _apply_feat_prep(block['X'], prep)}
                     _Xb = np.ascontiguousarray(block['X'])
                     _hb = (_Xb.shape, str(_Xb.dtype), hashlib.blake2b(_Xb, digest_size=16).hexdigest())
                     for tname, Yt in targets.items():    # one build, scored per target
@@ -1110,33 +647,23 @@ def f_feature_search(session, configs, Y_neu, base_source, build_cfg=None, base_
                                   f'enc={_r["encode_r_med"]:+.3f}   {time.perf_counter() - _tt:.1f}s')
                     del block, _Xb                       # release the scored cell immediately
                 sc = pd.concat(cell_rows, ignore_index=True)
-            else:                                        # non-grid: build all blocks then score at once
-                if memoizable:
-                    built, frame_t = {}, None
-                    for b in blocks:
-                        # 'build' = extract raw (gabor/meng CONVOLVE here; pix just selects pixels), then PCA
-                        if timing:
-                            print(f'      [{time.strftime("%H:%M:%S")}] → build+pca {b}', flush=True)
-                        _tb = time.perf_counter()
-                        raw, frame_t = _raw_block(session, build_cfg, b, plan[b]['inputs'],
-                                                  prerendered, raw_cache, False, timing=timing)
-                        if timing:
-                            print(f'      [{time.strftime("%H:%M:%S")}]   raw {b} '
-                                  f'{time.perf_counter() - _tb:.1f}s ({np.asarray(raw["X"]).shape[1]} col)'
-                                  f' → pca', flush=True)
-                        _tp = time.perf_counter()
-                        built[b] = _reduce_raw(raw, b, plan[b].get('n_pca'), prep,
-                                               pre_pca_zscore=feat_pre_pca_zscore)
-                        if timing:
-                            print(f'      [{time.strftime("%H:%M:%S")}] ✓ build+pca {b} '
-                                  f'(pca {time.perf_counter() - _tp:.1f}s, total '
-                                  f'{time.perf_counter() - _tb:.1f}s)', flush=True)
-                else:
-                    built, frame_t, _st, _mv = f_resolve_features(
-                        session, plan, build_cfg, only=blocks, want_movie=False, verbose=False,
-                        whiten=(prep == 'whiten'), prerendered=(prerendered if force_build else None), **src)
-                    for b in blocks:                                  # 'zscore' post-process (whiten done above)
-                        built[b] = {**built[b], 'X': _apply_feat_prep(built[b]['X'], prep)}
+            else:                                        # single raw BLOCK (pix): raw (memoized) → its proc
+                built, frame_t = {}, None
+                for b in blocks:
+                    pb = (cfg.get('plan') or {}).get(b) or {}
+                    if len(pb.get('inputs') or []) != 1 or pb.get('n_pca') is not None:
+                        raise ValueError(f'block {b!r}: only single-input raw blocks (pix) are supported; '
+                                         f'multi-input / derived / n_pca blocks were removed 2026-11-12')
+                    _tb = time.perf_counter()
+                    raw, frame_t = _raw_block(session, build_cfg, b, pb['inputs'], prerendered, raw_cache,
+                                              False, timing=timing)
+                    _X = np.asarray(raw['X'])
+                    _rn = list(raw.get('raw_names') or raw['names'])
+                    built[b] = {**raw, 'X': _X, 'names': _rn, 'raw_names': _rn, 'raw_dim': _X.shape[1],
+                                'pca': None, 'pca_groups': None}
+                    if timing:
+                        print(f'      [{time.strftime("%H:%M:%S")}] ✓ raw {b} '
+                              f'{time.perf_counter() - _tb:.1f}s ({_X.shape[1]} col)', flush=True)
                 _proc = cfg.get('proc')                               # f_proc step-list (norm/pca/whiten) on the block
                 if _proc:
                     for b in blocks:

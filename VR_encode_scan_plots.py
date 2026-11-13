@@ -38,7 +38,7 @@ except Exception:
 # SECTION 1 · SETUP — point at the store (same ENC_TAG + feat_root as script 1)
 # ==========================================================================
 feat_root    = 'F:/VR/features/'
-ENC_TAG      = 'enc_7_18_26'
+ENC_TAG      = 'enc_11_12_26'        # old: 'enc_7_18_26' / 'enc_11_6_26' (gaborS+mengS blocks)
 data_dir_bh  = 'F:/VR/Bh_data/mice_gcamp/'
 vr_data_xlsx = 'F:/VR/data_proc/VR_data.xlsx'
 data_dir_of  = lambda m: 'F:/VR/data_proc/' + m
@@ -165,7 +165,7 @@ if 1:
 
 #%% SECTION 5 · Per-dataset small multiples — one widefield panel per dataset (chosen block/model)
 if 1:
-    plot_mouse = 'L'; plot_block = 'gaborS+mengS'; plot_model = 'ridge'
+    plot_mouse = 'L'; plot_block = 'gabmag+mengopp'; plot_model = 'ridge'
     dot_size = 6                         # scatter marker size (was 10)
     dsets = sorted(full.loc[full['mouse'] == plot_mouse, 'dset_name'].unique())
     n = len(dsets)
@@ -193,8 +193,8 @@ if 1:
     cells = full[(full['mouse'] == 'L') & (full['source'] == 'cells')]
     es.f_plot_score_hist(cells, dset_tag='L cells')
     es.f_plot_block_model_compare(cells, x=('block', 'agg'),
-                                  y=('block', 'gaborS+mengS'), model='ridge', dset_tag='L cells')
-    _b = 'gaborS+mengS'
+                                  y=('block', 'gabmag+mengopp'), model='ridge', dset_tag='L cells')
+    _b = 'gabmag+mengopp'
     _d = cells[cells['block'] == _b]
     _m = _d[_d['model'] == 'ridge'].merge(_d[_d['model'] == 'cca'],
                                           on=['mouse', 'dset_name', 'source', 'unit'],
@@ -212,7 +212,7 @@ if 1:
 # Ensembles have no location; compare their encoding R² across datasets. For a chosen (block, model),
 # plot the per-ensemble R² grouped by dataset, SIGNIFICANT ensembles highlighted, + the sig-only median.
 if 1:
-    plot_mouse = 'L'; plot_block = 'gaborS+mengS'; plot_model = 'ridge'
+    plot_mouse = 'L'; plot_block = 'gabmag+mengopp'; plot_model = 'ridge'
     ens = full[(full['source'] == 'ensembles') & (full['mouse'] == plot_mouse)
                & (full['block'] == plot_block) & (full['model'] == plot_model)].copy()
     if not ens.empty:

@@ -7,19 +7,11 @@ motion energy, wavelet, raw pixels) and ranks them by how well they predict neur
 well neurons predict them (decode).
 PIPELINE: step 1 of 3 — VR_feature_search → VR_ca_encoding → VR_ca_cebra. See SCRIPTS.md.
 
-Take one dataset and ask "which feature representation (and at what PCA granularity /
-sampling / combination) encodes+decodes the neurons best?". Every candidate is REGENERATED
-fresh on the GPU (force_build=True — the cache is bypassed so the search spans the full
-parameter space, not the few cached settings); the monitor render runs ONCE and is shared
-across configs, only the conv re-runs per config. Each config is scored by
-f_dataset_scan.f_score_representations (decode R² neural→feature + encode r feature→neural).
-The neural-scored sibling of VR_feature_optim.py (movie recon).
-
-ONE builder `fsearch.f_feature_grid(kind, marginalize=(...), sf_cyc_deg, tf_hz, ...)`: the bank's
-filters form an ori × wl(SF) × tf grid; `marginalize` pools a chosen set of axes and the REMAINING
-axes become a param matrix scored cell-by-cell (marginalize=() → per filter, {'ori'} → per (wl,tf),
-{'ori','wl','tf'} → whole bank). Two optional PCA layers (per-filter, per-cell). See cell 2; pivot a
-per-filter result into the 3D score grid with `fsearch.f_score_grid`.
+Feature sets are ONE `feat_sets` dict (cell 2; same format as VR_ca_cebra / VR_ca_encoding), built by the
+shared engine (f_feature_source.f_feature_plan + f_iter_feature_cells) and scored by decode + encode (the
+shared encoder config, cell 1a). Convolutions reload from conv_autosave; the movie renders only when a
+convolution is not cached or a pix set needs pixels. `marginalize` pools ori / sf / tf (the rest become
+scored cells); layer1_proc acts per filter, layer2_proc per cell. Cell 3 = scorecard, 3c = component sweep.
 
 Spyder cell-based (#%% markers). Created 2026-07-18. Compute in functions/f_feature_search.py.
 """
@@ -394,7 +386,7 @@ print(f'{len(configs)} configs: {[c["name"] for c in configs]}')
 #        for i, m in enumerate([(), ('ori',), 'all'])], [])
 
 
-#%% Cell 3 — run the search + scorecard (force_build=True → fresh GPU, render once)
+#%% Cell 3 — run the search + scorecard (convolutions reload from conv_autosave; lazy render)
 # verbose = the standard per-config / per-cell summary (unchanged). timing = EXTENDED log: flushed
 # timestamped START + duration markers for each MAJOR step (render, per conv-unit, decode, encode) so
 # you can read what's running while watching CPU. Leave timing=False for the compact output.
@@ -515,31 +507,3 @@ if show_grid:                           # 2×2: decode/encode × (n_dim, varianc
                              var_col='l1_var_kept' if sweep_layer == 'layer1' else 'var_kept',
                              title=f'{dset_tag} — performance vs components kept')
 fsearch.f_feature_sizes(res_pc, ram_gb=128, sort_by='none')   # 'none' = sweep order; or any column
-
-
-#%% Cell 3b (OLD, superseded by cell 3c `sweep_post`) — normalize / whiten test: expand configs × feat_prep
-# Old config format (gaborS, ds=4). Use cell 3c's sweep_post for normalize/whiten on feat_sets banks.
-# f_prep_configs adds a '|<prep>' variant per base config. NOTE: the search applies all procs before
-# the CV split with NO within-fold standardization (proc_before_cv=True), so prep moves ENCODE too —
-# the ridge penalty depends on column scale — as well as DECODE (feature = target).
-if 0:
-    gab_in = [{'source': 'gabor', 'reduce': 'sample', 'ds': 4, 'sf_cyc_deg': (0.13,), 'odegs': None}]
-    base = fsearch.f_granularity_configs('gaborS', gab_in, ('combined',), n_pca=300)
-    prep_cfgs = fsearch.f_prep_configs(base, preps=(None, 'zscore', 'whiten'))
-    res_prep = fsearch.f_feature_search(session, prep_cfgs, Y_neu, base_source, build_cfg, verbose=True)
-    print(res_prep[['config', 'feat_prep', 'decode_r2', 'encode_r_med', 'n_dim']].to_string(index=False))
-    fsearch.f_plot_feature_search(res_prep, title=f'{dset_tag} — feature prep (normalize/whiten)')
-
-
-#%% Cell 4 (example, opt-in) — marginal sweep over sampling ds (all fresh GPU build)
-# Vary ONE axis (ds), hold the rest. The render is reused across these too (rendered once above).
-if 0:
-    ds_list = [2, 4, 6]
-    sweep_cfgs = [{'name': f'gaborS_ds{ds}:combined', 'blocks': ['gaborS'],
-                   'plan': {'gaborS': {'origin': 'build', 'n_pca': 300,
-                                       'inputs': [{'source': 'gabor', 'reduce': 'sample', 'ds': ds,
-                                                   'sf_cyc_deg': (0.13,), 'odegs': None}]}}}
-                  for ds in ds_list]
-    res_ds = fsearch.f_feature_search(session, sweep_cfgs, Y_neu, base_source, build_cfg, verbose=True)
-    print(res_ds[['config', 'decode_r2', 'encode_r_med', 'n_dim']].to_string(index=False))
-    fsearch.f_plot_feature_search(res_ds, title=f'{dset_tag} — gaborS ds sweep')

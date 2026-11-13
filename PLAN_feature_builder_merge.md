@@ -87,17 +87,39 @@ feat_sets dict ──► f_resolve_feat_sets ──► ONE spec builder ──�
    gabor/fft/meng entries now == the search (8 ori / Nyquist instead of 4 / ds=4).
    Original step: **Fix divergence 1 now** (small): single-SF entries go through f_pyramid_specs on the plan side.
    PARITY: every pyramid entry's inputs unchanged; single-SF entries now == the search's.
+2+3 (engine) **DONE 2026-11-09** — `f_feature_source.f_iter_feature_cells` = THE grid-cell engine (streaming,
+   exact cached layer-1 via _layer1_apply/_l1_decomp/_l1_nested, per-input layer-1 override, repo
+   orientation, unique unit labels). f_feature_search.f_iter_grid_cells and _build_grid_block are thin
+   wrappers. PARITY: search 24/24 configs identical (cells, order, X, names, dims, l1 var); plan identical
+   without layer-1 pca/svd; with svd canonical corr ≥ 0.999997, except whiten→layer-2 pca, which is
+   ill-posed (all whitened variances = 1 → 'top-k' undefined; old and new both arbitrary). Plan raw names
+   now unit-unique ('gabor_sf0.04065:…' instead of 'gabor_dsnyquist:…' repeated per level).
+   STILL TODO in step 3: plan-side per-unit build (today it still extracts all raw inputs at once).
 2. **Move the streaming builder** into f_feature_source with a pluggable raw source + explicit cache;
    the search imports it. PARITY: search blocks byte-identical to today (grid + layer-1 svd + names).
 3. **`_build_grid_block` → wrapper** over it (repo / from_block sources included). PARITY: cebra's current
    vis_sets blocks identical; any layer-1 pca/svd entry differs only by the exact-vs-randomized amount
    (measured and reported); peak RAM measured before/after.
-4. **One spec builder** `f_feature_plan`; `f_feature_configs` = names + plan blocks; f_pyramid_grid /
+4. **DONE 2026-11-09** — `f_feature_source.f_feature_plan(feat_sets, strict, tag_suffix, **common)` is the ONE
+   spec builder (f_vis_sets_to_plan = alias). f_feature_configs wraps its blocks as search configs.
+   PARITY: 15/15 config groups byte-identical (all script dicts + tag_suffix/common + f_proc_sweep pre/post);
+   plan side unchanged (25 entries). f_pyramid_grid / f_feature_specs no longer on the feat_sets path.
+   Original step 4: **One spec builder** `f_feature_plan`; `f_feature_configs` = names + plan blocks; f_pyramid_grid /
    f_feature_specs / f_grid_block / f_pyramid_block become thin wrappers. PARITY: config names + inputs
    identical for the current feat_sets / vis_sets dicts.
-5. **f_feature_search → one path**; `_raw_block` direct; legacy builders → f_feature_legacy.py; old-scorer
+5. **DONE 2026-11-12** — removed f_feature_grid / f_feature_specs / f_pyramid_grid / f_granularity_configs /
+   f_variant_configs / f_prep_configs / f_build_grid / _reduce_raw / _apply_feat_prep (search) and f_grid_block /
+   f_pyramid_block / gaborG+mengG plan entries (plan side); f_feature_search has two paths (grid / single raw
+   block = pix), lazy render by default, base_plan / force_build=False / feat_prep / feat_pre_pca_zscore raise.
+   Script cells 3b/4 removed. f_feature_search.py 1332 → 1026 lines. PARITY: real-data scorecard (2 grid sets +
+   pix, decode+encode) IDENTICAL; 15/15 config groups identical; plan side 25 entries identical.
+   Original step 5: **f_feature_search → one path**; `_raw_block` direct; legacy builders → f_feature_legacy.py; old-scorer
    knobs removed (per decision). PARITY: Cell 3 / 3c tables identical on the test sets.
-6. **Cebra / VR_ca_encoding feature cell**: `feat_sets` name + `f_feature_plan`; legacy feature_list
+6. **DONE 2026-11-12** — cebra + VR_ca_encoding: `vis_sets` → `feat_sets`, f_feature_plan; build cells keep the
+   movie LAZY (cebra drops its unused L/R slice; encoding slices per cell via f_side_movie). feature_plan +
+   feature_list identical to before. NB both feature_lists include 'pix', which needs pixels → those
+   scripts still render unless pix is dropped. #78 group A COMPLETE (step 7 lazy render done earlier).
+   Original step 6: **Cebra / VR_ca_encoding feature cell**: `feat_sets` name + `f_feature_plan`; legacy feature_list
    names (gaborS/mengS/gaborG, feat_pca_variant) as comments; pix via a feat_sets entry (or keep the old
    pix block deliberately). Optional feature_sets.py.
 7. **Lazy render** (shape-only placeholders on autosave hits).

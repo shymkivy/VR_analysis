@@ -41,7 +41,7 @@ except Exception:
     pass
 
 from f_pipeline import f_load_session
-from f_feature_source import f_default_feature_plan, f_default_build_cfg, f_default_source
+from f_feature_source import f_proc_feature_plan, f_feature_plan, f_default_build_cfg, f_default_source
 from f_feature_gen import f_resolve_dsets
 import f_encoding as enc
 import f_ensembles as ens
@@ -58,17 +58,19 @@ vr_data_xlsx = 'F:/VR/data_proc/VR_data.xlsx'
 data_dir_of  = lambda m: 'F:/VR/data_proc/' + m
 feat_root    = 'F:/VR/features/'      # shared root; the encode_scan/ store folder sits here
 
-ENC_TAG      = 'enc_11_6_26'          # versions the store file (bump to start a fresh sweep)
+ENC_TAG      = 'enc_11_12_26'         # versions the store file (bump to start a fresh sweep)
+                                     # enc_11_6_26 = old gaborS/mengS pca_feat cache blocks
                                      # enc_7_18_26 = old per-script ensembles (not the shared config)
 DSETS        = None                   # None/'all' = all do_proc | list of n_dset | {mouse: [...]}
 
 
 #%% SECTION 2 · CONFIG — sources, blocks, models, encoder + ensemble knobs, feature plan
 sources      = ('cells', 'ensembles')     # unit sources to encode: raw cells AND/OR ensembles
-blocks       = ['agg', 'pix', 'motion', 'self_mot', 'beh', 'gaborS', 'mengS', 'gaborS+mengS']   # each scored ALONE, per unit
+blocks       = ['agg', 'pix', 'motion', 'self_mot', 'beh', 'gabmag', 'mengopp', 'gabmag+mengopp']   # each scored ALONE, per unit
+# blocks     = ['agg', 'pix', 'motion', 'self_mot', 'beh', 'gaborS', 'mengS', 'gaborS+mengS']       # old (enc_11_6_26)
 # ENCODER = the shared encoder config (f_encoding; defaults = VR_ca_cebra's enc_params — ridge α 1e3,
 # lags 0–500 ms, interleaved 5-fold, standardize, target σ 6; every key documented in _enc_defaults()).
-# n_feature_pcs=None: the blocks arrive already reduced (n_feature_pcs below → feature plan).
+# n_feature_pcs=None: the blocks arrive already reduced (feat_sets layer2_proc).
 # Override by name, e.g. f_default_encoder_params(n_feature_pcs=None, embargo_sec=0.5).
 enc_cfg      = enc.f_default_encoder_params(n_feature_pcs=None)
 models       = ['ridge']          # , 'cca'                    # per-unit model sweep (→ enc_cfg 'decoder')
@@ -77,7 +79,6 @@ model_kw     = {                                              # extra encoder ke
                 }
 sigma_frames = enc_cfg['target_sigma_frames']     # neural target smoothing (from the encoder config)
 print(f'encoder config {enc.f_enc_config_tag(enc_cfg)}')
-n_feature_pcs    = 200          # cap feature PCs per visual block (loaded → keep top-N; derived → joint-PCA size); None = use cache's saved count
 
 # ENSEMBLES (only if 'ensembles' in sources): the SHARED ensemble config (f_ensemble_pipeline; defaults
 # = VR_ca_cebra, every parameter documented in _ens_defaults()). Per dataset they LOAD from
@@ -92,43 +93,61 @@ print(f'ensemble config {enspipe.f_ens_config_tag(ens_cfg)}')
 # scored on that single build (no per-model rebuild).
 conv_backend = 'gpu'                       # 'gpu' (torch, fast — like the tuning scan) | 'cpu' (scipy)
 conv_device  = 'cuda'                      # torch device for conv_backend='gpu'
-# point-sample stride for the BUILT gaborS/mengS blocks. RAM scales ∝ 1/ds²: at 150×101 over a full
-# session ds=2 → ~30k columns → a ~11 GB float32 block (22 GB if float64) → OOM; ds=4 → ~7.6k cols.
-# The gabor MAGNITUDE map is smooth (Nyquist stride ≈0.5·λ ≈6 px), so ds≥2 loses little. Lower to 2
-# only if you have the RAM (and want finer retinotopy).
-samp_ds      = 4
-feature_plan = f_default_feature_plan()
-for _bn in ('gaborS', 'mengS', 'gaborS+mengS', 'gaborS+mengS2'):   # override sampled-visual ds
-    for _inp in feature_plan.get(_bn, {}).get('inputs', []):
-        if _inp.get('reduce') == 'sample':
-            _inp['ds'] = samp_ds
-# n_feature_pcs → per-block PC budget. On a LOADED cache block (pix/gaborS/mengS) the plan's n_pca is an
-# UPPER-BOUND cap (_cap_loaded_block keeps the top-N variance PCs); on the DERIVED gaborS+mengS it is the
-# joint-PCA output size. Set it on the visual/pix blocks + the derived composites' source blocks so the
-# whole visual budget is n_feature_pcs. agg/self_mot are raw (no PCA) and untouched.
-if n_feature_pcs is not None:
-    for _bn in ('pix', 'gaborS', 'mengS', 'mengS2', 'mengS3',
-                'gaborS+mengS', 'gaborS+mengS2', 'gaborS+mengS3'):
-        if _bn in feature_plan:
-            feature_plan[_bn]['n_pca'] = int(n_feature_pcs)
+# VISUAL BANKS — `feat_sets`, the SAME dict as VR_feature_search / VR_ca_cebra / VR_ca_encoding (built by
+# f_feature_source.f_feature_plan). A bank name in `blocks` scores all its cells together; 'a+b' joins banks.
+feat_sets = {
+    '_common': dict(cyc_fov=(1, 2, 4, 8, 16), odegs=(0, 45, 90), marginalize='all',
+                    layer1_proc=None, layer2_proc=[('pca', 50)]),
+    'gabmag':  dict(kind='gabor', stats=('magnitude',)),
+    'mengopp': dict(kind='meng', tf_hz=(0.25, 0.5, 1.0, 2), output='opponent', transform='signed_sqrt'),
+}
+feature_plan = f_proc_feature_plan()
+feature_plan.update(f_feature_plan(feat_sets))
 build_cfg    = f_default_build_cfg(side='both', conv_backend=conv_backend, conv_device=conv_device)
+# shared conv store — MUST match VR_feature_search / VR_ca_cebra (part of the autosave key)
+build_cfg['conv_autosave']     = True
+build_cfg['conv_autosave_tag'] = 'auto1'
+build_cfg['edge_min_frac']     = 0.45
 
-# REUSE the pca_feat caches (no reconvolution) — mirrors VR_ca_cebra.py. Set feat_pca_variant to the
-# generated variant so gaborS/mengS LOAD from cache; feat_combine composes gaborS+mengS from those
-# loaded blocks (concat scores + one PCA, balance=True = the old input_norm='pca' balancing). Blocks
-# NOT in the cache (agg/pix/self_mot) still build. feat_pca_variant=None → build gabor/meng from scratch.
-feat_pca_variant = 'pcacomb'      # None | 'pcacomb' | 'pcasep' | 'pcaraw'
-feat_whiten      = False          # whiten loaded PCA blocks (÷√eigenvalue)
-feat_combine     = {}             # gaborS+mengS is now a DERIVED block in f_default_feature_plan
-                                  # (from_block: gaborS+mengS) — just list it in `blocks`; no reconv.
+# OLD feature plumbing (gaborS/mengS from the pca_feat cache, n_feature_pcs cap) — kept for reference
+# n_feature_pcs    = 200
+# # point-sample stride for the BUILT gaborS/mengS blocks. RAM scales ∝ 1/ds²: at 150×101 over a full
+# # session ds=2 → ~30k columns → a ~11 GB float32 block (22 GB if float64) → OOM; ds=4 → ~7.6k cols.
+# # The gabor MAGNITUDE map is smooth (Nyquist stride ≈0.5·λ ≈6 px), so ds≥2 loses little. Lower to 2
+# # only if you have the RAM (and want finer retinotopy).
+# samp_ds      = 4
+# feature_plan = f_default_feature_plan()
+# for _bn in ('gaborS', 'mengS', 'gaborS+mengS', 'gaborS+mengS2'):   # override sampled-visual ds
+#     for _inp in feature_plan.get(_bn, {}).get('inputs', []):
+#         if _inp.get('reduce') == 'sample':
+#             _inp['ds'] = samp_ds
+# # n_feature_pcs → per-block PC budget. On a LOADED cache block (pix/gaborS/mengS) the plan's n_pca is an
+# # UPPER-BOUND cap (_cap_loaded_block keeps the top-N variance PCs); on the DERIVED gaborS+mengS it is the
+# # joint-PCA output size. Set it on the visual/pix blocks + the derived composites' source blocks so the
+# # whole visual budget is n_feature_pcs. agg/self_mot are raw (no PCA) and untouched.
+# if n_feature_pcs is not None:
+#     for _bn in ('pix', 'gaborS', 'mengS', 'mengS2', 'mengS3',
+#                 'gaborS+mengS', 'gaborS+mengS2', 'gaborS+mengS3'):
+#         if _bn in feature_plan:
+#             feature_plan[_bn]['n_pca'] = int(n_feature_pcs)
+# build_cfg    = f_default_build_cfg(side='both', conv_backend=conv_backend, conv_device=conv_device)
+#
+# # REUSE the pca_feat caches (no reconvolution) — mirrors VR_ca_cebra.py. Set feat_pca_variant to the
+# # generated variant so gaborS/mengS LOAD from cache; feat_combine composes gaborS+mengS from those
+# # loaded blocks (concat scores + one PCA, balance=True = the old input_norm='pca' balancing). Blocks
+# # NOT in the cache (agg/pix/self_mot) still build. feat_pca_variant=None → build gabor/meng from scratch.
+# feat_pca_variant = 'pcacomb'      # None | 'pcacomb' | 'pcasep' | 'pcaraw'
+# feat_whiten      = False          # whiten loaded PCA blocks (÷√eigenvalue)
+# feat_combine     = {}             # gaborS+mengS is now a DERIVED block in f_default_feature_plan
+#                                   # (from_block: gaborS+mengS) — just list it in `blocks`; no reconv.
 
 # config stamped into the store (for later verification of what produced the scores)
 scan_cfg = {'sources': sources, 'blocks': blocks, 'models': models, 'model_kw': model_kw,
             'enc_cfg': enc_cfg, 'enc_tag_cfg': enc.f_enc_config_tag(enc_cfg), 'sigma_frames': sigma_frames,
             'feat_tag': f_default_source()['conv_tag'],
-            'num_samp': build_cfg.get('lat_samp'), 'conv_backend': conv_backend, 'samp_ds': samp_ds,
-            'feat_pca_variant': feat_pca_variant, 'feat_whiten': feat_whiten, 'n_feature_pcs': n_feature_pcs,
-            'feat_combine': {k: dict(v) for k, v in feat_combine.items()},
+            'num_samp': build_cfg.get('lat_samp'), 'conv_backend': conv_backend,
+            'feat_sets': feat_sets, 'edge_min_frac': build_cfg['edge_min_frac'],
+            'conv_autosave_tag': build_cfg['conv_autosave_tag'],
             'ens_cfg': ens_cfg, 'ens_tag': enspipe.f_ens_config_tag(ens_cfg), 'ens_which': ens_which,
             'enc_tag': ENC_TAG}
 
@@ -166,8 +185,6 @@ print(f'planned {len(target)} combos across {sum(len(v) for v in dsets_of.values
 _n_combo = len(sources) * len(blocks) * len(models)
 for m in mice:
     src_m = f_default_source(mouse_id=m)
-    if feat_pca_variant:                                   # load gaborS/mengS from the pca_feat cache
-        src_m = {**src_m, 'cache_tag': f"{src_m['cache_tag']}_{feat_pca_variant}"}
     for nd, dset_name in dsets_of[m]:
         combos = [(s, b, mdl) for s in sources for b in blocks for mdl in models
                   if es._enc_key(m, dset_name, s, b, mdl) not in store['results']]
@@ -177,8 +194,7 @@ for m in mice:
         try:
             session = f_load_session(m, nd, data_dir_of(m), data_dir_bh, vr_data_xlsx, verbose=False)
             prep = es.f_encode_prepare(session, blocks, sigma_frames=sigma_frames,
-                                       plan=feature_plan, build_cfg=build_cfg, src=src_m,
-                                       whiten=feat_whiten, combine=feat_combine, verbose=True)
+                                       plan=feature_plan, build_cfg=build_cfg, src=src_m, verbose=True)
             # per-source (T, n_units) targets + unit labels; ensembles extracted once if needed
             targets = {'cells': (prep['Y_enc'], prep['cell_ids'])}
             if any(s == 'ensembles' for s, _, _ in combos):

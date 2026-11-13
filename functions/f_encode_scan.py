@@ -196,7 +196,9 @@ def f_encode_prepare(session, blocks, *, sigma_frames=6, plan=None, build_cfg=No
     combine_srcs = {b for spec in combine.values() for b in spec['blocks']}
     # RESOLVE requested blocks MINUS composite names, PLUS the composites' source blocks (loaded, then
     # combined below) — so gaborS+mengS is composed from the caches, not rebuilt.
-    need = sorted((set(blocks) - set(combine)) | combine_srcs)
+    # 'a+b' not in the plan = a join of plan blocks → resolve its parts
+    parts = {p for b in set(blocks) - set(combine) for p in ([b] if b in plan else b.split('+'))}
+    need = sorted(parts | combine_srcs)
     built_blocks, frame_t, side_tags, _ = f_resolve_features(
         session, plan, build_cfg, dset_name=dset_name, only=need,
         render_verbose=False, whiten=whiten, verbose=verbose, **src)
@@ -222,11 +224,13 @@ def f_encode_prepare(session, blocks, *, sigma_frames=6, plan=None, build_cfg=No
 def f_encode_one_cfg(built_blocks, block, Y_enc, enc_cfg, frame_t, model=None, model_kw=None):
     """One block × model per-unit encode with the SHARED encoder config (f_encoding.f_run_encoder,
     model = VR_ca_cebra's). `model` overrides enc_cfg['decoder']; `model_kw` = extra encoder keys
-    for that model (e.g. {'n_components': 30} for cca). feature_block = [block], n_feature_pcs = None
+    for that model (e.g. {'n_components': 30} for cca). feature_block = [block] (bank names expand;
+    'a+b' not in built_blocks → [a, b] concatenated), n_feature_pcs = None
     (blocks arrive already reduced by the feature plan). Same return as f_encode_one:
     {'block','model','r2' (n_units,),'r' (n_units,),'keep' (n_units,) bool}, NaN where dropped."""
     from f_encoding import f_run_encoder
-    cfg = {**enc_cfg, 'feature_block': [block], 'n_feature_pcs': None, **(model_kw or {})}
+    fb = [block] if block in built_blocks else block.split('+')       # 'a+b' → concatenated banks
+    cfg = {**enc_cfg, 'feature_block': fb, 'n_feature_pcs': None, **(model_kw or {})}
     if model is not None:
         cfg['decoder'] = model
     n = int(Y_enc.shape[1])

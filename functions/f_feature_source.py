@@ -53,6 +53,7 @@ Created 2026-07-13 (feature-source centralization; VR_ca_cebra.py is the first c
 """
 
 import copy
+import json
 
 import numpy as np
 
@@ -271,50 +272,6 @@ def f_default_feature_plan(**overrides):
     return plan
 
 
-def f_grid_block(kind, marginalize=(), *, sf_cyc_deg=(0.13,), tf_hz=(1.0,), n_orient=4, odegs=None,
-                 ds=4, ds_factor=None, reduce='sample', transform=None, output='opponent',
-                 stats=('magnitude',), layer1_proc=(), layer2_proc=(), origin='build',
-                 n_sf_sub=None, n_ori_sub=None, patch_snap=None):
-    """Plan-side GRID block (mirrors f_feature_search.f_feature_grid): ONE gabor/meng/fft bank whose
-    filters = ori × sf × tf. `marginalize` ⊆ {'ori','sf'/'wl','tf'} POOLS those axes; the builder
-    (_build_grid_block) yields ONE cell-block per remaining-axis combo (marginalize=() → per filter,
-    ('ori',) → per (sf,tf), ('ori','sf','tf') → one block). layer1_proc = per-filter f_proc (== search
-    layer1); layer2_proc = per-cell f_proc (== layer2). Extraction is ONE input per (sf,tf) conv-unit
-    (all orientations), so raw comes from fresh build OR a conv_repo via _extract_input. odegs = explicit
-    orientation DEGREES (sets n_orient); None → n_orient evenly-spaced in [0,180). `ds` = point-sample
-    stride (int/(h,w) fixed | 'nyquist' → per-SF ≈ds_factor·λ, so higher SF sampled finer).
-    Kinds in NO_TF_KINDS ('gabor','fft') carry `stats` and emit ONE unit per SF (no tf axis); `fft`
-    also takes n_sf_sub / n_ori_sub / patch_snap (see f_visual_features.f_fft_features)."""
-    is_gabor = (kind in NO_TF_KINDS)                           # spatial-only kind → stats, no tf
-    odegs = tuple(float(a) for a in np.atleast_1d(odegs)) if odegs is not None else None
-    if odegs is not None:
-        n_orient = len(odegs)
-    sf_cyc_deg = tuple(float(s) for s in np.atleast_1d(sf_cyc_deg))
-    tf_units = [None] if is_gabor else [float(t) for t in np.atleast_1d(tf_hz)]
-    inputs = []
-    for sfv in sf_cyc_deg:                                     # one input per (sf,tf) conv-unit
-        for tfv in tf_units:
-            inp = {'source': kind, 'reduce': reduce, 'ds': ds, 'n_orient': n_orient,
-                   'odegs': odegs, 'sf_cyc_deg': (sfv,)}
-            if ds_factor is not None or ds == 'nyquist':       # per-SF Nyquist stride (build + repo)
-                inp['ds_factor'] = float(ds_factor if ds_factor is not None else 0.5)
-            if is_gabor:
-                inp['stats'] = tuple(stats)
-                for _k, _v in (('n_sf_sub', n_sf_sub), ('n_ori_sub', n_ori_sub),
-                               ('patch_snap', patch_snap)):    # fft-only; ignored by gabor
-                    if _v is not None:
-                        inp[_k] = _v
-            else:
-                inp['tf_hz'] = (tfv,)
-                inp['output'] = output
-                if transform is not None:
-                    inp['transform'] = transform
-            inputs.append(inp)
-    return {'origin': origin, 'inputs': inputs,
-            'grid': {'kind': kind, 'marginalize': f_marg_spec(marginalize),
-                     'layer1_proc': list(layer1_proc), 'layer2_proc': list(layer2_proc)}}
-
-
 PYRAMID_KINDS = ('gabor', 'fft', 'meng', 'fftglobal', 'wavelet')   # built from a filter bank
                                              # ('pix' = the raw movie, no SF axis)
 # Knobs each kind actually READS (f_pyramid_specs). A knob outside its kind's list is silently dropped
@@ -371,40 +328,46 @@ def f_resolve_feat_sets(feat_sets, strict=True, tag_suffix=None, **common):
     return out
 
 
-def f_vis_sets_to_plan(vis_sets, hFOV_deg=98.4, strict=True, **common):
-    """NAMED FEATURE SETS → plan blocks, the plan-side twin of f_feature_search.f_feature_configs. Lets
+def f_feature_plan(feat_sets, hFOV_deg=98.4, strict=True, tag_suffix=None, **common):
+    """THE spec builder: NAMED FEATURE SETS → plan blocks {tag: block}. Used directly by cebra / encoding
+    (→ f_resolve_features) AND by the search (f_feature_search.f_feature_configs wraps each block as a
+    config), so one dict means one thing everywhere. `tag_suffix` / `**common` as f_resolve_feat_sets
+    (sweep passes). `f_vis_sets_to_plan` is the old name (alias). Lets
     the SAME dict be pasted between VR_feature_search.py (scored by encode+decode) and VR_ca_cebra.py
     (used for the encoding arm) — same reserved `'_common'` defaults, same per-entry overrides, same
     `kind` validation, identical keyword names, and cell names that match via f_num_tag.
 
     `vis_sets` = {'_common': {...}, name: {kind, …}}. Every bank entry — a pyramid (`cyc_fov` / `sf_range` /
-    tuple `sf_cyc_deg`) or a single SF — goes through f_pyramid_specs + f_specs_block, exactly like the search
-    (f_feature_configs → f_pyramid_grid), so one dict builds identical inputs in both scripts. Expands at
+    tuple `sf_cyc_deg`) or a single SF — goes through f_pyramid_specs + f_specs_block; the search's
+    f_feature_configs wraps these same blocks, so one dict builds identical inputs in every script. Expands at
     build to `<name>:<cell>` blocks. `kind='pix'` maps to the plan's raw-movie pix block with the layer1+layer2
     procs run back-to-back on it (pix has no filter axis), matching f_pix_config on the search side.
     Returns {name: plan_block} to merge into a feature_plan; add the same names to feature_list."""
     out = {}
-    for nm, tag, kind, s in f_resolve_feat_sets(vis_sets, strict=strict, **common):
+    for nm, tag, kind, s in f_resolve_feat_sets(feat_sets, strict=strict, tag_suffix=tag_suffix, **common):
         s = dict(s)
         marg = s.pop('marginalize', DEFAULT_MARGINALIZE)
         l1, l2 = s.pop('layer1_proc', ()) or (), s.pop('layer2_proc', ()) or ()
         origin = s.pop('origin', 'build')
         if kind == 'pix':                            # raw movie: no filter axis → l1 then l2 on one block
-            out[nm] = {'origin': origin,
+            out[tag] = {'origin': origin,
                        'inputs': [{'source': 'pix', 'reduce': 'raw', 'n_pix_pca': None}],
                        'proc': list(l1) + list(l2)}
             continue
-        # every bank entry (single SF or pyramid) → f_pyramid_specs, the SAME route as the search's
-        # f_feature_configs → f_pyramid_grid. (Single-SF entries used to go through f_grid_block, whose own
+        # every bank entry (single SF or pyramid) → f_pyramid_specs (the search uses these same blocks).
+        # (Single-SF entries used to go through f_grid_block, whose own
         # defaults — 4 orientations, fixed ds=4 — differed from the search's 8 / Nyquist; fixed 2026-11-09.)
         specs = f_pyramid_specs(kind, hFOV_deg=hFOV_deg,
                                 **{k: v for k, v in s.items() if k != 'ds_factor'})
-        out[nm] = f_specs_block(specs, marginalize=marg, layer1_proc=l1, layer2_proc=l2, origin=origin)
+        out[tag] = f_specs_block(specs, marginalize=marg, layer1_proc=l1, layer2_proc=l2, origin=origin)
     return out
 
 
-# Fallback when a feature-set entry names no `marginalize`. CANONICAL — f_vis_sets_to_plan (plan side)
-# and f_feature_search.f_pyramid_grid / f_pyramid_block (search side) all take their default from here,
+f_vis_sets_to_plan = f_feature_plan                # old name, kept for existing scripts
+
+
+# Fallback when a feature-set entry names no `marginalize`. CANONICAL — f_feature_plan (used by every
+# script, search included) takes its default from here,
 # so an omitted marginalize cannot mean 'per SF level' in one script and 'per filter' in the other.
 DEFAULT_MARGINALIZE = ('ori',)
 
@@ -522,7 +485,7 @@ def f_pyramid_specs(kind='gabor', *, sf_cyc_deg=None, sf_range=None, n_sf=5, cyc
                     output='opponent', stats=('magnitude',), tf_hz=(1.0,),
                     n_sf_sub=None, n_ori_sub=None, patch_snap=None, **kind_kw):
     """PARAM GENERATOR (no proc / no marginalize) → a LIST of level-1 feature spec dicts, one per SF
-    (× tf for meng), for f_specs_block / f_feature_search.f_feature_specs. SF list priority: sf_cyc_deg |
+    (× tf for meng), for f_specs_block (via f_feature_plan). SF list priority: sf_cyc_deg |
     cyc_fov/hFOV_deg (paper cycles-per-FOV) | geomspace(sf_range, n_sf). Per-SF sampling: spacing =
     _NYQUIST_DS·λ/samp_factor → `samp_factor` 1 = true Nyquist (λ/2), 2 = 2× oversample, <1 = undersample
     (higher SF → finer either way). Pass layer1/layer2 procs + marginalize to the consumer, not here.
@@ -563,22 +526,6 @@ def f_pyramid_specs(kind='gabor', *, sf_cyc_deg=None, sf_range=None, n_sf=5, cyc
                 d['transform'] = transform
             specs.append(d)
     return specs
-
-
-def f_pyramid_block(kind='gabor', *, sf_cyc_deg=None, sf_range=None, n_sf=5, cyc_fov=None,
-                    hFOV_deg=98.4, n_orient=8, odegs=None, ds='nyquist', samp_factor=1.0,
-                    marginalize=DEFAULT_MARGINALIZE, transform=None, output='opponent', stats=('magnitude',),
-                    layer1_proc=(('norm', 'zscore'),), layer2_proc=(('pca', 50),),
-                    tf_hz=(1.0,), origin='build', **kind_kw):
-    """Kay/Gallant WAVELET-PYRAMID plan block. Builds the SF param-space from a RANGE (f_pyramid_specs),
-    samples per SF (samp_factor 1=Nyquist / 2=2× oversample / <1=under), recombines via layer1/layer2
-    (f_specs_block). SF list: sf_cyc_deg | cyc_fov/hFOV_deg | geomspace(sf_range, n_sf). marginalize=('ori',)
-    → one cell per SF; () = per filter."""
-    specs = f_pyramid_specs(kind, sf_cyc_deg=sf_cyc_deg, sf_range=sf_range, n_sf=n_sf, cyc_fov=cyc_fov,
-                            hFOV_deg=hFOV_deg, n_orient=n_orient, odegs=odegs, ds=ds, samp_factor=samp_factor,
-                            transform=transform, output=output, stats=stats, tf_hz=tf_hz, **kind_kw)
-    return f_specs_block(specs, marginalize=marginalize, layer1_proc=layer1_proc,
-                         layer2_proc=layer2_proc, origin=origin)
 
 
 def f_proc_feature_plan(**overrides):
@@ -627,14 +574,7 @@ def f_proc_feature_plan(**overrides):
                                  'n_orient': 4, 'sf_cyc_deg': (0.13,), 'tf_hz': (2.0,),
                                  'output': 'opponent'}],
                      'proc': [('pca', 100)]},
-        # GRID visual banks (feature-search model): every filter = its own L1 dataset, combined via
-        # marginalization into L2 cells. marginalize=() → one block PER filter (ori×sf×tf); set
-        # ('ori',) → per (sf,tf), ('ori','sf','tf') → one block. Each expands to `<name>:<cell>` blocks.
-        'gaborG':   f_grid_block('gabor', marginalize=(), sf_cyc_deg=(0.13,), n_orient=4, ds=4,
-                                 layer1_proc=[('norm', 'zscore')], layer2_proc=[('pca', 50)]),
-        'mengG':    f_grid_block('meng', marginalize=(), sf_cyc_deg=(0.13,), tf_hz=(1.0, 2.0, 3.0),
-                                 n_orient=4, ds=4, transform='signed_sqrt', output='opponent',
-                                 layer1_proc=[('norm', 'zscore')], layer2_proc=[('pca', 50)]),
+        # (gaborG / mengG inline grid banks removed 2026-11-12 — define banks with feat_sets / f_feature_plan)
     }
     for k, v in overrides.items():
         if v is None:
@@ -942,65 +882,222 @@ def _layer1_names(Xp, raw_nms, glabel):
     return list(raw_nms) if k == len(raw_nms) else [f'{glabel}_PC{i + 1}' for i in range(k)]
 
 
-def _build_grid_block(name, block, origin, shared, verbose, prior=None):
-    """GRID expander (feature-search model; routed here when a block has a `grid` key). Each input is
-    ONE (sf,tf) conv-unit (all orientations). Per input: _extract_input → _input_transform →
-    f_pca_group_cols('none') per-filter groups → f_proc(layer1) per filter. Filters route to CELLS keyed
-    by the NON-marginalized axes (ori in DEGREES, sf/tf from the input spec); per cell: concat →
-    f_proc(layer2). Returns {f'{name}:{cellname}': block} — one output block per cell. Mirrors
-    f_feature_search.f_iter_grid_cells but sources raw via _extract_input (build OR repo)."""
+# ── ONE grid-cell engine for every script (2026-11-09, PLAN_feature_builder_merge.md step 2–3) ──────────
+# Used by f_feature_search.f_iter_grid_cells (search; raw = per-unit build + conv_autosave) and by
+# _build_grid_block (cebra / encoding; raw = shared build or conv_repo). Exact layer-1 decomposition is
+# fit ONCE per (unit, filter, pre-steps) and sliced, with the same k / identity rules as _pca_fit/_svd_fit.
+
+class _NestedFit:
+    """Prefix of an exact eigen-decomposition — the fields consumers read from a sklearn PCA/TruncatedSVD."""
+    def __init__(self, V, ratio, var, mean):
+        self.components_ = V.T                            # (k, d)
+        self.explained_variance_ratio_ = ratio
+        self.explained_variance_ = var
+        self.mean_ = mean                                 # None for svd (uncentered)
+        self.n_components = V.shape[1]
+
+    def transform(self, X):
+        X = np.asarray(X, np.float32)
+        if self.mean_ is not None:
+            X = X - self.mean_.astype(np.float32)
+        return X @ self.components_.T.astype(np.float32)
+
+
+def _l1_decomp(X, op, chunk=20000):
+    """Exact full decomposition of one filter's columns, fit ONCE and sliced per sweep value.
+    pca: eigh of the covariance. svd: eigh of XᵀX (uncentered), ratios = projected variance ÷ total
+    variance (sklearn TruncatedSVD's definition). Returns (V desc-sorted (d,d), ratio, var, mean)."""
+    T, d = X.shape
+    G = np.zeros((d, d)); mu = np.zeros(d)
+    for i in range(0, T, chunk):                          # float64 accumulation in row chunks
+        Xc = np.asarray(X[i:i + chunk], np.float64)
+        G += Xc.T @ Xc; mu += Xc.sum(0)
+    mu /= T
+    C = G / T - np.outer(mu, mu)                          # covariance (ddof 0)
+    tot = float(np.trace(C)) or 1.0
+    w, V = np.linalg.eigh(C if op == 'pca' else G)
+    V = V[:, ::-1]
+    var = np.einsum('ij,jk,ki->i', V.T, C, V)             # variance of each projection
+    return V, var / tot, var, (mu if op == 'pca' else None)
+
+
+def _l1_nested(X, op, n, dec):
+    """Apply one ('pca'|'svd', n) step from a cached decomposition with the SAME k / identity rules as
+    _pca_fit / _svd_fit. Returns (scores, fit_or_None)."""
+    V, ratio, var, mu = dec
+    d = X.shape[1]
+    cum = np.cumsum(ratio)
+    if isinstance(n, (tuple, list)) and len(n) == 2:     # (variance-fraction, cap)
+        cap = min(int(n[1]), d if op == 'pca' else d - 1)
+        k = min(max(int(np.searchsorted(cum[:cap], float(n[0])) + 1), 1), cap)
+        if op == 'pca' and k >= d:
+            return X, None
+    elif isinstance(n, float) and 0 < n < 1:              # variance fraction
+        if op == 'pca':
+            k = min(int(np.searchsorted(cum, n, side='right') + 1), d)
+        else:
+            cap = d - 1
+            if cum[cap - 1] < n:                          # d-1 comps miss the fraction → keep all d
+                return X, None
+            k = min(max(int(np.searchsorted(cum[:cap], n) + 1), 1), cap)
+    else:
+        k = int(n)
+        if k >= d:
+            return X, None
+    fit = _NestedFit(V[:, :k], ratio[:k], var[:k], mu)
+    return fit.transform(X), fit
+
+
+def _layer1_apply(X, l1, cache, ckey):
+    """LAYER-1 step-list on one filter's columns. norm-only pre steps → pca/svd from a decomposition fit
+    ONCE per `ckey` (in `cache`) and sliced → trailing norm / whiten. Anything else → plain f_proc.
+    Returns (Xp, fitted_steps)."""
+    from f_feature_helpers import f_proc
+    ir = next((i for i, st in enumerate(l1) if st[0] in ('pca', 'svd')), None)
+    lead = l1[ir] if ir is not None else None
+    if not (lead and lead[1] and X.shape[1] >= 2 and all(st[0] == 'norm' for st in l1[:ir])):
+        return f_proc(X, l1)
+    pre = l1[:ir]
+    Xin = f_proc(X, pre)[0] if pre else X
+    dk = ckey + (lead[0], repr(pre))
+    if dk not in cache:
+        cache[dk] = _l1_decomp(Xin, lead[0])
+    Xp, p = _l1_nested(Xin, lead[0], lead[1], cache[dk])
+    fit = [(lead[0], {'pca': p, 'eig': None if p is None else p.explained_variance_})]
+    for st in l1[ir + 1:]:                                # trailing steps
+        if st[0] == 'whiten':                             # ÷ √variance of each kept component
+            if p is not None:
+                ev = p.explained_variance_
+                Xp = Xp / np.sqrt(np.where(ev > 0, ev, 1.0)).astype(np.float32)
+            fit.append(('whiten', {'eig': None if p is None else p.explained_variance_}))
+        else:
+            Xp, rest = f_proc(Xp, [st])
+            fit += rest
+    return Xp, fit
+
+
+def f_iter_feature_cells(inputs, grid, get_raw, *, origin='build', cache=None, release=None,
+                         timing=False):
+    """THE grid-cell engine (STREAMING generator) behind every feature-set build. `inputs` = one spec per
+    conv-unit (one SF [× TF], all orientations); `grid` = {kind, marginalize, layer1_proc, layer2_proc}.
+    Per unit: `get_raw(i, inp, label)` → (X (T, n), raw_names) already transformed → per filter (o, sf,
+    tf) the layer-1 proc (a per-input `inp['proc']` overrides it) → filters routed to CELLS by the
+    NON-marginalized axes → a cell is finalized (concat → layer-2 proc) and YIELDED as soon as its last
+    contributing unit is done, then `release(i, inp, label)` frees that unit's raw. Peak RAM ≈ one unit's
+    raw + the open cells. `cache` holds the layer-1 decompositions (reused across calls when shared).
+    Yields (cell_name, block); cell names carry physical values (o<deg>, sf<cyc/deg>, tf<Hz>), 'all'
+    when every axis is pooled. `origin='repo'` → orientation in the names is already DEGREES."""
     import re
+    import time
+    from collections import OrderedDict
     from f_feature_helpers import f_proc, f_num_tag
     from f_visual_features import f_pca_group_cols
-    g = block['grid']
-    marg = f_marg_axes(g.get('marginalize', ()))          # canonical: normalizes 'wl', expands 'all'
-    l1 = list(g.get('layer1_proc') or [])
-    l2 = list(g.get('layer2_proc') or [])
-    cells = {}                                                # cell-key tuple → [(member_label, Xp, names)]
-    for i, inp in enumerate(block['inputs']):
-        Xi, ni, _meta = _extract_input(inp, name, i, origin, shared, verbose, prior=prior)
-        Xi = _input_transform(Xi, inp.get('transform'))
-        Xi = np.asarray(Xi)
+    cache = {} if cache is None else cache
+    marg = f_marg_axes(grid.get('marginalize', ()))
+    l1_blk = list(grid.get('layer1_proc') or [])
+    l2 = list(grid.get('layer2_proc') or [])
+    units = []                                            # (i, label, inp, sfv, tfv)
+    for i, inp in enumerate(inputs):
+        inp = dict(inp)
+        src = inp.get('source')
         sfv = float(np.atleast_1d(inp['sf_cyc_deg'])[0]) if inp.get('sf_cyc_deg') is not None else None
         tfv = float(np.atleast_1d(inp['tf_hz'])[0]) if inp.get('tf_hz') is not None else None
-        _odegs = inp.get('odegs')
-        _nori = inp.get('n_orient') or 1
-        lab = _input_label(inp)
-        _l1 = l1 if inp.get('proc') is None else list(inp['proc'])   # per-input proc overrides block layer1
-        for glabel, info in f_pca_group_cols(ni, 'none', None).items():   # one group per individual filter
+        label = (f'{src}_sf{f_num_tag(sfv)}' if sfv is not None else f'{src}_in{i}') \
+            + ('' if (src in NO_TF_KINDS or tfv is None) else f'tf{f_num_tag(tfv)}')
+        units.append((i, label, inp, sfv, tfv))
+
+    def _later(key, u):                                   # does a unit after u feed this cell?
+        kd = dict(key)
+        fsf, ftf = kd.get('sf'), kd.get('tf')
+        return any((fsf is None or sfv2 == fsf) and (ftf is None or tfv2 == ftf)
+                   for (_i, _l, _p, sfv2, tfv2) in units[u + 1:])
+
+    def _finalize(key, members):                          # concat → layer 2 → standard block
+        cell = '_'.join(f'{ax}{f_num_tag(val) if isinstance(val, (int, float)) else val}'
+                        for ax, val in key) or 'all'
+        Xcat = np.nan_to_num(np.concatenate([X for _, X, _, _, _ in members], axis=1))
+        raw_names = [f'{lbl}:{nm}' for lbl, _, nms, _, _ in members for nm in nms]
+        Xp, fit = f_proc(Xcat, l2)
+        _pca = next((p['pca'] for op, p in fit if op in ('pca', 'svd') and p.get('pca') is not None), None)
+        names = ([f'{cell}_PC{k + 1}' for k in range(Xp.shape[1])] if _pca is not None
+                 else list(raw_names))
+        l1v = [(w, w * v) for _, _, _, w, v in members if v == v]              # skip NaN (no l1 pca)
+        return cell, {'X': np.asarray(Xp, np.float32), 'names': names, 'pca': _pca, 'pca_groups': None,
+                      'raw_names': raw_names, 'raw_dim': Xcat.shape[1],
+                      'source_blocks': [lbl for lbl, _, _, _, _ in members], 'proc_fit': fit,
+                      'l1_var_kept': (sum(v for _, v in l1v) / sum(w for w, _ in l1v) if l1v else np.nan),
+                      'l1_dim_in': sum(w for _, _, _, w, _ in members), 'kind': cell}
+
+    cells = OrderedDict()
+    for u, (i, label, inp, sfv, tfv) in enumerate(units):
+        t0 = time.perf_counter()
+        if timing:
+            print(f'      [{time.strftime("%H:%M:%S")}] → conv {label} [{u + 1}/{len(units)}]', flush=True)
+        X, rn = get_raw(i, inp, label)
+        X = np.asarray(X)
+        if timing:
+            print(f'      [{time.strftime("%H:%M:%S")}] ✓ conv {label} {time.perf_counter() - t0:.1f}s '
+                  f'(raw {X.shape[1]} col)', flush=True)
+        l1 = l1_blk if inp.get('proc') is None else list(inp['proc'])     # per-input layer-1 override
+        odegs, n_ori = inp.get('odegs'), (inp.get('n_orient') or 1)
+        for glabel, info in f_pca_group_cols(rn, 'none', None).items():  # one group per filter
             cols = info['cols']
-            Xp, _ = f_proc(Xi[:, cols], _l1)                  # LAYER-1 proc per filter
+            Xp, f1 = _layer1_apply(X[:, cols], l1, cache, ('l1fit', label, json.dumps(inp, sort_keys=True,
+                                                                                      default=str), glabel))
+            p1 = next((p['pca'] for op, p in f1 if op in ('pca', 'svd') and p.get('pca') is not None), None)
+            v1 = (float(np.sum(p1.explained_variance_ratio_)) if p1 is not None
+                  else (1.0 if l1 else np.nan))           # no pca fired → nothing dropped
             mo = re.search(r'_o(\d+)', glabel) or re.search(r'o(\d+)', glabel)
             io = int(mo.group(1)) if mo else 0
-            if origin == 'repo':                              # repo names carry orientation DEGREES
+            if origin == 'repo':                          # repo names carry orientation DEGREES
                 odeg = float(io)
-            elif _odegs is not None:
-                odeg = float(np.atleast_1d(_odegs)[io])
+            elif odegs is not None:
+                odeg = float(np.atleast_1d(odegs)[io])
             else:
-                odeg = io * 180.0 / _nori
-            key = []                                          # sf/tf via f_num_tag (4 sig) so a config
-            if 'ori' not in marg:                             # yields the SAME cell names here as in
-                key.append(('o', f'{odeg:g}'))                # f_feature_search._finalize ('o' is :g there too)
+                odeg = io * 180.0 / n_ori
+            key = []
+            if 'ori' not in marg:
+                key.append(('o', f'{odeg:g}'))
             if 'sf' not in marg and sfv is not None:
-                key.append(('sf', f_num_tag(sfv)))
+                key.append(('sf', sfv))                   # raw float (contributor match); formatted in name
             if 'tf' not in marg and tfv is not None:
-                key.append(('tf', f_num_tag(tfv)))
-            cells.setdefault(tuple(key), []).append((f'{lab}:{glabel}', Xp,
-                                                     _layer1_names(Xp, [ni[c] for c in cols], glabel)))
+                key.append(('tf', tfv))
+            cells.setdefault(tuple(key), []).append(
+                (f'{label}:{glabel}', Xp, _layer1_names(Xp, [rn[c] for c in cols], glabel), len(cols), v1))
+        if release is not None:
+            release(i, inp, label)
+        del X
+        for key in [k for k in cells if not _later(k, u)]:
+            t1 = time.perf_counter()
+            out = _finalize(key, cells.pop(key))
+            if timing:
+                print(f'      [{time.strftime("%H:%M:%S")}] ✓ finalize/PCA {out[0]} '
+                      f'{time.perf_counter() - t1:.1f}s ({out[1]["X"].shape[1]} dim)', flush=True)
+            yield out
+
+
+def _build_grid_block(name, block, origin, shared, verbose, prior=None):
+    """GRID block (cebra / encoding plan side) → {f'{name}:{cell}': block}. Thin wrapper over the shared
+    engine f_iter_feature_cells (same engine as the feature search); raw per input comes from the shared
+    build or the conv_repo via _extract_input, then _input_transform."""
+    gb = shared.get('grid_build')
+
+    def get_raw(i, inp, label):
+        if origin == 'build' and gb is not None and inp.get('source') in _VISUAL_SOURCES:
+            key = f'{name}#u{i}'                          # one conv-unit, built on its own (cache-keyed)
+            built, _ft, _st, _mv = _resolve_build(gb['session'], gb['build_cfg'], [key],
+                                                  {key: {'inputs': [inp]}}, gb['render_verbose'],
+                                                  prerendered=gb['prerendered'], verbose=False)
+            b = built[_vk(key, 0)]
+            Xi, ni = b['X'], list(b['names'])
+        else:
+            Xi, ni, _meta = _extract_input(inp, name, i, origin, shared, verbose, prior=prior)
+        return np.asarray(_input_transform(Xi, inp.get('transform'))), ni
     out = {}
-    for key, members in cells.items():
-        cellname = '_'.join(f'{ax}{val}' for ax, val in key) or 'all'
-        outname = f'{name}:{cellname}'
-        X_cat = np.nan_to_num(np.concatenate([X for _, X, _ in members], axis=1))
-        raw_names = [f'{lbl}:{nm}' for lbl, _, nms in members for nm in nms]
-        Xp, fit = f_proc(X_cat, l2)                           # LAYER-2 proc per cell
-        _pca = next((p['pca'] for op, p in fit if op in ('pca', 'svd') and p.get('pca') is not None), None)
-        names = ([f'{cellname}_PC{i + 1}' for i in range(Xp.shape[1])] if _pca is not None
-                 else list(raw_names))
-        out[outname] = {'X': np.asarray(Xp, np.float32), 'names': names, 'pca': _pca, 'pca_groups': None,
-                        'raw_names': raw_names, 'raw_dim': int(X_cat.shape[1]),
-                        'source_blocks': [lbl for lbl, _, _ in members], 'proc_fit': fit,
-                        'kind': outname, 'inputs': block['inputs']}
+    for cell, blk in f_iter_feature_cells(block['inputs'], block['grid'], get_raw, origin=origin):
+        outname = f'{name}:{cell}'
+        blk['kind'], blk['inputs'] = outname, block['inputs']
+        out[outname] = blk
     return out
 
 
@@ -1447,9 +1544,24 @@ def f_resolve_features(session, plan, build_cfg=None, *, features_dir=None, mous
                     print(f'      {_n}: {np.asarray(_b["X"]).shape}'
                           + (f'  raw_dim={_b.get("raw_dim")}' if _b.get('raw_dim') else ''))
 
+    # GRID blocks with origin='build' are built PER UNIT inside _build_grid_block (one conv-unit in RAM at
+    # a time; conv_autosave hits need no pixels) with a LAZY movie: f_render_once renders only if a unit is
+    # not cached (shapes recorded in <features_dir>/render_shapes.json). The shared build below serves the
+    # remaining build blocks (agg / pix / self_mot / legacy) and reuses the same movie if it needs pixels.
+    grid_build = [n for n in groups['build'] if 'grid' in plan[n]]
+    if grid_build:
+        if prerendered is None and any(i.get('source') in _RENDER_SOURCES
+                                       for n in grid_build for i in plan[n].get('inputs', [])):
+            from f_feature_search import f_render_once
+            prerendered = f_render_once(session, build_cfg, verbose=verbose, shape_dir=features_dir)
+        shared['grid_build'] = {'session': session, 'build_cfg': build_cfg, 'prerendered': prerendered,
+                                'render_verbose': render_verbose}
     if groups['build']:
-        built, ft, st, mv = _resolve_build(session, build_cfg, groups['build'], plan,
+        built, ft, st, mv = _resolve_build(session, build_cfg,
+                                           [n for n in groups['build'] if n not in grid_build], plan,
                                            render_verbose, prerendered=prerendered, verbose=verbose)
+        if mv is None and grid_build and prerendered is not None:
+            mv = prerendered[2]                               # lazy: pixels render on first use
         shared['build'] = built
         frame_t = ft if frame_t is None else frame_t
         side_tags = st if side_tags is None else side_tags
